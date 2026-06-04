@@ -1,0 +1,8 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+
+cc_binary(
+    name = "p4modem",
+    srcs = ["p4modem.cpp"],
+    copts = ["-std=c++17"],
+    visibility = ["//visibility:public"],
+)
