@@ -20,6 +20,13 @@ cc_binary(
     visibility = ["//visibility:public"],
 )
 
+cc_binary(
+    name = "pcm_impair",
+    srcs = ["pcm_impair.cpp"],
+    copts = CPP17_COPTS,
+    visibility = ["//visibility:public"],
+)
+
 sh_test(
     name = "p4modem_roundtrip_test",
     srcs = ["p4modem_test.sh"],
@@ -45,5 +52,19 @@ sh_test(
     name = "fec_limits_test",
     srcs = ["fec_limits_test.sh"],
     data = [":p4modem"],
+    size = "large",
+)
+
+sh_test(
+    name = "fec_performance_test",
+    srcs = ["fec_performance_test.sh"],
+    data = [":p4modem"],
+    size = "large",
+)
+
+sh_test(
+    name = "timing_drift_test",
+    srcs = ["timing_drift_test.sh"],
+    data = [":p4modem", ":pcm_impair"],
     size = "large",
 )

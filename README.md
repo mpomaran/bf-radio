@@ -59,31 +59,31 @@ The project is intended as an experimental platform for studying:
 
 ```text
 Payload
-  ↓
+  ->
 CRC
-  ↓
+  ->
 FEC
-  ↓
+  ->
 Interleaver
-  ↓
+  ->
 Bit Packing
-  ↓
+  ->
 P4 Symbol Mapping
-  ↓
+  ->
 Audio PCM
-  ↓
+  ->
 FM Radio Channel
-  ↓
+  ->
 Correlation Receiver
-  ↓
+  ->
 Symbol Decisions
-  ↓
+  ->
 Deinterleaver
-  ↓
+  ->
 FEC Decoder
-  ↓
+  ->
 CRC Validation
-  ↓
+  ->
 Payload
 ```
 
@@ -171,7 +171,7 @@ The current implementation uses a state-of-the-art but computationally efficient
 * **Code Rate:** k/n = 82/100 = **0.82** (18% redundancy vs. 100% for repetition)
 * **Decoding Algorithm:** Fast hard-decision majority voting (3 iterations max)
 * **Interleaver:** whole-frame 100-column block interleaver after FEC
-* **Encoding Ratio:** ~640:1 (256-byte payload → 165 KB encoded @ 8 kHz)
+* **Encoding Ratio:** ~640:1 (256-byte payload -> 165 KB encoded @ 8 kHz)
 
 ### Interleaver
 
@@ -187,28 +187,59 @@ the exact interleaver geometry used by the encoder.
 
 ### Tested Error Correction Limits
 
-Comprehensive testing (`fec_limits_test.sh`) validates recovery under various corruption patterns:
+Comprehensive testing (`fec_limits_test.sh` and `fec_performance_test.sh`) validates recovery under preamble, sync, header-bearing data, and mid-payload corruption patterns. Burst sizes below are PCM bytes overwritten with `0xff`.
 
-**Single Burst Errors (per data region):**
-- ✓ 1-byte burst — 100% recovery
-- ✓ 4-byte burst — 100% recovery
-- ✓ 8-byte burst — 100% recovery
-- ✓ 16-byte burst — 100% recovery
-- ✓ 32-byte burst — 100% recovery
-- ✓ 64-byte burst — 100% recovery
+**Payload-size matrix:**
 
-**Burst Position Insensitivity:**
-- ✓ 8-byte burst at byte 100 (preamble) — recovered
-- ✓ 8-byte burst at byte 1000 (data) — recovered
-- ✓ 8-byte burst at byte 5000 (data) — recovered
-- ✓ 8-byte burst at byte 20000 (data) — recovered
+| Payload | Encoded PCM | Preamble limit | Header-region limit | Mid-data limit | First mid-data failure |
+|---------|-------------|----------------|---------------------|----------------|------------------------|
+| 4 B | 32,000 B | >=1024 B | 256 B | >=1024 B | none in scan |
+| 8 B | 37,280 B | >=1024 B | 256 B | >=1024 B | none in scan |
+| 16 B | 37,280 B | >=1024 B | 256 B | >=1024 B | none in scan |
+| 32 B | 48,000 B | >=1024 B | 256 B | 128 B | 256 B |
+| 64 B | 64,000 B | >=1024 B | 256 B | 128 B | 256 B |
+| 128 B | 96,000 B | >=1024 B | 128 B | 128 B | 256 B |
+| 256 B | 165,280 B | >=1024 B | 256 B | 128 B | 256 B |
+| 512 B | 298,560 B | >=1024 B | 256 B | 128 B | 256 B |
+| 1024 B | 565,280 B | >=1024 B | 256 B | 128 B | 256 B |
 
-**Multiple Distributed Errors:**
-- ✓ Two 4-byte bursts (9 KB apart) — 100% recovery
-- ✓ Three 4-byte bursts (scattered throughout frame) — 100% recovery
+**Region behavior:**
 
-**High-Density Error Patterns:**
-- ✓ Four 4-byte bursts (every 2 KB) — 100% recovery
+- Preamble corruption is highly tolerant in the tested range because the sync sequence follows the preamble and can still be found.
+- Sync corruption is tested separately with 4 B and 8 B bursts at the sync start; both recover in the current matrix.
+- Header bits are FEC-protected and interleaved across the data symbols, but large early-data bursts still become the practical packet-finding limit.
+- Mid-data bursts recover through 128 B for payloads 32 B and larger, then fail at 256 B in the current hard-decision decoder.
+
+### Tested Timing Drift Limits
+
+`timing_drift_test.sh` uses the C++ impairment tool `pcm_impair` to simulate
+clock mismatch, Doppler-like sample-rate error, and deterministic byte-level bit
+flips. The test linearly resamples either the whole PCM signal or a 25% region
+at the start, middle, or end of the signal. It scans stretch and shorten cases
+in 1% steps until decode failure, for payloads of 4, 8, 16, 32, 64, 128, 256,
+512, and 1024 bytes.
+
+Bit flips are applied as one deterministic byte bit flip every 4096 PCM bytes.
+In the measured matrix, bit flips did not change the timing-drift threshold:
+cases with and without bit flips failed at the same percentages.
+
+| Payload | Whole signal | Start 25% | Middle 25% | End 25% |
+|---------|--------------|-----------|------------|---------|
+| 4 B | fails at 1% | fails at 1% | fails at 1% | OK through 20% |
+| 8 B | fails at 1% | fails at 1% | fails at 1% | OK through 20% |
+| 16 B | fails at 1% | fails at 1% | fails at 1% | OK through 20% |
+| 32 B | fails at 1% | fails at 1% | fails at 1% | OK through 20% |
+| 64 B | fails at 1% | OK through 20% | fails at 1% | fails at 1% |
+| 128 B | fails at 1% | fails at 1% | fails at 1% | fails at 1% |
+| 256 B | fails at 1% | fails at 1% | fails at 1% | fails at 1% |
+| 512 B | fails at 1% | fails at 1% | fails at 1% | fails at 1% |
+| 1024 B | fails at 1% | fails at 1% | fails at 1% | fails at 1% |
+
+Stretch and shorten results were identical in the current scan. This confirms
+the main synchronization limitation of the prototype: after sync is found, the
+decoder assumes fixed symbol timing and does not track sample-rate drift. Timing
+recovery should be added before relying on the modem in channels with Doppler,
+independent transmitter/receiver clocks, or long recordings with clock skew.
 
 ### Key Advantages Over Repetition Coding
 
@@ -218,27 +249,29 @@ Comprehensive testing (`fec_limits_test.sh`) validates recovery under various co
 | Encoding Ratio | ~970:1 | ~640:1 |
 | Data Rate (256-byte) | ~130 bps | ~245 bps | 
 | Error Recovery | Limited | Excellent |
-| Burst Tolerance | ≤2KB | ≤64KB+ |
+| Burst Tolerance | low | 128 B mid-data tested, larger in preamble |
 | Computational Cost (decode) | Minimal | Low |
 
 ### Capacity Planning
 
 For deployment considerations:
 
-- **Current overhead:** ~640× encoding expansion (down from ~970× with repetition)
+- **Current overhead:** ~640x encoding expansion (down from ~970x with repetition)
 - **Effective data rate:** ~245 bits/second (at 8 kHz, 16-bit PCM with 256-byte frame and LDPC 0.82)
 - **Typical use:** Low-speed command/control and sensor telemetry
 - **Production deployments:** Current LDPC design is production-ready for narrowband FM
 
 ### Testing
 
-Run the FEC limit test suite:
+Run the FEC limit and performance test suites:
 
 ```bash
 bazel test //lab:fec_limits_test
+bazel test //lab:fec_performance_test
+bazel test //lab:timing_drift_test
 ```
 
-This test exercises the error correction across 10+ individual corruption scenarios and provides detailed recovery diagnostics.
+The performance matrix tests payloads of 4, 8, 16, 32, 64, 128, 256, 512, and 1024 bytes, increasing burst size until recovery fails or the scan reaches 1024 corrupted PCM bytes.
 
 ## Disclaimer
 

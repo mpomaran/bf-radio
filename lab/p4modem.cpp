@@ -1,26 +1,23 @@
 /*
-  p4modem.cpp — prosty eksperymentalny modem P4 przez PCM audio dla Baofenga/VOX
+  p4modem.cpp - simple experimental P4 modem over PCM audio for handheld FM
+  radios and VOX-controlled links.
 
-  Cel:
-    - około 300 bps brutto / około 245 bps netto z LDPC (kod 0.82)
-    - wejście/wyjście przez surowe PCM 16-bit signed little-endian mono
-    - nośna audio 1500 Hz
-    - symbole P4 długości 10 ms
-    - alfabet 8 symboli = 3 bity/symbol
-    - 100 symboli/s × 3 bity = 300 bps brutto
-    - FEC: LDPC (3,6)-regular o współczynniku 0.82 => około 245 bps netto
-    - ramki z preambułą, sync, headerem, payloadem i CRC16
+  Goals:
+    - About 300 bps gross / about 245 bps net with LDPC rate 0.82.
+    - Raw 16-bit signed little-endian mono PCM input/output.
+    - 1500 Hz audio carrier.
+    - 10 ms P4 symbols.
+    - 8-symbol alphabet = 3 bits per symbol.
+    - 100 symbols/s * 3 bits = 300 bps gross.
+    - LDPC (3,6)-regular FEC at rate 0.82.
+    - Frames with preamble, sync, header, payload, and CRC16.
 
-  UWAGA:
-    To nie jest gotowy "produkcyjny" modem. To baza do eksperymentów.
-    Na prawdziwym Baofengu trzeba stroić:
-      - poziom audio,
-      - długość preambuły pod VOX,
-      - próg detekcji,
-      - symbol timing,
-      - dla lepszej wydajności dodać turbo-kody lub iteracyjne poprawy LDPC.
+  Note:
+    This is not a production modem. It is a base for experiments. Real handheld
+    radio links still need tuning for audio level, VOX preamble length,
+    detection thresholds, symbol timing, and stronger iterative FEC.
 
-  Format pracy:
+  Usage:
     Encode:
       ./p4modem enc input.bin output.pcm
 
@@ -31,61 +28,55 @@
     - 8000 Hz
     - mono
     - signed 16-bit little-endian
-    - bez nagłówka WAV
+    - no WAV header
 
   Stack:
     payload bytes
-      ↓
-    CRC16-CCITT
-      ↓
-    bitstream
-      ↓
-    LDPC encoding (code rate 0.82)
-      ↓
-    grupowanie po 3 bity
-      ↓
-    symbole P4
-      ↓
-    PCM audio
+      -> CRC16-CCITT
+      -> bitstream
+      -> LDPC encoding (code rate 0.82)
+      -> interleaver
+      -> grouping into 3-bit symbols
+      -> P4 symbols
+      -> PCM audio
 
-  Ramka:
+  Frame:
     PREAMBLE:
-      100 symboli sync, czyli około 1 s — przy VOX można zwiększyć
+      100 sync symbols, roughly 1 second. Increase this for slow VOX/AGC.
 
     SYNC:
-      16 znanych symboli
+      16 known symbols.
 
     HEADER:
-      2 bajty długości payloadu, little-endian
-      także chronione FEC/wspólnym kodowaniem LDPC w tym prototypie jako część body
+      2-byte little-endian payload length, protected as part of the LDPC body.
 
     BODY:
       length[2] + payload + crc16[2]
 
-  Modulacja P4:
-    Dla symbolu generujemy sekwencję fazową P4:
+  P4 modulation:
+    Each symbol uses a P4 phase sequence:
 
       phi[n] = pi * n^2 / N
 
-    Symbol danych wybieramy przez cykliczne przesunięcie kodu P4.
-    Następnie nakładamy tę fazę na nośną audio:
+    Data symbols are represented by cyclic shifts of the P4 code and mixed
+    onto the audio carrier:
 
       s[n] = cos(2*pi*fc*t + phi_p4[(n + shift) mod N])
 
-    Dekoder:
-      - tnie PCM na okna symbolowe,
-      - koreluje każde okno z 8 wzorcami P4,
-      - wybiera symbol o największej korelacji.
+    Decoder:
+      - Split PCM into symbol windows.
+      - Correlate each window with the 8 P4 templates.
+      - Pick the symbol with the highest correlation.
 
-  Dlaczego tylko 8 symboli, a nie 64?
-    64 symbole dawałyby 6 bitów/symbol, ale wymagają znacznie lepszej separacji
-    korelacyjnej i synchronizacji. 8 symboli jest dużo odporniejsze na Baofenga,
-    VOX i tanią kartę USB audio.
+  Why 8 symbols instead of 64?
+    64 symbols would provide 6 bits per symbol, but require much better
+    correlation separation and synchronization. 8 symbols are more robust for
+    simple handheld radios, VOX, and cheap USB audio devices.
 
-  Najważniejsze ograniczenie:
-    Dekoder zakłada, że symbol timing jest trafiony po znalezieniu preambuły.
-    W realnym systemie warto dodać tracking: sprawdzanie okien -1/0/+1 próbka
-    i wybór największej korelacji.
+  Main limitation:
+    The decoder assumes symbol timing is correct after sync is found. A real
+    system should add timing tracking, for example by checking -1/0/+1 sample
+    windows and selecting the highest correlation.
 */
 
 #include <algorithm>
@@ -99,10 +90,10 @@
 
 static constexpr int SAMPLE_RATE = 8000;
 static constexpr double CARRIER_HZ = 1500.0;
-static constexpr int SYMBOL_SAMPLES = 80;       // 10 ms przy 8 kHz
-static constexpr int ALPHABET = 8;              // 3 bity/symbol
+static constexpr int SYMBOL_SAMPLES = 80;       // 10 ms at 8 kHz
+static constexpr int ALPHABET = 8;              // 3 bits per symbol
 static constexpr int BITS_PER_SYMBOL = 3;
-static constexpr int PREAMBLE_SYMBOLS = 100;    // około 1 s dla VOX
+static constexpr int PREAMBLE_SYMBOLS = 100;    // About 1 s for VOX
 static constexpr int SYNC_SYMBOLS = 16;
 static constexpr int FEC_CODEWORD_BITS = 100;
 static constexpr double PI = 3.14159265358979323846;
@@ -372,8 +363,8 @@ static std::vector<double> make_p4_phase(int shift) {
 
 static std::vector<double> make_symbol_wave(int symbol) {
     /*
-      Używamy 8 cyklicznych przesunięć P4.
-      Shifty są rozstrzelone po całej długości kodu, aby zwiększyć separację.
+      Use 8 cyclic P4 shifts. The shifts are spread across the full code length
+      to improve correlation separation.
     */
     int shift = (symbol * SYMBOL_SAMPLES) / ALPHABET;
     auto phase = make_p4_phase(shift);
@@ -406,8 +397,8 @@ static void append_symbol_pcm(std::vector<int16_t>& pcm, int symbol) {
 
 static double corr_score(const int16_t* samples, const std::vector<double>& tpl) {
     /*
-      Korelacja z usunięciem DC i normalizacją energii.
-      To pomaga przy różnym poziomie audio.
+      Correlation with DC removal and energy normalization. This helps when
+      audio levels vary between recordings or radio paths.
     */
     double mean = 0.0;
     for (int i = 0; i < SYMBOL_SAMPLES; ++i) mean += samples[i];
@@ -480,16 +471,12 @@ static void encode_file(const std::string& in_path, const std::string& out_pcm_p
     auto symbols = bits_to_symbols(tx_bits);
 
     std::vector<int16_t> pcm;
-
     /*
-      Preambuła:
-        powtarzamy symbol 0, żeby VOX i AGC miały czas.
+      Preamble: repeat symbol 0 so VOX and AGC have time to settle.
     */
     for (int i = 0; i < PREAMBLE_SYMBOLS; ++i) append_symbol_pcm(pcm, 0);
-
     /*
-      SYNC:
-        znana sekwencja symboli o dobrej zmienności.
+      Sync: a known symbol sequence with good variation.
     */
     const int sync_seq[SYNC_SYMBOLS] = {
         7, 1, 6, 2, 5, 3, 4, 0,
@@ -497,14 +484,12 @@ static void encode_file(const std::string& in_path, const std::string& out_pcm_p
     };
 
     for (int s : sync_seq) append_symbol_pcm(pcm, s);
-
     /*
-      Dane.
+      Data symbols.
     */
     for (int s : symbols) append_symbol_pcm(pcm, s);
-
     /*
-      Krótki ogon ciszy.
+      Short silence tail.
     */
     pcm.insert(pcm.end(), SAMPLE_RATE / 2, 0);
 
@@ -524,12 +509,10 @@ static int find_sync(const std::vector<int16_t>& pcm) {
     int total_symbols = int(pcm.size() / SYMBOL_SAMPLES);
     int best_pos = -1;
     int best_hits = -1;
-
     /*
-      Prosty skaner symbolowy.
-      Zakładamy, że początek jest mniej więcej wyrównany do SYMBOL_SAMPLES.
-      Dla prawdziwego audio warto skanować z krokiem np. 4 próbki i policzyć
-      korelację całego SYNC, a nie tylko twardo zdekodowane symbole.
+      Simple symbol scanner. It assumes the stream is roughly aligned to
+      SYMBOL_SAMPLES after sync. Real audio should scan at a smaller sample
+      step and score the full sync correlation instead of only hard decisions.
     */
     for (int sym = 0; sym + SYNC_SYMBOLS < total_symbols; ++sym) {
         int hits = 0;

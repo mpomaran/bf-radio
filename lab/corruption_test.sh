@@ -41,9 +41,9 @@ echo ""
 # Verify baseline: clean encode/decode
 "$modem" dec "$encoded" "$decoded" 2>/dev/null
 if cmp -s "$payload" "$decoded"; then
-  echo "✓ Baseline: Clean roundtrip verified"
+  echo "OK Baseline: Clean roundtrip verified"
 else
-  echo "✗ Baseline: Failed - cannot continue"
+  echo "FAIL Baseline: Failed - cannot continue"
   exit 1
 fi
 
@@ -59,28 +59,29 @@ corrupt_burst() {
   local file="$1"
   local offset="$2"
   local num_bytes="$3"
+  local prefix="$TEST_TMPDIR/corrupt_$$"
   
   local head_bytes="$offset"
   local tail_offset=$((offset + num_bytes))
   
-  head -c "$head_bytes" "$file" > /tmp/h
-  tail -c +$((tail_offset + 1)) "$file" > /tmp/t
+  head -c "$head_bytes" "$file" > "$prefix.h"
+  tail -c +$((tail_offset + 1)) "$file" > "$prefix.t"
   
   # Create corruption pattern (all bits flipped)
-  dd if=/dev/zero bs=1 count=$num_bytes 2>/dev/null | tr '\0' '\377' > /tmp/c
+  dd if=/dev/zero bs=1 count=$num_bytes 2>/dev/null | tr '\0' '\377' > "$prefix.c"
   
-  cat /tmp/h /tmp/c /tmp/t > "$file"
+  cat "$prefix.h" "$prefix.c" "$prefix.t" > "$file"
 }
 
 # Test 1: Single bit flip in preamble
 echo -n "1. Single bit flip at byte 100 (preamble): "
 cp "$encoded" "$TEST_TMPDIR/test1.pcm"
-head -c 100 "$TEST_TMPDIR/test1.pcm" > /tmp/h
-tail -c +102 "$TEST_TMPDIR/test1.pcm" > /tmp/t
+head -c 100 "$TEST_TMPDIR/test1.pcm" > "$TEST_TMPDIR/test1.h"
+tail -c +102 "$TEST_TMPDIR/test1.pcm" > "$TEST_TMPDIR/test1.t"
 byte_hex=$(od -An -tx1 -N1 -j100 "$TEST_TMPDIR/test1.pcm" | tr -d ' ')
 byte_new=$((16#$byte_hex ^ 1))
-printf "\\x$(printf '%02x' $byte_new)" > /tmp/b
-cat /tmp/h /tmp/b /tmp/t > "$TEST_TMPDIR/test1.pcm"
+printf "\\x$(printf '%02x' $byte_new)" > "$TEST_TMPDIR/test1.b"
+cat "$TEST_TMPDIR/test1.h" "$TEST_TMPDIR/test1.b" "$TEST_TMPDIR/test1.t" > "$TEST_TMPDIR/test1.pcm"
 
 if "$modem" dec "$TEST_TMPDIR/test1.pcm" "$decoded" 2>/dev/null && [ -s "$decoded" ]; then
   errors=$(cmp -l "$payload" "$decoded" 2>/dev/null | wc -l)

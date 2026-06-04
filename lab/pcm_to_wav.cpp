@@ -6,7 +6,7 @@
 #include <vector>
 
 /*
-  pcm_to_wav.cpp — Convert raw PCM audio to WAV format.
+  pcm_to_wav.cpp - Convert raw PCM audio to WAV format.
   
   Designed to work with p4modem output:
     - 16-bit signed PCM
