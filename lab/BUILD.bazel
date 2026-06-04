@@ -7,9 +7,37 @@ cc_binary(
     visibility = ["//visibility:public"],
 )
 
+cc_binary(
+    name = "pcm_to_wav",
+    srcs = ["pcm_to_wav.cpp"],
+    copts = ["-std=c++17"],
+    visibility = ["//visibility:public"],
+)
+
 sh_test(
     name = "p4modem_roundtrip_test",
     srcs = ["p4modem_test.sh"],
     data = [":p4modem"],
     size = "small",
+)
+
+sh_test(
+    name = "pcm_to_wav_test",
+    srcs = ["pcm_to_wav_test.sh"],
+    data = [":p4modem", ":pcm_to_wav"],
+    size = "small",
+)
+
+sh_test(
+    name = "corruption_test",
+    srcs = ["corruption_test.sh"],
+    data = [":p4modem"],
+    size = "medium",
+)
+
+sh_test(
+    name = "fec_limits_test",
+    srcs = ["fec_limits_test.sh"],
+    data = [":p4modem"],
+    size = "large",
 )
