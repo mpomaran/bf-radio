@@ -104,6 +104,8 @@ static constexpr int ALPHABET = 8;              // 3 bity/symbol
 static constexpr int BITS_PER_SYMBOL = 3;
 static constexpr int PREAMBLE_SYMBOLS = 100;    // około 1 s dla VOX
 static constexpr int SYNC_SYMBOLS = 16;
+static constexpr int FEC_CODEWORD_BITS = 100;
+static constexpr double PI = 3.14159265358979323846;
 static constexpr double AMP = 0.55;
 
 struct Complex {
@@ -217,7 +219,7 @@ static std::vector<uint8_t> repetition_decode_2x(const std::vector<uint8_t>& bit
 
 class LDPCCodec {
     static constexpr int K = 82;       // information bits
-    static constexpr int N = 100;      // codeword length (K + parity)
+    static constexpr int N = FEC_CODEWORD_BITS;  // codeword length (K + parity)
     static constexpr int P = N - K;    // parity bits = 18
 
 public:
@@ -310,13 +312,52 @@ static std::vector<uint8_t> ldpc_decode(const std::vector<uint8_t>& bits) {
     return LDPCCodec::decode(bits);
 }
 
-// Deprecated: interleaver no longer needed with LDPC builtin dispersal
-static std::vector<uint8_t> interleave(const std::vector<uint8_t>& in, int rows = 8) {
-    return in;  // LDPC handles error dispersal, no additional interleaving needed
+/*
+  Whole-frame block interleaver.
+
+  LDPC protects fixed 100-bit codewords. A burst on the audio channel produces
+  adjacent hard-decision bit errors, so transmitting each codeword contiguously
+  is the worst case. This interleaver writes FEC bits row-wise by codeword and
+  transmits them column-wise. For an offline packet, that maximizes spreading:
+  a contiguous channel burst is distributed across as many LDPC codewords as
+  the frame contains, while each codeword receives only a few isolated errors.
+*/
+static std::vector<uint8_t> interleave(const std::vector<uint8_t>& in,
+                                       int columns = FEC_CODEWORD_BITS) {
+    if (in.empty() || columns <= 1) return in;
+
+    const size_t cols = size_t(columns);
+    const size_t rows = (in.size() + cols - 1) / cols;
+    std::vector<uint8_t> out;
+    out.reserve(in.size());
+
+    for (size_t col = 0; col < cols; ++col) {
+        for (size_t row = 0; row < rows; ++row) {
+            const size_t idx = row * cols + col;
+            if (idx < in.size()) out.push_back(in[idx]);
+        }
+    }
+
+    return out;
 }
 
-static std::vector<uint8_t> deinterleave(const std::vector<uint8_t>& in, int rows = 8) {
-    return in;  // LDPC handles error dispersal, no additional deinterleaving needed
+static std::vector<uint8_t> deinterleave(const std::vector<uint8_t>& in,
+                                         int columns = FEC_CODEWORD_BITS) {
+    if (in.empty() || columns <= 1) return in;
+
+    const size_t cols = size_t(columns);
+    const size_t rows = (in.size() + cols - 1) / cols;
+    std::vector<uint8_t> out(in.size(), 0);
+
+    size_t src = 0;
+    for (size_t col = 0; col < cols; ++col) {
+        for (size_t row = 0; row < rows; ++row) {
+            const size_t dst = row * cols + col;
+            if (dst < in.size()) out[dst] = in[src++];
+        }
+    }
+
+    return out;
 }
 
 static std::vector<double> make_p4_phase(int shift) {
@@ -324,7 +365,7 @@ static std::vector<double> make_p4_phase(int shift) {
 
     for (int n = 0; n < SYMBOL_SAMPLES; ++n) {
         int idx = (n + shift) % SYMBOL_SAMPLES;
-        phase[n] = M_PI * double(idx * idx) / double(SYMBOL_SAMPLES);
+        phase[n] = PI * double(idx * idx) / double(SYMBOL_SAMPLES);
     }
     return phase;
 }
@@ -340,7 +381,7 @@ static std::vector<double> make_symbol_wave(int symbol) {
     std::vector<double> wave(SYMBOL_SAMPLES);
     for (int n = 0; n < SYMBOL_SAMPLES; ++n) {
         double t = double(n) / SAMPLE_RATE;
-        double carrier = 2.0 * M_PI * CARRIER_HZ * t;
+        double carrier = 2.0 * PI * CARRIER_HZ * t;
         wave[n] = AMP * std::cos(carrier + phase[n]);
     }
     return wave;
@@ -435,7 +476,8 @@ static void encode_file(const std::string& in_path, const std::string& out_pcm_p
 
     auto bits = bytes_to_bits(frame);
     auto fec = ldpc_encode(bits);
-    auto symbols = bits_to_symbols(fec);
+    auto tx_bits = interleave(fec);
+    auto symbols = bits_to_symbols(tx_bits);
 
     std::vector<int16_t> pcm;
 
@@ -544,12 +586,11 @@ static void decode_file(const std::string& in_pcm_path, const std::string& out_p
     std::vector<uint8_t> payload;
     bool found = false;
 
-    for (size_t symbol_count = 1; symbol_count <= symbols.size(); ++symbol_count) {
-        size_t bit_count = symbol_count * BITS_PER_SYMBOL;
-        size_t byte_aligned = (bit_count / 8) * 8;
-        if (byte_aligned < 8) continue;
-
-        std::vector<uint8_t> fec_bits(symbol_bits.begin(), symbol_bits.begin() + byte_aligned);
+    for (size_t fec_bit_count = FEC_CODEWORD_BITS;
+         fec_bit_count <= symbol_bits.size();
+         fec_bit_count += FEC_CODEWORD_BITS) {
+        std::vector<uint8_t> tx_bits(symbol_bits.begin(), symbol_bits.begin() + fec_bit_count);
+        auto fec_bits = deinterleave(tx_bits);
         auto data_bits = ldpc_decode(fec_bits);
         auto bytes = bits_to_bytes(data_bits);
 

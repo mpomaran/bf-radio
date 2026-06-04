@@ -1,16 +1,22 @@
 load("@rules_cc//cc:defs.bzl", "cc_binary")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+CPP17_COPTS = select({
+    "@platforms//os:windows": ["/std:c++17"],
+    "//conditions:default": ["-std=c++17"],
+})
 
 cc_binary(
     name = "p4modem",
     srcs = ["p4modem.cpp"],
-    copts = ["-std=c++17"],
+    copts = CPP17_COPTS,
     visibility = ["//visibility:public"],
 )
 
 cc_binary(
     name = "pcm_to_wav",
     srcs = ["pcm_to_wav.cpp"],
-    copts = ["-std=c++17"],
+    copts = CPP17_COPTS,
     visibility = ["//visibility:public"],
 )
 

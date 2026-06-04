@@ -7,8 +7,24 @@ encoded="$TEST_TMPDIR/encoded.pcm"
 wav_output="$TEST_TMPDIR/output.wav"
 
 printf 'test' > "$payload"
-modem="$TEST_SRCDIR/$TEST_WORKSPACE/lab/p4modem"
-converter="$TEST_SRCDIR/$TEST_WORKSPACE/lab/pcm_to_wav"
+
+rlocation() {
+  local path="$1"
+  if [ -n "${RUNFILES_MANIFEST_FILE:-}" ]; then
+    grep -m1 "^_main/$path " "$RUNFILES_MANIFEST_FILE" | cut -d' ' -f2-
+  else
+    printf '%s/%s/%s\n' "$TEST_SRCDIR" "$TEST_WORKSPACE" "$path"
+  fi
+}
+
+modem="$(rlocation lab/p4modem.exe)"
+if [ -z "$modem" ]; then
+  modem="$(rlocation lab/p4modem)"
+fi
+converter="$(rlocation lab/pcm_to_wav.exe)"
+if [ -z "$converter" ]; then
+  converter="$(rlocation lab/pcm_to_wav)"
+fi
 
 # Encode with p4modem
 "$modem" enc "$payload" "$encoded"

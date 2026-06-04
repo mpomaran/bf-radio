@@ -170,7 +170,20 @@ The current implementation uses a state-of-the-art but computationally efficient
 * **Codeword Length (N):** 100 bits (K + P)
 * **Code Rate:** k/n = 82/100 = **0.82** (18% redundancy vs. 100% for repetition)
 * **Decoding Algorithm:** Fast hard-decision majority voting (3 iterations max)
+* **Interleaver:** whole-frame 100-column block interleaver after FEC
 * **Encoding Ratio:** ~640:1 (256-byte payload → 165 KB encoded @ 8 kHz)
+
+### Interleaver
+
+The modem uses a whole-frame block interleaver between LDPC encoding and P4
+symbol packing. FEC bits are written row-wise in 100-bit LDPC codewords and
+transmitted column-wise. This is the most effective lightweight choice for the
+current packet modem because it maximizes burst spreading across all LDPC
+codewords in a frame without adding metadata, padding, or streaming state.
+
+On receive, the deinterleaver is applied before LDPC decoding. The decoder now
+tests candidate packet lengths in full 100-bit FEC codewords, which preserves
+the exact interleaver geometry used by the encoder.
 
 ### Tested Error Correction Limits
 

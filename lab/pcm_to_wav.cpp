@@ -1,8 +1,9 @@
 #include <cstdint>
 #include <fstream>
 #include <iostream>
-#include <vector>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 /*
   pcm_to_wav.cpp — Convert raw PCM audio to WAV format.

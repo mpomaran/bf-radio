@@ -7,7 +7,20 @@ set -euo pipefail
 payload="$TEST_TMPDIR/payload_256.bin"
 encoded="$TEST_TMPDIR/encoded.pcm"
 decoded="$TEST_TMPDIR/decoded.bin"
-modem="$TEST_SRCDIR/$TEST_WORKSPACE/lab/p4modem"
+
+rlocation() {
+  local path="$1"
+  if [ -n "${RUNFILES_MANIFEST_FILE:-}" ]; then
+    grep -m1 "^_main/$path " "$RUNFILES_MANIFEST_FILE" | cut -d' ' -f2-
+  else
+    printf '%s/%s/%s\n' "$TEST_SRCDIR" "$TEST_WORKSPACE" "$path"
+  fi
+}
+
+modem="$(rlocation lab/p4modem.exe)"
+if [ -z "$modem" ]; then
+  modem="$(rlocation lab/p4modem)"
+fi
 
 # Generate 256-byte deterministic payload
 printf '\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f' > "$payload"
