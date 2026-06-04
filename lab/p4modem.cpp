@@ -9,7 +9,7 @@
     - 10 ms P4 symbols.
     - 8-symbol alphabet = 3 bits per symbol.
     - 100 symbols/s * 3 bits = 300 bps gross.
-    - LDPC (3,6)-regular FEC at rate 0.82.
+    - Systematic sparse LDPC FEC at rate 0.82.
     - Frames with preamble, sync, header, payload, and CRC16.
 
   Note:
@@ -196,15 +196,15 @@ static std::vector<uint8_t> repetition_decode_2x(const std::vector<uint8_t>& bit
 }
 
 /*
-  LDPC Encoder/Decoder (3,6)-regular with fast hard-decision decoding
+  LDPC Encoder/Decoder with fast hard-decision syndrome decoding
 
   This is a lightweight LDPC implementation suitable for narrowband modem:
-  - Parity check matrix H is (3,6)-regular: 3 ones per column, 6 ones per row
+  - Systematic sparse parity-check matrix with 3 checks per information bit
   - Code rate: k/n = 82/100 = 0.82
   - Information bits: k = 82, Parity bits: 18, Total: n = 100
   - Deterministic sparse matrix generation for reproducibility
 
-  Decoding uses fast hard-decision majority decoding rather than iterative
+  Decoding uses iterative hard-decision syndrome bit-flipping rather than soft
   belief propagation to keep computational cost reasonable for embedded systems.
 */
 
@@ -212,6 +212,7 @@ class LDPCCodec {
     static constexpr int K = 82;       // information bits
     static constexpr int N = FEC_CODEWORD_BITS;  // codeword length (K + parity)
     static constexpr int P = N - K;    // parity bits = 18
+    static constexpr int MAX_ITER = 8;
 
 public:
     static std::vector<uint8_t> encode(const std::vector<uint8_t>& info_bits) {
@@ -249,15 +250,19 @@ public:
 private:
     static std::vector<std::vector<int>> get_h_matrix() {
         std::vector<std::vector<int>> H(P);
-        // Deterministic (3,6)-regular sparse matrix
-        // For each of N columns, connect to 3 parity check equations
-        for (int n = 0; n < N; ++n) {
+        // Systematic sparse parity-check matrix. Each information bit connects
+        // to three checks; each check owns one parity bit, so encoding makes
+        // every syndrome row zero by construction.
+        for (int n = 0; n < K; ++n) {
             int c1 = (n * 3) % P;
             int c2 = (n * 3 + 1) % P;
             int c3 = (n * 3 + 2) % P;
             H[c1].push_back(n);
             H[c2].push_back(n);
             H[c3].push_back(n);
+        }
+        for (int p = 0; p < P; ++p) {
+            H[p].push_back(K + p);
         }
         return H;
     }
@@ -267,7 +272,6 @@ private:
         std::vector<uint8_t> codeword = info;
         codeword.resize(N, 0);
         
-        // Calculate parity bits: p = H_p * c_info (mod 2)
         for (int p = 0; p < P; ++p) {
             uint8_t parity = 0;
             for (int n : H[p]) {
@@ -279,13 +283,41 @@ private:
     }
 
     static std::vector<uint8_t> decode_chunk(const std::vector<uint8_t>& received) {
-        // Fast hard-decision majority decoding
         auto H = get_h_matrix();
         std::vector<uint8_t> result = received;
-        
-        // Single-pass syndrome decoding
-        // Simply extract information bits without trying to correct
-        // since we're in a clean test scenario
+
+        for (int iter = 0; iter < MAX_ITER; ++iter) {
+            std::vector<uint8_t> syndrome(P, 0);
+            int unsatisfied = 0;
+            for (int p = 0; p < P; ++p) {
+                uint8_t parity = 0;
+                for (int n : H[p]) parity ^= result[n] & 1;
+                syndrome[p] = parity;
+                unsatisfied += parity;
+            }
+            if (unsatisfied == 0) break;
+
+            std::vector<int> votes(K, 0);
+            for (int p = 0; p < P; ++p) {
+                if (!syndrome[p]) continue;
+                for (int n : H[p]) {
+                    if (n < K) votes[n]++;
+                }
+            }
+
+            int best_bit = -1;
+            int best_votes = 0;
+            for (int i = 0; i < K; ++i) {
+                if (votes[i] > best_votes) {
+                    best_votes = votes[i];
+                    best_bit = i;
+                }
+            }
+
+            if (best_bit < 0 || best_votes < 2) break;
+            result[best_bit] ^= 1;
+        }
+
         std::vector<uint8_t> decoded(K);
         for (int i = 0; i < K; ++i) {
             decoded[i] = result[i];

@@ -20,7 +20,7 @@ P4Modem explores radar-inspired waveform design and correlation-based detection 
 
 * **Forward Error Correction**
 
-  * LDPC (3,6)-regular encoding with code rate 0.82.
+  * Systematic sparse LDPC encoding with code rate 0.82.
   * Soft-error recovery from burst corruptions.
   * CRC-protected frames.
 
@@ -159,17 +159,17 @@ bazel test //lab:all
 
 ## Forward Error Correction Analysis
 
-### FEC Architecture: LDPC (3,6)-Regular
+### FEC Architecture: Systematic Sparse LDPC
 
 The current implementation uses a state-of-the-art but computationally efficient LDPC error correction scheme:
 
-* **Code Type:** Low-Density Parity-Check (LDPC) code, (3,6)-regular
-* **Sparse Matrix:** 3 parity checks per information bit, 6 information bits per check
+* **Code Type:** systematic sparse Low-Density Parity-Check (LDPC) code
+* **Sparse Matrix:** systematic sparse parity-check matrix with 3 parity checks per information bit
 * **Information Bits (K):** 82 bits
 * **Parity Bits (P):** 18 bits  
 * **Codeword Length (N):** 100 bits (K + P)
 * **Code Rate:** k/n = 82/100 = **0.82** (18% redundancy vs. 100% for repetition)
-* **Decoding Algorithm:** Fast hard-decision majority voting (3 iterations max)
+* **Decoding Algorithm:** iterative hard-decision syndrome bit-flipping (8 iterations max)
 * **Interleaver:** whole-frame 100-column block interleaver after FEC
 * **Encoding Ratio:** ~640:1 (256-byte payload -> 165 KB encoded @ 8 kHz)
 
@@ -185,6 +185,78 @@ On receive, the deinterleaver is applied before LDPC decoding. The decoder now
 tests candidate packet lengths in full 100-bit FEC codewords, which preserves
 the exact interleaver geometry used by the encoder.
 
+## Chirp/CSS Modem Prototype
+
+The repository also includes a separate chirp spread-spectrum prototype:
+
+```bash
+bazel build //lab:chirp_modem
+bazel test //lab:chirp_modem_test
+```
+
+`chirp_modem.cpp` uses LoRa-style cyclic shifts of an up-chirp instead of P4
+polyphase symbols. It keeps the same raw PCM interface:
+
+```bash
+bazel-bin/lab/chirp_modem enc input.bin output.pcm
+bazel-bin/lab/chirp_modem dec input.pcm output.bin
+```
+
+The chirp decoder is designed to be more tolerant of Doppler-like sample-rate
+error and weak transmitter/receiver clocks:
+
+- Frames use the same systematic sparse LDPC FEC and whole-frame block interleaver
+  as `p4modem.cpp`; chirp symbols carry the interleaved FEC bitstream in
+  4-bit CSS symbols.
+- During sync search, it tries multiple candidate symbol durations and reports
+  the inferred drift.
+- During payload decoding, it computes correlations at fractional timing
+  offsets and fractional chirp shifts, not only exact symbol centers.
+- It tracks timing from neighboring symbol decisions by smoothing the best
+  timing offset into the next symbol position and symbol-span estimate.
+- If CRC validation fails, it retries intermediate data-drift hypotheses and
+  small data-start timing offsets.
+
+`chirp_modem_test.sh` verifies clean roundtrip, whole-signal +1% stretch,
+whole-signal drift from -5% through +5% in 1% steps, and a +1% stretch in the
+middle 25% of the signal.
+
+The chirp modem has parallel tests for the same categories as P4:
+
+```bash
+bazel test //lab:chirp_modem_test
+bazel test //lab:chirp_pcm_to_wav_test
+bazel test //lab:chirp_corruption_test
+bazel test //lab:chirp_fec_limits_test
+bazel test //lab:chirp_fec_performance_test
+bazel test //lab:chirp_timing_drift_test
+```
+
+Measured chirp timing drift results:
+
+- `chirp_modem_test.sh`: a 30-byte frame decodes across whole-signal -5%..+5%
+  drift in 1% steps, plus a +1% middle-region stretch.
+- `chirp_timing_drift_test.sh`: payloads 4, 8, 16, 64, 128, 256, and 512 bytes
+  pass at -5%, 0%, and +5% whole-signal drift; 32-byte and 1024-byte payloads
+  pass at -5% and 0% but fail at +5% in the current decoder.
+- Bitflip timing-drift combinations are covered by the P4 timing matrix and by
+  chirp FEC/corruption tests; the full chirp bitflip timing matrix is currently
+  too expensive for routine Bazel runs.
+
+Measured chirp FEC regression results:
+
+| Payload | Encoded PCM | Preamble OK | Header OK | Mid-data OK |
+|---------|-------------|-------------|-----------|-------------|
+| 4 B | 24,736 B | 128 B | 16 B | 128 B |
+| 8 B | 31,136 B | 128 B | 16 B | 128 B |
+| 16 B | 31,136 B | 128 B | 16 B | 16 B |
+| 32 B | 43,936 B | 128 B | 16 B | 128 B |
+| 64 B | 63,136 B | 128 B | 16 B | 128 B |
+| 128 B | 101,536 B | 128 B | 16 B | 128 B |
+| 256 B | 184,736 B | 128 B | 16 B | 128 B |
+| 512 B | 344,736 B | 128 B | 16 B | 128 B |
+| 1024 B | 664,736 B | 128 B | 16 B | 128 B |
+
 ### Tested Error Correction Limits
 
 Comprehensive testing (`fec_limits_test.sh` and `fec_performance_test.sh`) validates recovery under preamble, sync, header-bearing data, and mid-payload corruption patterns. Burst sizes below are PCM bytes overwritten with `0xff`.
@@ -193,22 +265,22 @@ Comprehensive testing (`fec_limits_test.sh` and `fec_performance_test.sh`) valid
 
 | Payload | Encoded PCM | Preamble limit | Header-region limit | Mid-data limit | First mid-data failure |
 |---------|-------------|----------------|---------------------|----------------|------------------------|
-| 4 B | 32,000 B | >=1024 B | 256 B | >=1024 B | none in scan |
-| 8 B | 37,280 B | >=1024 B | 256 B | >=1024 B | none in scan |
-| 16 B | 37,280 B | >=1024 B | 256 B | >=1024 B | none in scan |
-| 32 B | 48,000 B | >=1024 B | 256 B | 128 B | 256 B |
-| 64 B | 64,000 B | >=1024 B | 256 B | 128 B | 256 B |
-| 128 B | 96,000 B | >=1024 B | 128 B | 128 B | 256 B |
-| 256 B | 165,280 B | >=1024 B | 256 B | 128 B | 256 B |
-| 512 B | 298,560 B | >=1024 B | 256 B | 128 B | 256 B |
-| 1024 B | 565,280 B | >=1024 B | 256 B | 128 B | 256 B |
+| 4 B | 32,000 B | >=1024 B | >=1024 B | >=1024 B | none in scan |
+| 8 B | 37,280 B | >=1024 B | 512 B | 512 B | 1024 B |
+| 16 B | 37,280 B | >=1024 B | >=1024 B | 256 B | 512 B |
+| 32 B | 48,000 B | >=1024 B | >=1024 B | 128 B | 256 B |
+| 64 B | 64,000 B | >=1024 B | >=1024 B | 128 B | 256 B |
+| 128 B | 96,000 B | >=1024 B | >=1024 B | 128 B | 256 B |
+| 256 B | 165,280 B | >=1024 B | >=1024 B | 128 B | 256 B |
+| 512 B | 298,560 B | >=1024 B | >=1024 B | 128 B | 256 B |
+| 1024 B | 565,280 B | >=1024 B | >=1024 B | 128 B | 256 B |
 
 **Region behavior:**
 
 - Preamble corruption is highly tolerant in the tested range because the sync sequence follows the preamble and can still be found.
 - Sync corruption is tested separately with 4 B and 8 B bursts at the sync start; both recover in the current matrix.
 - Header bits are FEC-protected and interleaved across the data symbols, but large early-data bursts still become the practical packet-finding limit.
-- Mid-data bursts recover through 128 B for payloads 32 B and larger, then fail at 256 B in the current hard-decision decoder.
+- Mid-data bursts recover through 128 B for payloads 32 B and larger, then fail at 256 B in the current hard-decision decoder. Smaller packets have fewer codewords and tolerate larger localized bursts in this matrix.
 
 ### Tested Timing Drift Limits
 
@@ -243,7 +315,7 @@ independent transmitter/receiver clocks, or long recordings with clock skew.
 
 ### Key Advantages Over Repetition Coding
 
-| Aspect | Repetition 2x | LDPC (3,6) |
+| Aspect | Repetition 2x | Sparse LDPC |
 |--------|--------------|-----------|
 | Overhead | 100% | 18% |
 | Encoding Ratio | ~970:1 | ~640:1 |
@@ -269,6 +341,9 @@ Run the FEC limit and performance test suites:
 bazel test //lab:fec_limits_test
 bazel test //lab:fec_performance_test
 bazel test //lab:timing_drift_test
+bazel test //lab:chirp_modem_test
+bazel test //lab:chirp_fec_performance_test
+bazel test //lab:chirp_timing_drift_test
 ```
 
 The performance matrix tests payloads of 4, 8, 16, 32, 64, 128, 256, 512, and 1024 bytes, increasing burst size until recovery fails or the scan reaches 1024 corrupted PCM bytes.

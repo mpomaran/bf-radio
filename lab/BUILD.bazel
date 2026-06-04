@@ -27,6 +27,13 @@ cc_binary(
     visibility = ["//visibility:public"],
 )
 
+cc_binary(
+    name = "chirp_modem",
+    srcs = ["chirp_modem.cpp"],
+    copts = CPP17_COPTS,
+    visibility = ["//visibility:public"],
+)
+
 sh_test(
     name = "p4modem_roundtrip_test",
     srcs = ["p4modem_test.sh"],
@@ -66,5 +73,47 @@ sh_test(
     name = "timing_drift_test",
     srcs = ["timing_drift_test.sh"],
     data = [":p4modem", ":pcm_impair"],
+    size = "large",
+)
+
+sh_test(
+    name = "chirp_modem_test",
+    srcs = ["chirp_modem_test.sh"],
+    data = [":chirp_modem", ":pcm_impair"],
+    size = "medium",
+)
+
+sh_test(
+    name = "chirp_pcm_to_wav_test",
+    srcs = ["chirp_pcm_to_wav_test.sh"],
+    data = [":chirp_modem", ":pcm_to_wav"],
+    size = "small",
+)
+
+sh_test(
+    name = "chirp_corruption_test",
+    srcs = ["chirp_corruption_test.sh"],
+    data = [":chirp_modem"],
+    size = "medium",
+)
+
+sh_test(
+    name = "chirp_fec_limits_test",
+    srcs = ["chirp_fec_limits_test.sh"],
+    data = [":chirp_modem"],
+    size = "large",
+)
+
+sh_test(
+    name = "chirp_fec_performance_test",
+    srcs = ["chirp_fec_performance_test.sh"],
+    data = [":chirp_modem"],
+    size = "large",
+)
+
+sh_test(
+    name = "chirp_timing_drift_test",
+    srcs = ["chirp_timing_drift_test.sh"],
+    data = [":chirp_modem", ":pcm_impair"],
     size = "large",
 )
