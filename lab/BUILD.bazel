@@ -6,3 +6,10 @@ cc_binary(
     copts = ["-std=c++17"],
     visibility = ["//visibility:public"],
 )
+
+sh_test(
+    name = "p4modem_roundtrip_test",
+    srcs = ["p4modem_test.sh"],
+    data = [":p4modem"],
+    size = "small",
+)

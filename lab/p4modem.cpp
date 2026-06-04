@@ -336,18 +336,6 @@ static int decode_symbol_at(const std::vector<int16_t>& pcm, size_t pos, double*
     return best;
 }
 
-static std::vector<uint8_t> symbols_to_bits(const std::vector<int>& symbols) {
-    std::vector<uint8_t> bits;
-    bits.reserve(symbols.size() * BITS_PER_SYMBOL);
-
-    for (int s : symbols) {
-        bits.push_back((s >> 2) & 1);
-        bits.push_back((s >> 1) & 1);
-        bits.push_back(s & 1);
-    }
-    return bits;
-}
-
 static std::vector<int> bits_to_symbols(const std::vector<uint8_t>& bits) {
     std::vector<int> symbols;
 
@@ -476,32 +464,51 @@ static void decode_file(const std::string& in_pcm_path, const std::string& out_p
         pos += SYMBOL_SAMPLES;
     }
 
-    auto ilv_bits = symbols_to_bits(symbols);
-    auto fec_bits = deinterleave(ilv_bits, 8);
-    auto data_bits = repetition_decode_2x(fec_bits);
-    auto bytes = bits_to_bytes(data_bits);
-
-    if (bytes.size() < 4) throw std::runtime_error("Decoded data too short");
-
-    uint16_t len = uint16_t(bytes[0]) | (uint16_t(bytes[1]) << 8);
-    if (len > 4096) throw std::runtime_error("Invalid decoded length");
-
-    size_t frame_len = 2 + size_t(len) + 2;
-    if (bytes.size() < frame_len) throw std::runtime_error("Decoded frame incomplete");
-
-    std::vector<uint8_t> frame(bytes.begin(), bytes.begin() + frame_len - 2);
-
-    uint16_t got_crc = uint16_t(bytes[frame_len - 2]) |
-                       (uint16_t(bytes[frame_len - 1]) << 8);
-    uint16_t calc_crc = crc16_ccitt(frame);
-
-    if (got_crc != calc_crc) {
-        std::cerr << "CRC FAIL: got=0x" << std::hex << got_crc
-                  << " calc=0x" << calc_crc << std::dec << "\n";
-        throw std::runtime_error("CRC check failed");
+    std::vector<uint8_t> symbol_bits;
+    symbol_bits.reserve(symbols.size() * BITS_PER_SYMBOL);
+    for (int s : symbols) {
+        symbol_bits.push_back((s >> 2) & 1);
+        symbol_bits.push_back((s >> 1) & 1);
+        symbol_bits.push_back(s & 1);
     }
 
-    std::vector<uint8_t> payload(bytes.begin() + 2, bytes.begin() + 2 + len);
+    std::vector<uint8_t> payload;
+    bool found = false;
+
+    for (size_t symbol_count = 1; symbol_count <= symbols.size(); ++symbol_count) {
+        size_t bit_count = symbol_count * BITS_PER_SYMBOL;
+        size_t byte_aligned = (bit_count / 8) * 8;
+        if (byte_aligned < 8) continue;
+
+        std::vector<uint8_t> ilv_bits(symbol_bits.begin(), symbol_bits.begin() + byte_aligned);
+        auto fec_bits = deinterleave(ilv_bits, 8);
+        auto data_bits = repetition_decode_2x(fec_bits);
+        auto bytes = bits_to_bytes(data_bits);
+
+        if (bytes.size() < 4) continue;
+
+        uint16_t len = uint16_t(bytes[0]) | (uint16_t(bytes[1]) << 8);
+        if (len > 4096) continue;
+
+        size_t frame_len = 2 + size_t(len) + 2;
+        if (bytes.size() < frame_len) continue;
+
+        std::vector<uint8_t> frame(bytes.begin(), bytes.begin() + frame_len - 2);
+        uint16_t got_crc = uint16_t(bytes[frame_len - 2]) |
+                           (uint16_t(bytes[frame_len - 1]) << 8);
+        uint16_t calc_crc = crc16_ccitt(frame);
+
+        if (got_crc == calc_crc) {
+            payload.assign(bytes.begin() + 2, bytes.begin() + 2 + len);
+            found = true;
+            break;
+        }
+    }
+
+    if (!found) {
+        throw std::runtime_error("CRC check failed or valid frame not found");
+    }
+
     write_file(out_path, payload);
 
     std::cerr << "Decoded " << payload.size() << " bytes OK\n";
