@@ -127,6 +127,22 @@ Future work may include:
 * Avoid SDR-specific assumptions
 * Serve as a playground for modern packet radio experimentation
 
+## How to Build
+
+This project uses Bazel for builds. From the repository root run:
+
+```bash
+git clone <repo-url> p4modem
+cd p4modem
+bazel build //lab:p4modem
+```
+
+The resulting binary will be available at:
+
+```bash
+bazel-bin/lab/p4modem
+```
+
 ## Disclaimer
 
 P4Modem is an experimental research project and is not intended for safety-critical communication. Users are responsible for complying with local radio regulations and licensing requirements.
