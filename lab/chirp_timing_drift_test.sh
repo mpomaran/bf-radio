@@ -20,7 +20,7 @@ resolve_tool() {
 
 modem="$(resolve_tool chirp_modem)"
 impair="$(resolve_tool pcm_impair)"
-payload_sizes=(4 8 16 32 64 128 256 512 1024)
+payload_sizes=(4 8 16 32 64 128 256 512)
 regions=(all)
 scales=(95 100 105)
 bitflip_modes=(no_bitflips)

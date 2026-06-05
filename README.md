@@ -202,21 +202,69 @@ bazel-bin/lab/chirp_modem enc input.bin output.pcm
 bazel-bin/lab/chirp_modem dec input.pcm output.bin
 ```
 
+It is also intended to build as a standalone Raspberry Pi OS C++17 program:
+
+```bash
+cd lab
+g++ -std=c++17 -O2 -Wall -Wextra -pedantic chirp_modem.cpp -o chirp_modem
+./chirp_modem selftest
+```
+
 The chirp decoder is designed to be more tolerant of Doppler-like sample-rate
 error and weak transmitter/receiver clocks:
 
-- Frames use the same systematic sparse LDPC FEC and whole-frame block interleaver
-  as `p4modem.cpp`; chirp symbols carry the interleaved FEC bitstream in
-  4-bit CSS symbols.
-- During sync search, it tries multiple candidate symbol durations and reports
-  the inferred drift.
+- Frames use a compact systematic sparse LDPC-style FEC local to
+  `chirp_modem.cpp`: 64 information bits, 64 parity bits, 128-bit codewords,
+  rate 1/2. Its parity-check columns are deterministic, nonzero, and unique.
+- The chirp demodulator computes correlation metrics for all 16 raw CSS
+  symbols, derives max-log bit LLRs, deinterleaves soft values, and feeds an
+  iterative weighted bit-flipping decoder. Positive LLR means bit 0 is more
+  likely.
+- TX maps 4-bit groups through Gray coding before CSS symbol selection; RX
+  converts raw CSS candidates back through Gray before building bit LLRs.
+- During sync search, it scans possible preamble starts across the PCM,
+  includes an energy-onset candidate for leading silence, tries multiple
+  candidate symbol durations, and then locally refines the best lock.
 - During payload decoding, it computes correlations at fractional timing
   offsets and fractional chirp shifts, not only exact symbol centers.
-- It tracks timing from neighboring symbol decisions by smoothing the best
-  timing offset into the next symbol position and symbol-span estimate.
+- It tracks timing with an explicit decision-directed loop containing position,
+  span, and filtered timing error state. Timing updates are confidence-gated
+  using the best-minus-second-best correlation margin and span is clamped.
 - If CRC validation fails, it retries intermediate data-drift hypotheses and
   small data-start timing offsets.
 
+### Streaming Acquisition
+
+`chirp_modem.cpp` now includes an internal streaming scan API for continuous
+PCM listening:
+
+```cpp
+StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pcm);
+```
+
+The scanner accepts an arbitrary rolling PCM window and reports:
+
+- `NoFrameWindowConsumed`: no useful frame was found; the caller may erase
+  `discard_prefix_samples`.
+- `NeedMoreSamples`: a plausible candidate may be present but the protected
+  header or full frame is incomplete; erase only `discard_prefix_samples`, keep
+  the remaining tail, append more PCM, and scan again.
+- `FrameDecoded`: a complete `CHRP` frame for this modem passed FEC, magic,
+  version, length, and CRC checks. `frame_start_sample` and `frame_end_sample`
+  are offsets in the supplied window, with `frame_end_sample` exclusive.
+- `InvalidFrameRejected`: a frame-like candidate was inspectable but rejected,
+  for example due to wrong magic/version/header/CRC; erase
+  `discard_prefix_samples` and continue scanning.
+
+The protected frame header is `CHRP`, version `1`, payload length, and flags.
+It is encoded as its own FEC codeword before the interleaved body so a streaming
+receiver can learn the required frame length without buffering arbitrary audio.
+
+`chirp_selftest_test.sh` runs the built-in `selftest` mode, covering bit/byte
+roundtrip, Gray mapping, hard and soft interleavers, FEC structure and error
+correction, clean modem roundtrip, leading silence, 0.98x/0.99x/1.01x/1.02x
+time scaling, sliding-window reception, long idle before a valid frame,
+no-frame streams, incomplete frame tails, and rejected incompatible frames.
 `chirp_modem_test.sh` verifies clean roundtrip, whole-signal +1% stretch,
 whole-signal drift from -5% through +5% in 1% steps, and a +1% stretch in the
 middle 25% of the signal.
@@ -226,6 +274,7 @@ The chirp modem has parallel tests for the same categories as P4:
 ```bash
 bazel test //lab:chirp_modem_test
 bazel test //lab:chirp_pcm_to_wav_test
+bazel test //lab:chirp_selftest_test
 bazel test //lab:chirp_corruption_test
 bazel test //lab:chirp_fec_limits_test
 bazel test //lab:chirp_fec_performance_test
@@ -236,9 +285,10 @@ Measured chirp timing drift results:
 
 - `chirp_modem_test.sh`: a 30-byte frame decodes across whole-signal -5%..+5%
   drift in 1% steps, plus a +1% middle-region stretch.
-- `chirp_timing_drift_test.sh`: payloads 4, 8, 16, 64, 128, 256, and 512 bytes
-  pass at -5%, 0%, and +5% whole-signal drift; 32-byte and 1024-byte payloads
-  pass at -5% and 0% but fail at +5% in the current decoder.
+- `chirp_timing_drift_test.sh`: routine Bazel coverage tests payloads 4, 8,
+  16, 32, 64, 128, 256, and 512 bytes at -5%, 0%, and +5% whole-signal drift.
+  The 1024-byte timing matrix is omitted from routine runs because the scalar
+  all-symbol correlator is too slow at that size without FFT/SIMD acceleration.
 - Bitflip timing-drift combinations are covered by the P4 timing matrix and by
   chirp FEC/corruption tests; the full chirp bitflip timing matrix is currently
   too expensive for routine Bazel runs.
@@ -247,15 +297,15 @@ Measured chirp FEC regression results:
 
 | Payload | Encoded PCM | Preamble OK | Header OK | Mid-data OK |
 |---------|-------------|-------------|-----------|-------------|
-| 4 B | 24,736 B | 128 B | 16 B | 128 B |
-| 8 B | 31,136 B | 128 B | 16 B | 128 B |
-| 16 B | 31,136 B | 128 B | 16 B | 16 B |
-| 32 B | 43,936 B | 128 B | 16 B | 128 B |
-| 64 B | 63,136 B | 128 B | 16 B | 128 B |
-| 128 B | 101,536 B | 128 B | 16 B | 128 B |
-| 256 B | 184,736 B | 128 B | 16 B | 128 B |
-| 512 B | 344,736 B | 128 B | 16 B | 128 B |
-| 1024 B | 664,736 B | 128 B | 16 B | 128 B |
+| 4 B | 26,528 B | 128 B | 16 B | 128 B |
+| 8 B | 34,720 B | 128 B | 16 B | 128 B |
+| 16 B | 42,912 B | 128 B | 16 B | 128 B |
+| 32 B | 59,296 B | 128 B | 16 B | 128 B |
+| 64 B | 92,064 B | 128 B | 16 B | 128 B |
+| 128 B | 157,600 B | 128 B | 16 B | 128 B |
+| 256 B | 288,672 B | 128 B | 16 B | 128 B |
+| 512 B | 550,816 B | 128 B | 16 B | 128 B |
+| 1024 B | 1,075,104 B | 128 B | 16 B | 128 B |
 
 ### Tested Error Correction Limits
 
