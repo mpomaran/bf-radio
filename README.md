@@ -47,10 +47,14 @@ Current implementation facts:
 - `SYMBOL_SAMPLES = 128`, so one symbol is 128 samples = 16 ms = 256 PCM bytes.
 - Preamble: 48 symbols of raw CSS symbol 0.
 - Sync sequence: `15, 1, 14, 2, 13, 3, 12, 4`.
+- Pilot symbol: raw CSS symbol `10` inserted every 32 protected data symbols.
 - Protected frame header: magic `CHRP`, version `1`, payload length, flags.
 - Maximum payload size: 4096 bytes.
+- TX scrambles protected FEC bits with a deterministic PRBS before Gray/CSS
+  mapping; RX descrambles by flipping LLR signs before FEC.
 - TX maps 4-bit groups through Gray coding before CSS symbol selection.
-- RX computes correlation metrics for all 16 raw CSS symbols.
+- RX computes metrics for all 16 raw CSS symbols using a 128-point FFT circular
+  correlation against the ideal or learned base chirp.
 - RX can learn an adaptive chirp template from the repeated preamble symbols,
   which helps with speaker/recorder/microphone paths that reshape the waveform.
 - If the adaptive template does not validate a frame, RX retries the candidate
@@ -82,9 +86,11 @@ payload bytes
 -> protected CHRP header + CRC16
 -> header FEC and body FEC
 -> body interleaver
+-> PRBS bit scrambler
 -> Gray-coded 4-bit groups
 -> 16-shift chirp/CSS symbols
--> preamble + sync + data + trailing silence
+-> pilot insertion every 32 data symbols
+-> preamble + sync + data/pilots + trailing silence
 -> raw 8 kHz PCM16
 ```
 
@@ -94,8 +100,10 @@ High-level receive path:
 raw 8 kHz PCM16
 -> streaming preamble/sync acquisition
 -> optional preamble-adaptive channel template
--> per-symbol correlation metrics
+-> FFT circular-correlation symbol metrics
+-> pilot-aided timing/template updates
 -> bit LLRs
+-> PRBS LLR descrambler
 -> body deinterleaver
 -> FEC decoder
 -> CHRP magic/version/length validation
@@ -317,6 +325,7 @@ The chirp frame is:
 preamble: 48 symbols of raw CSS symbol 0
 sync:     15, 1, 14, 2, 13, 3, 12, 4
 data:     protected header FEC codeword + interleaved protected body
+pilots:   raw CSS symbol 10 before data symbol 32, 64, 96, ...
 tail:     0.25 seconds of silence
 ```
 
@@ -336,7 +345,9 @@ payload bytes
 CRC16 over header + payload
 ```
 
-The header is protected by FEC. It is not placed outside the encoded data.
+The header is protected by FEC. It is not placed outside the encoded data. The
+PRBS scrambler and pilot insertion are physical-layer transforms around the
+protected bitstream; they do not change the CHRP payload format.
 
 ### FEC and Interleaving
 
@@ -575,11 +586,11 @@ Current local run, `./chirp_modem measure 500`, on 2026-06-13:
 | awgn-metric | -6 | 0.6506 | 0.347298 | 1 |
 | radio-metric | 12 | 0.0323437 | 0.0141906 | 0 |
 | radio-metric | 9 | 0.0617 | 0.0273938 | 0.098 |
-| radio-metric | 6 | 0.174838 | 0.0801594 | 0.946 |
+| radio-metric | 6 | 0.174462 | 0.0798219 | 0.954 |
 | radio-metric | 3 | 0.381663 | 0.185705 | 1 |
 | radio-metric | 0 | 0.5837 | 0.293388 | 1 |
 | radio-metric | -3 | 0.722931 | 0.37088 | 1 |
-| radio-metric | -6 | 0.805187 | 0.419264 | 1 |
+| radio-metric | -6 | 0.805219 | 0.419361 | 1 |
 
 Interpretation:
 
@@ -602,15 +613,15 @@ useful next fixes are:
 - Add a preamble-based SFO/CFO estimator. Estimate sample-rate offset and
   residual frequency/phase slope before data, then initialize the timing loop
   from that estimate instead of letting data symbols discover it.
-- Add pilot symbols every 32 or 64 data symbols. Use pilots to update timing,
-  channel/template shape, and metric scaling without decision-directed error
-  propagation.
+- Tune the new pilot symbols. The current PHY inserts raw symbol `10` every 32
+  protected data symbols and uses it for timing/template updates; future work
+  should test pilot spacing, pilot sequence choice, and metric-scale estimation.
 - Make the interleaver span time and FEC codewords more deliberately. Current
   block interleaving is simple; burst errors from fades/echo timing slips should
   be spread over more codewords.
-- Add a scrambler/randomizer before FEC. CCSDS notes that LDPC alone does not
-  guarantee enough bit transitions for synchronizers; a randomizer also makes
-  FEC and interleaving behavior less data-pattern dependent.
+- Improve the new PRBS scrambler. Current scrambling is applied after FEC and is
+  undone by LLR sign flips before BP; future work should evaluate whether
+  payload-before-FEC scrambling gives better FEC/interleaver behavior.
 - Replace the local LDPC-style matrix with a known short-block LDPC, starting
   with CCSDS `(128,64)` or `(512,256)`. The decoder is now BP-capable, but the
   matrix is still local and not optimized like WiFi/DVB/CCSDS matrices.

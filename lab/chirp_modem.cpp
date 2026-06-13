@@ -32,6 +32,8 @@ static constexpr int ALPHABET = 16;
 static constexpr int BITS_PER_SYMBOL = 4;
 static constexpr int PREAMBLE_SYMBOLS = 48;
 static constexpr int SYNC_SYMBOLS = 8;
+static constexpr int PILOT_INTERVAL_SYMBOLS = 32;
+static constexpr int PILOT_SYMBOL = 10;
 static constexpr int FEC_INFO_BITS = 64;
 static constexpr int FEC_PARITY_BITS = 64;
 static constexpr int FEC_CODEWORD_BITS = FEC_INFO_BITS + FEC_PARITY_BITS;
@@ -145,6 +147,49 @@ static std::vector<uint8_t> bits_to_symbols(const std::vector<uint8_t>& bits) {
         symbols.push_back(binary_to_gray4(binary_symbol));
     }
     return symbols;
+}
+
+static uint8_t prbs_bit(uint16_t* state) {
+    const uint8_t out = uint8_t(*state & 1U);
+    const uint16_t feedback =
+        uint16_t(((*state >> 0) ^ (*state >> 2) ^ (*state >> 3) ^ (*state >> 5)) & 1U);
+    *state = uint16_t((*state >> 1) | (feedback << 15));
+    return out;
+}
+
+static std::vector<uint8_t> scramble_bits(const std::vector<uint8_t>& bits) {
+    std::vector<uint8_t> out;
+    out.reserve(bits.size());
+    uint16_t state = 0xACE1u;
+    for (uint8_t b : bits) out.push_back(uint8_t((b ^ prbs_bit(&state)) & 1U));
+    return out;
+}
+
+static std::vector<double> descramble_llrs(const std::vector<double>& llrs) {
+    std::vector<double> out;
+    out.reserve(llrs.size());
+    uint16_t state = 0xACE1u;
+    for (double v : llrs) {
+        out.push_back(prbs_bit(&state) ? -v : v);
+    }
+    return out;
+}
+
+static size_t pilot_count_for_data_symbols(size_t data_symbols) {
+    if (data_symbols == 0) return 0;
+    return (data_symbols - 1) / size_t(PILOT_INTERVAL_SYMBOLS);
+}
+
+static std::vector<uint8_t> insert_pilot_symbols(const std::vector<uint8_t>& data_symbols) {
+    std::vector<uint8_t> out;
+    out.reserve(data_symbols.size() + pilot_count_for_data_symbols(data_symbols.size()));
+    for (size_t i = 0; i < data_symbols.size(); ++i) {
+        if (i > 0 && (i % size_t(PILOT_INTERVAL_SYMBOLS)) == 0) {
+            out.push_back(uint8_t(PILOT_SYMBOL));
+        }
+        out.push_back(data_symbols[i]);
+    }
+    return out;
 }
 
 /*
@@ -886,7 +931,8 @@ static SymbolMetrics decode_symbol_metrics_at(const std::vector<int16_t>& pcm,
                                               double pos,
                                               double symbol_span,
                                               bool intermediate,
-                                              const AdaptiveTemplateBank* adaptive = nullptr) {
+                                              const AdaptiveTemplateBank* adaptive = nullptr,
+                                              int rank_symbol = -1) {
     static const double timing_offsets[] = {
         -24.0, -18.0, -12.0, -8.0, -4.0, -2.0, -1.0, -0.5,
         0.0,
@@ -947,7 +993,11 @@ static SymbolMetrics decode_symbol_metrics_at(const std::vector<int16_t>& pcm,
         finalize_best_scores(&current);
 
         const double timing_penalty = (adaptive != nullptr && adaptive->valid) ? 0.012 : 0.003;
-        const double rank = current.best_score - timing_penalty * std::abs(timing_offset);
+        const double rank_score =
+            (rank_symbol >= 0 && rank_symbol < ALPHABET)
+                ? current.metric[size_t(rank_symbol)]
+                : current.best_score;
+        const double rank = rank_score - timing_penalty * std::abs(timing_offset);
         if (rank > best_rank) {
             best = current;
             best_rank = rank;
@@ -1060,12 +1110,12 @@ static std::vector<uint8_t> build_frame_tx_bits(const std::vector<uint8_t>& fram
     tx_bits.reserve(header_fec.size() + body_tx_bits.size());
     tx_bits.insert(tx_bits.end(), header_fec.begin(), header_fec.end());
     tx_bits.insert(tx_bits.end(), body_tx_bits.begin(), body_tx_bits.end());
-    return tx_bits;
+    return scramble_bits(tx_bits);
 }
 
 static std::vector<int16_t> encode_frame_bytes_to_pcm(const std::vector<uint8_t>& frame) {
     const std::vector<uint8_t> tx_bits = build_frame_tx_bits(frame);
-    const std::vector<uint8_t> symbols = bits_to_symbols(tx_bits);
+    const std::vector<uint8_t> symbols = insert_pilot_symbols(bits_to_symbols(tx_bits));
 
     std::vector<int16_t> pcm;
     pcm.reserve((PREAMBLE_SYMBOLS + SYNC_SYMBOLS + symbols.size()) * SYMBOL_SAMPLES + SAMPLE_RATE / 4);
@@ -1249,12 +1299,50 @@ static std::vector<double> decode_llrs_tracking(const std::vector<int16_t>& pcm,
     const double template_learning_rate = 0.010;
     const double kp = adaptive_templates ? 0.18 : 0.55;
     const double ki = adaptive_templates ? 0.003 : 0.015;
+    size_t data_symbols = 0;
+    size_t next_pilot_after = size_t(PILOT_INTERVAL_SYMBOLS);
 
     while (timing.pos + timing.span < double(pcm.size()) && llrs.size() < max_bits) {
+        if (data_symbols == next_pilot_after) {
+            const SymbolMetrics pilot =
+                decode_symbol_metrics_at(pcm, timing.pos, timing.span, true,
+                                         adaptive, PILOT_SYMBOL);
+            double best_other = -1.0;
+            for (int s = 0; s < ALPHABET; ++s) {
+                if (s != PILOT_SYMBOL) {
+                    best_other = std::max(best_other, pilot.metric[size_t(s)]);
+                }
+            }
+            const double pilot_confidence =
+                pilot.metric[size_t(PILOT_SYMBOL)] - best_other;
+            if (adaptive != nullptr && adaptive->valid &&
+                pilot.metric[size_t(PILOT_SYMBOL)] > 0.20 &&
+                std::abs(pilot.timing_offset) <= template_update_max_timing_offset) {
+                update_adaptive_template_bank(adaptive, pcm,
+                                              timing.pos + pilot.timing_offset,
+                                              timing.span, PILOT_SYMBOL,
+                                              template_learning_rate * 1.8);
+            }
+            if (pilot_confidence > 0.0 &&
+                std::abs(pilot.timing_offset) <= timing_update_max_offset) {
+                timing.timing_error_filtered =
+                    0.80 * timing.timing_error_filtered + 0.20 * pilot.timing_offset;
+                timing.span += 1.5 * ki * timing.timing_error_filtered;
+                timing.span = std::max(min_span, std::min(max_span, timing.span));
+                timing.pos += timing.span + 0.75 * kp * pilot.timing_offset;
+            } else {
+                timing.timing_error_filtered *= 0.98;
+                timing.pos += timing.span;
+            }
+            next_pilot_after += size_t(PILOT_INTERVAL_SYMBOLS);
+            continue;
+        }
+
         const SymbolMetrics m =
             decode_symbol_metrics_at(pcm, timing.pos, timing.span, true, adaptive);
         const std::array<double, BITS_PER_SYMBOL> symbol_llr = symbol_metrics_to_llr(m);
         for (double v : symbol_llr) llrs.push_back(v);
+        ++data_symbols;
 
         const double confidence = m.best_score - m.second_best_score;
         if (decision_directed_update && adaptive != nullptr && adaptive->valid &&
@@ -1370,8 +1458,9 @@ static bool decode_exact_payload_from_llrs(const std::vector<double>& llrs,
                                            std::vector<uint8_t>* payload) {
     if (llrs.size() < fec_bit_count || fec_bit_count < FEC_CODEWORD_BITS) return false;
 
-    std::vector<double> header_llrs(llrs.begin(),
-                                    llrs.begin() + std::ptrdiff_t(FEC_CODEWORD_BITS));
+    const std::vector<double> fec_llrs = descramble_llrs(llrs);
+    std::vector<double> header_llrs(fec_llrs.begin(),
+                                    fec_llrs.begin() + std::ptrdiff_t(FEC_CODEWORD_BITS));
     const std::vector<uint8_t> header_bits = fec_decode_bits_from_llr(header_llrs);
     std::vector<uint8_t> bytes = bits_to_bytes(header_bits);
     bytes.resize(PROTOCOL_HEADER_BYTES);
@@ -1382,8 +1471,8 @@ static bool decode_exact_payload_from_llrs(const std::vector<double>& llrs,
 
     const size_t body_fec_bits = fec_bit_count - FEC_CODEWORD_BITS;
     if (body_fec_bits > 0) {
-        std::vector<double> body_tx_llrs(llrs.begin() + std::ptrdiff_t(FEC_CODEWORD_BITS),
-                                         llrs.begin() + std::ptrdiff_t(fec_bit_count));
+        std::vector<double> body_tx_llrs(fec_llrs.begin() + std::ptrdiff_t(FEC_CODEWORD_BITS),
+                                         fec_llrs.begin() + std::ptrdiff_t(fec_bit_count));
         const std::vector<double> body_fec_llrs = deinterleave_soft(body_tx_llrs);
         const std::vector<uint8_t> body_bits = fec_decode_bits_from_llr(body_fec_llrs);
         const std::vector<uint8_t> body_bytes = bits_to_bytes(body_bits);
@@ -1552,6 +1641,7 @@ static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pc
                 std::vector<double> header_tx(
                     header_llrs.begin(),
                     header_llrs.begin() + std::ptrdiff_t(FEC_CODEWORD_BITS));
+                header_tx = descramble_llrs(header_tx);
                 const std::vector<uint8_t> header_bits = fec_decode_bits_from_llr(header_tx);
                 const std::vector<uint8_t> header_bytes = bits_to_bytes(header_bits);
 
@@ -1567,7 +1657,10 @@ static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pc
 
                 const size_t required_symbols =
                     (required_fec_bits + BITS_PER_SYMBOL - 1) / BITS_PER_SYMBOL;
-                const double frame_end = data_pos + double(required_symbols) * candidate_span;
+                const size_t required_physical_symbols =
+                    required_symbols + pilot_count_for_data_symbols(required_symbols);
+                const double frame_end =
+                    data_pos + double(required_physical_symbols) * candidate_span;
                 if (frame_end + candidate_span >= double(pcm.size())) {
                     result.status = StreamScanStatus::NeedMoreSamples;
                     result.discard_prefix_samples = clamp_discard(frame_start, pcm.size());
@@ -1850,6 +1943,20 @@ static RawLinkMetrics measure_raw_link_metrics(const std::vector<int16_t>& pcm,
             const double ki = adaptive_ptr != nullptr ? 0.003 : 0.015;
 
             for (size_t i = 0; i < expected_symbols.size(); ++i) {
+                if (i > 0 && (i % size_t(PILOT_INTERVAL_SYMBOLS)) == 0) {
+                    const SymbolMetrics pilot =
+                        decode_symbol_metrics_at(pcm, timing.pos, timing.span, true,
+                                                 adaptive_ptr, PILOT_SYMBOL);
+                    if (std::abs(pilot.timing_offset) <= timing_update_max_offset) {
+                        timing.timing_error_filtered =
+                            0.80 * timing.timing_error_filtered + 0.20 * pilot.timing_offset;
+                        timing.span += 1.5 * ki * timing.timing_error_filtered;
+                        timing.span = std::max(min_span, std::min(max_span, timing.span));
+                        timing.pos += timing.span + 0.75 * kp * pilot.timing_offset;
+                    } else {
+                        timing.pos += timing.span;
+                    }
+                }
                 if (timing.pos + timing.span >= double(pcm.size())) {
                     candidate.symbol_errors += expected_symbols.size() - i;
                     candidate.bit_errors += expected_tx_bits.size() - i * BITS_PER_SYMBOL;

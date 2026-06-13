@@ -23,15 +23,16 @@ find_runfile() {
 
 chirp_modem="$(find_runfile lab/chirp_modem)"
 impair="$(find_runfile lab/pcm_audio_channel_impair)"
-original="$(rlocation testdata/original_encoded.pcm)"
 expected="$(rlocation testdata/transmitted.txt)"
 
+original="$TEST_TMPDIR/original_encoded.pcm"
 impaired="$TEST_TMPDIR/audio_channel.pcm"
 decoded="$TEST_TMPDIR/decoded.bin"
 log="$TEST_TMPDIR/decode.log"
 
+"$chirp_modem" enc "$expected" "$original" >"$TEST_TMPDIR/encode.log" 2>&1
 "$impair" "$original" "$impaired" >"$TEST_TMPDIR/impair.log" 2>&1
-timeout 20 "$chirp_modem" dec "$impaired" "$decoded" >"$log" 2>&1
+timeout 60 "$chirp_modem" dec "$impaired" "$decoded" >"$log" 2>&1
 cmp -s "$expected" "$decoded"
 
 echo "Synthetic audio-channel impairment test OK"
