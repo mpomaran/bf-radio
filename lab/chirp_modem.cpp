@@ -156,21 +156,28 @@ static std::vector<uint8_t> bits_to_symbols(const std::vector<uint8_t>& bits) {
     P = 64 parity bits
     N = 128 total bits, rate 1/2
 
-  H = [A | I], where each information column in A has weight 3:
+  H = [A | I], where each information column in A uses up to three row taps:
 
     rows: n, 11*n+7, 23*n+19 (mod 64)
 
-  The first row index makes all information columns unique. Parity columns are
-  unit vectors, so there are no duplicate columns and no weight-1 or weight-2
-  undetectable error patterns. Encoding is systematic. Decoding is an iterative
-  hard/soft weighted bit-flipping decoder. Positive LLR means bit 0 is more
-  likely; negative LLR means bit 1 is more likely.
+  The first row index makes all information columns unique. A few columns have
+  two distinct taps because two formulas can hit the same row; duplicate taps
+  are collapsed exactly as they are in info_mask(). Parity columns are unit
+  vectors. Encoding is systematic. Decoding uses full soft-decision sum-product
+  belief propagation in the LLR domain. Positive LLR means bit 0 is more likely;
+  negative LLR means bit 1 is more likely.
+
+  This is still a tiny local experimental code. The decoder algorithm is now a
+  real BP decoder, but the code construction is not WiFi, DVB-S2, or CCSDS LDPC.
 */
 class LDPCCodec {
     static constexpr int K = FEC_INFO_BITS;
     static constexpr int P = FEC_PARITY_BITS;
     static constexpr int N = FEC_CODEWORD_BITS;
-    static constexpr int MAX_ITER = 20;
+    static constexpr int MAX_CHECK_DEGREE = 4;
+    static constexpr int MAX_ITER = 40;
+    static constexpr double MESSAGE_LIMIT = 18.0;
+    static constexpr double TANH_LIMIT = 1.0 - 1e-12;
 
 public:
     static std::vector<uint8_t> encode(const std::vector<uint8_t>& info_bits) {
@@ -259,42 +266,115 @@ private:
         return unsatisfied;
     }
 
-    static std::array<uint8_t, K> decode_chunk_from_llr(const std::array<double, N>& llr) {
+    static int positive_mod(int value, int modulus) {
+        value %= modulus;
+        return value < 0 ? value + modulus : value;
+    }
+
+    static int append_unique_var(std::array<int, MAX_CHECK_DEGREE>* vars,
+                                 int degree,
+                                 int bit) {
+        for (int i = 0; i < degree; ++i) {
+            if ((*vars)[size_t(i)] == bit) return degree;
+        }
+        (*vars)[size_t(degree)] = bit;
+        return degree + 1;
+    }
+
+    static std::array<int, MAX_CHECK_DEGREE> check_variables(int row, int* degree) {
+        /*
+          These are the inverse mappings of:
+            row = n
+            row = 11*n + 7   (mod 64), inverse(11) = 35
+            row = 23*n + 19  (mod 64), inverse(23) = 39
+          The final variable is the systematic parity bit for this row. Duplicate
+          information taps are collapsed so the graph matches info_mask().
+        */
+        std::array<int, MAX_CHECK_DEGREE> vars = {};
+        for (int& v : vars) v = -1;
+        int deg = 0;
+        deg = append_unique_var(&vars, deg, row);
+        deg = append_unique_var(&vars, deg, positive_mod(35 * (row - 7), P));
+        deg = append_unique_var(&vars, deg, positive_mod(39 * (row - 19), P));
+        deg = append_unique_var(&vars, deg, K + row);
+        *degree = deg;
+        return vars;
+    }
+
+    static double clamp_message(double value) {
+        if (value > MESSAGE_LIMIT) return MESSAGE_LIMIT;
+        if (value < -MESSAGE_LIMIT) return -MESSAGE_LIMIT;
+        return value;
+    }
+
+    static std::array<uint8_t, N> hard_decision(const std::array<double, N>& llr) {
         std::array<uint8_t, N> bits = {};
         for (int i = 0; i < N; ++i) bits[size_t(i)] = llr[size_t(i)] < 0.0 ? 1 : 0;
+        return bits;
+    }
+
+    static std::array<uint8_t, K> decode_chunk_from_llr(const std::array<double, N>& input_llr) {
+        std::array<double, N> channel_llr = {};
+        for (int i = 0; i < N; ++i) {
+            channel_llr[size_t(i)] = clamp_message(input_llr[size_t(i)]);
+        }
+
+        std::array<std::array<int, MAX_CHECK_DEGREE>, P> vars = {};
+        std::array<int, P> check_degree = {};
+        std::array<std::array<double, MAX_CHECK_DEGREE>, P> var_to_check = {};
+        std::array<std::array<double, MAX_CHECK_DEGREE>, P> check_to_var = {};
+        for (int row = 0; row < P; ++row) {
+            vars[size_t(row)] = check_variables(row, &check_degree[size_t(row)]);
+            for (int edge = 0; edge < check_degree[size_t(row)]; ++edge) {
+                var_to_check[size_t(row)][size_t(edge)] =
+                    channel_llr[size_t(vars[size_t(row)][size_t(edge)])];
+            }
+        }
+
+        std::array<double, N> posterior = channel_llr;
+        std::array<uint8_t, N> bits = hard_decision(posterior);
+        std::array<uint8_t, P> syndrome = {};
+        if (compute_syndrome(bits, &syndrome) == 0) {
+            std::array<uint8_t, K> decoded = {};
+            for (int i = 0; i < K; ++i) decoded[size_t(i)] = bits[size_t(i)] & 1;
+            return decoded;
+        }
 
         for (int iter = 0; iter < MAX_ITER; ++iter) {
-            std::array<uint8_t, P> syndrome = {};
-            if (compute_syndrome(bits, &syndrome) == 0) break;
-
-            int best_bit = -1;
-            double best_score = 0.0;
-            for (int bit = 0; bit < N; ++bit) {
-                int unsat = 0;
-                int sat = 0;
-                if (bit < K) {
-                    const uint64_t mask = info_mask(bit);
-                    for (int p = 0; p < P; ++p) {
-                        if ((mask >> p) & 1U) {
-                            if (syndrome[size_t(p)]) ++unsat;
-                            else ++sat;
-                        }
+            for (int row = 0; row < P; ++row) {
+                for (int edge = 0; edge < check_degree[size_t(row)]; ++edge) {
+                    double product = 1.0;
+                    for (int other = 0; other < check_degree[size_t(row)]; ++other) {
+                        if (other == edge) continue;
+                        product *= std::tanh(0.5 * var_to_check[size_t(row)][size_t(other)]);
                     }
-                } else {
-                    if (syndrome[size_t(bit - K)]) ++unsat;
-                    else ++sat;
-                }
-
-                const double reliability = std::min(std::abs(llr[size_t(bit)]), 8.0);
-                const double score = double(unsat) - 0.45 * double(sat) - 0.08 * reliability;
-                if (score > best_score) {
-                    best_score = score;
-                    best_bit = bit;
+                    product = std::max(-TANH_LIMIT, std::min(TANH_LIMIT, product));
+                    check_to_var[size_t(row)][size_t(edge)] =
+                        clamp_message(2.0 * std::atanh(product));
                 }
             }
 
-            if (best_bit < 0) break;
-            bits[size_t(best_bit)] ^= 1;
+            posterior = channel_llr;
+            for (int row = 0; row < P; ++row) {
+                for (int edge = 0; edge < check_degree[size_t(row)]; ++edge) {
+                    const int bit = vars[size_t(row)][size_t(edge)];
+                    posterior[size_t(bit)] =
+                        clamp_message(posterior[size_t(bit)] +
+                                      check_to_var[size_t(row)][size_t(edge)]);
+                }
+            }
+
+            bits = hard_decision(posterior);
+            if (compute_syndrome(bits, &syndrome) == 0) break;
+
+            for (int row = 0; row < P; ++row) {
+                for (int edge = 0; edge < check_degree[size_t(row)]; ++edge) {
+                    const int bit = vars[size_t(row)][size_t(edge)];
+                    var_to_check[size_t(row)][size_t(edge)] =
+                        clamp_message(posterior[size_t(bit)] -
+                                      check_to_var[size_t(row)][size_t(edge)]);
+                }
+            }
         }
 
         std::array<uint8_t, K> decoded = {};
@@ -837,7 +917,7 @@ static bool parse_protected_frame(const std::vector<uint8_t>& bytes,
     return true;
 }
 
-static std::vector<int16_t> encode_frame_bytes_to_pcm(const std::vector<uint8_t>& frame) {
+static std::vector<uint8_t> build_frame_tx_bits(const std::vector<uint8_t>& frame) {
     if (frame.size() < PROTOCOL_HEADER_BYTES + CRC_BYTES) {
         throw std::runtime_error("Protected frame too short");
     }
@@ -852,6 +932,11 @@ static std::vector<int16_t> encode_frame_bytes_to_pcm(const std::vector<uint8_t>
     tx_bits.reserve(header_fec.size() + body_tx_bits.size());
     tx_bits.insert(tx_bits.end(), header_fec.begin(), header_fec.end());
     tx_bits.insert(tx_bits.end(), body_tx_bits.begin(), body_tx_bits.end());
+    return tx_bits;
+}
+
+static std::vector<int16_t> encode_frame_bytes_to_pcm(const std::vector<uint8_t>& frame) {
+    const std::vector<uint8_t> tx_bits = build_frame_tx_bits(frame);
     const std::vector<uint8_t> symbols = bits_to_symbols(tx_bits);
 
     std::vector<int16_t> pcm;
@@ -1533,6 +1618,379 @@ static void append_scaled(std::vector<int16_t>& dst,
     }
 }
 
+struct RawLinkMetrics {
+    size_t symbols = 0;
+    size_t symbol_errors = 0;
+    size_t bits = 0;
+    size_t bit_errors = 0;
+    bool sync_locked = false;
+};
+
+static double active_signal_power(const std::vector<int16_t>& pcm) {
+    double sum = 0.0;
+    size_t count = 0;
+    for (int16_t s : pcm) {
+        if (std::abs(int(s)) < 8) continue;
+        const double v = double(s);
+        sum += v * v;
+        ++count;
+    }
+    if (count == 0) return 1.0;
+    return sum / double(count);
+}
+
+static std::vector<int16_t> add_awgn_for_snr(const std::vector<int16_t>& pcm,
+                                             double snr_db,
+                                             std::mt19937* rng) {
+    const double power = active_signal_power(pcm);
+    const double noise_power = power / std::pow(10.0, snr_db / 10.0);
+    std::normal_distribution<double> noise(0.0, std::sqrt(noise_power));
+    std::vector<int16_t> out;
+    out.reserve(pcm.size());
+    for (int16_t s : pcm) {
+        double v = double(s) + noise(*rng);
+        v = std::max(-32768.0, std::min(32767.0, v));
+        out.push_back(int16_t(std::lround(v)));
+    }
+    return out;
+}
+
+static std::vector<int16_t> apply_quality_radio_channel(const std::vector<int16_t>& pcm,
+                                                        double snr_db,
+                                                        std::mt19937* rng) {
+    std::vector<int16_t> work = resample_pcm(pcm, 1.002);
+    std::vector<double> shaped(work.size() + 96, 0.0);
+    const double pi = 3.14159265358979323846;
+    double lp = 0.0;
+    double prev_in = 0.0;
+    double prev_hp = 0.0;
+
+    for (size_t i = 0; i < work.size(); ++i) {
+        const double fade = 1.0 - 0.10 * 0.5 *
+                                      (1.0 - std::cos(2.0 * pi * double(i) / 36000.0));
+        const double input = double(work[i]) * 0.78 * fade;
+        const double hp = input - prev_in + 0.996 * prev_hp;
+        prev_in = input;
+        prev_hp = hp;
+        lp += 0.84 * (hp - lp);
+        shaped[i] += lp;
+        shaped[i + 19] += 0.09 * lp;
+        shaped[i + 67] += 0.025 * lp;
+    }
+
+    std::vector<int16_t> out;
+    out.reserve(shaped.size());
+    for (double v : shaped) {
+        v = std::max(-30000.0, std::min(30000.0, v));
+        out.push_back(int16_t(std::lround(v)));
+    }
+    out = add_awgn_for_snr(out, snr_db, rng);
+
+    std::uniform_int_distribution<int> impulse_dist(-700, 700);
+    for (size_t i = 2048; i < out.size(); i += 4096) {
+        const int v = int(out[i]) + impulse_dist(*rng);
+        out[i] = int16_t(std::max(-32768, std::min(32767, v)));
+    }
+    return out;
+}
+
+static RawLinkMetrics measure_raw_link_metrics(const std::vector<int16_t>& pcm,
+                                               const std::vector<uint8_t>& expected_tx_bits,
+                                               const std::vector<uint8_t>& expected_symbols) {
+    RawLinkMetrics metrics;
+    metrics.symbols = expected_symbols.size();
+    metrics.bits = expected_tx_bits.size();
+    try {
+        const SyncLock lock = find_sync(pcm, false, nullptr);
+        metrics.sync_locked = true;
+        const AdaptiveTemplateBank adaptive =
+            build_adaptive_template_bank(pcm, lock.preamble_pos, lock.symbol_span);
+
+        auto measure_candidate = [&](double candidate_span,
+                                     const AdaptiveTemplateBank* adaptive_ptr) {
+            RawLinkMetrics candidate;
+            candidate.symbols = expected_symbols.size();
+            candidate.bits = expected_tx_bits.size();
+            candidate.sync_locked = true;
+            TimingState timing(lock.sync_pos + SYNC_SYMBOLS * lock.symbol_span,
+                               candidate_span);
+            const double min_span = NOMINAL_SPAN * 0.85;
+            const double max_span = NOMINAL_SPAN * 1.15;
+            const double confidence_threshold = adaptive_ptr != nullptr ? 0.055 : 0.035;
+            const double timing_update_max_offset = adaptive_ptr != nullptr ? 4.0 : 24.0;
+            const double kp = adaptive_ptr != nullptr ? 0.18 : 0.55;
+            const double ki = adaptive_ptr != nullptr ? 0.003 : 0.015;
+
+            for (size_t i = 0; i < expected_symbols.size(); ++i) {
+                if (timing.pos + timing.span >= double(pcm.size())) {
+                    candidate.symbol_errors += expected_symbols.size() - i;
+                    candidate.bit_errors += expected_tx_bits.size() - i * BITS_PER_SYMBOL;
+                    break;
+                }
+
+                const SymbolMetrics m =
+                    decode_symbol_metrics_at(pcm, timing.pos, timing.span, true, adaptive_ptr);
+                if (uint8_t(m.best_symbol) != expected_symbols[i]) ++candidate.symbol_errors;
+
+                const uint8_t binary_symbol = gray_to_binary4(uint8_t(m.best_symbol));
+                for (int bit = 0; bit < BITS_PER_SYMBOL; ++bit) {
+                    const size_t bit_index = i * BITS_PER_SYMBOL + size_t(bit);
+                    if (bit_index >= expected_tx_bits.size()) break;
+                    const uint8_t got =
+                        uint8_t((binary_symbol >> (BITS_PER_SYMBOL - 1 - bit)) & 1);
+                    if (got != (expected_tx_bits[bit_index] & 1)) ++candidate.bit_errors;
+                }
+
+                const double confidence = m.best_score - m.second_best_score;
+                if (confidence > confidence_threshold &&
+                    std::abs(m.timing_offset) <= timing_update_max_offset) {
+                    timing.timing_error_filtered =
+                        0.85 * timing.timing_error_filtered + 0.15 * m.timing_offset;
+                    timing.span += ki * timing.timing_error_filtered;
+                    timing.span = std::max(min_span, std::min(max_span, timing.span));
+                    timing.pos += timing.span + kp * m.timing_offset;
+                } else {
+                    timing.timing_error_filtered *= 0.98;
+                    timing.pos += timing.span;
+                }
+            }
+            return candidate;
+        };
+
+        metrics.symbol_errors = metrics.symbols;
+        metrics.bit_errors = metrics.bits;
+        const int span_tenths[] = {0, 1, -1, 2, -2, 5, -5, 10, -10, 20, -20, 30, -30};
+        for (int signed_tenths : span_tenths) {
+            const double candidate_span =
+                lock.symbol_span * (1.0 + double(signed_tenths) / 1000.0);
+            const int template_modes = adaptive.valid ? 2 : 1;
+            for (int template_mode = 0; template_mode < template_modes; ++template_mode) {
+                const AdaptiveTemplateBank* adaptive_ptr =
+                    (template_mode == 0 && adaptive.valid) ? &adaptive : nullptr;
+                const RawLinkMetrics candidate =
+                    measure_candidate(candidate_span, adaptive_ptr);
+                if (candidate.bit_errors < metrics.bit_errors) metrics = candidate;
+            }
+        }
+    } catch (const std::exception&) {
+        metrics.sync_locked = false;
+        metrics.symbol_errors = metrics.symbols;
+        metrics.bit_errors = metrics.bits / 2;
+    }
+    return metrics;
+}
+
+static size_t count_payload_bit_errors(const std::vector<uint8_t>& expected,
+                                       const std::vector<uint8_t>& got) {
+    const size_t max_size = std::max(expected.size(), got.size());
+    size_t errors = 0;
+    for (size_t i = 0; i < max_size; ++i) {
+        const uint8_t a = i < expected.size() ? expected[i] : 0;
+        const uint8_t b = i < got.size() ? got[i] : 0;
+        uint8_t diff = uint8_t(a ^ b);
+        for (int bit = 0; bit < 8; ++bit) {
+            errors += (diff >> bit) & 1U;
+        }
+    }
+    return errors;
+}
+
+struct StatisticalLinkResult {
+    size_t symbols = 0;
+    size_t symbol_errors = 0;
+    size_t bits = 0;
+    size_t bit_errors = 0;
+    size_t packets = 0;
+    size_t packet_errors = 0;
+};
+
+static SymbolMetrics simulate_metric_channel_symbol(uint8_t raw_symbol,
+                                                    double snr_db,
+                                                    bool radio_profile,
+                                                    size_t symbol_index,
+                                                    std::mt19937* rng) {
+    /*
+      Fast statistical measurement model:
+      - AWGN profile models a 16-way CSS correlator metric vector directly.
+      - Radio profile adds residual implementation damage: lower effective
+        metric SNR, neighbor-symbol leakage, and short burst erasures. This is
+        deliberately a measurement surrogate, not the full PCM receiver.
+    */
+    const double effective_snr_db = radio_profile ? snr_db - 4.0 : snr_db;
+    const double snr_linear = std::pow(10.0, effective_snr_db / 10.0);
+    const double signal = std::sqrt(2.0 * std::max(0.0, snr_linear));
+    const double sigma = 0.55;
+    std::normal_distribution<double> gaussian(0.0, sigma);
+
+    SymbolMetrics m;
+    for (int s = 0; s < ALPHABET; ++s) {
+        m.metric[size_t(s)] = gaussian(*rng);
+    }
+
+    m.metric[size_t(raw_symbol)] += signal;
+    if (radio_profile) {
+        const int prev = (int(raw_symbol) + ALPHABET - 1) & 0x0F;
+        const int next = (int(raw_symbol) + 1) & 0x0F;
+        m.metric[size_t(prev)] += 0.22 * signal;
+        m.metric[size_t(next)] += 0.30 * signal;
+        if ((symbol_index % 97) >= 90) {
+            for (int s = 0; s < ALPHABET; ++s) {
+                m.metric[size_t(s)] += gaussian(*rng) * 1.4;
+            }
+            m.metric[size_t(raw_symbol)] -= 0.45 * signal;
+        }
+    }
+
+    m.timing_offset = 0.0;
+    finalize_best_scores(&m);
+    return m;
+}
+
+static StatisticalLinkResult simulate_statistical_link(double snr_db,
+                                                       bool radio_profile,
+                                                       int trials,
+                                                       std::mt19937* rng) {
+    StatisticalLinkResult result;
+    for (int trial = 0; trial < trials; ++trial) {
+        std::vector<uint8_t> payload(64);
+        for (size_t i = 0; i < payload.size(); ++i) {
+            payload[i] = uint8_t((trial * 131 + int(i) * 17 + int((*rng)())) & 0xFF);
+        }
+
+        const std::vector<uint8_t> frame =
+            build_protected_frame(payload, PROTOCOL_MAGIC, PROTOCOL_VERSION, 0);
+        const std::vector<uint8_t> tx_bits = build_frame_tx_bits(frame);
+        const std::vector<uint8_t> tx_symbols = bits_to_symbols(tx_bits);
+        std::vector<double> llrs;
+        llrs.reserve(tx_bits.size());
+
+        for (size_t i = 0; i < tx_symbols.size(); ++i) {
+            const SymbolMetrics m =
+                simulate_metric_channel_symbol(tx_symbols[i], snr_db, radio_profile, i, rng);
+            if (uint8_t(m.best_symbol) != tx_symbols[i]) ++result.symbol_errors;
+            ++result.symbols;
+
+            const uint8_t hard_binary = gray_to_binary4(uint8_t(m.best_symbol));
+            const std::array<double, BITS_PER_SYMBOL> symbol_llr = symbol_metrics_to_llr(m);
+            for (int bit = 0; bit < BITS_PER_SYMBOL; ++bit) {
+                const size_t bit_index = i * BITS_PER_SYMBOL + size_t(bit);
+                if (bit_index >= tx_bits.size()) break;
+                const uint8_t hard_bit =
+                    uint8_t((hard_binary >> (BITS_PER_SYMBOL - 1 - bit)) & 1);
+                if (hard_bit != (tx_bits[bit_index] & 1)) ++result.bit_errors;
+                ++result.bits;
+                llrs.push_back(symbol_llr[size_t(bit)]);
+            }
+        }
+
+        std::vector<uint8_t> decoded;
+        const bool ok = decode_exact_payload_from_llrs(llrs, tx_bits.size(), &decoded);
+        if (!ok || decoded != payload) ++result.packet_errors;
+        ++result.packets;
+    }
+    return result;
+}
+
+static void run_statistical_quality_measurement(int trials_per_point = 500) {
+    if (trials_per_point <= 0) throw std::runtime_error("measure trials must be positive");
+    const double snr_points[] = {12.0, 9.0, 6.0, 3.0, 0.0, -3.0, -6.0};
+    std::mt19937 rng(0x5EED500u);
+
+    std::cout << "profile,snr_db,trials,raw_ser,raw_ber,per\n";
+    for (const char* profile : {"awgn-metric", "radio-metric"}) {
+        const bool radio = std::string(profile) == "radio-metric";
+        for (double snr_db : snr_points) {
+            const StatisticalLinkResult r =
+                simulate_statistical_link(snr_db, radio, trials_per_point, &rng);
+            const double raw_ser =
+                r.symbols ? double(r.symbol_errors) / double(r.symbols) : 1.0;
+            const double raw_ber = r.bits ? double(r.bit_errors) / double(r.bits) : 0.5;
+            const double per = r.packets ? double(r.packet_errors) / double(r.packets) : 1.0;
+            std::cout << profile << ","
+                      << snr_db << ","
+                      << trials_per_point << ","
+                      << raw_ser << ","
+                      << raw_ber << ","
+                      << per << "\n";
+        }
+    }
+}
+
+static void run_pcm_quality_measurement(int trials_per_point = 2) {
+    if (trials_per_point <= 0) throw std::runtime_error("measure trials must be positive");
+    const double snr_points[] = {24.0, 18.0, 12.0, 6.0, 3.0, 0.0, -3.0, -6.0, -9.0, -12.0};
+    const char* profiles[] = {"awgn", "radio"};
+    std::mt19937 rng(0xBEEFu);
+
+    std::cout << "profile,snr_db,trials,sync_fail,raw_ser,raw_ber,per,payload_ber_accepted\n";
+    for (const char* profile : profiles) {
+        for (double snr_db : snr_points) {
+            size_t raw_symbols = 0;
+            size_t raw_symbol_errors = 0;
+            size_t raw_bits = 0;
+            size_t raw_bit_errors = 0;
+            size_t sync_fail = 0;
+            size_t packet_errors = 0;
+            size_t accepted_payload_bits = 0;
+            size_t accepted_payload_bit_errors = 0;
+
+            for (int trial = 0; trial < trials_per_point; ++trial) {
+                std::vector<uint8_t> payload(64);
+                for (size_t i = 0; i < payload.size(); ++i) {
+                    payload[i] = uint8_t((trial * 131 + int(i) * 17 + int(rng())) & 0xFF);
+                }
+
+                const std::vector<uint8_t> frame =
+                    build_protected_frame(payload, PROTOCOL_MAGIC, PROTOCOL_VERSION, 0);
+                const std::vector<uint8_t> tx_bits = build_frame_tx_bits(frame);
+                const std::vector<uint8_t> expected_symbols = bits_to_symbols(tx_bits);
+                const std::vector<int16_t> clean = encode_frame_bytes_to_pcm(frame);
+
+                std::vector<int16_t> impaired =
+                    std::string(profile) == "radio"
+                        ? apply_quality_radio_channel(clean, snr_db, &rng)
+                        : add_awgn_for_snr(clean, snr_db, &rng);
+
+                const RawLinkMetrics raw =
+                    measure_raw_link_metrics(impaired, tx_bits, expected_symbols);
+                raw_symbols += raw.symbols;
+                raw_symbol_errors += raw.symbol_errors;
+                raw_bits += raw.bits;
+                raw_bit_errors += raw.bit_errors;
+                if (!raw.sync_locked) ++sync_fail;
+
+                std::vector<uint8_t> decoded;
+                const bool ok = decode_payload_from_pcm(impaired, &decoded, false);
+                if (!ok || decoded != payload) {
+                    ++packet_errors;
+                } else {
+                    accepted_payload_bits += payload.size() * 8;
+                    accepted_payload_bit_errors += count_payload_bit_errors(payload, decoded);
+                }
+            }
+
+            const double raw_ser =
+                raw_symbols ? double(raw_symbol_errors) / double(raw_symbols) : 1.0;
+            const double raw_ber =
+                raw_bits ? double(raw_bit_errors) / double(raw_bits) : 0.5;
+            const double per = double(packet_errors) / double(trials_per_point);
+            const double payload_ber =
+                accepted_payload_bits
+                    ? double(accepted_payload_bit_errors) / double(accepted_payload_bits)
+                    : 0.0;
+
+            std::cout << profile << ","
+                      << snr_db << ","
+                      << trials_per_point << ","
+                      << sync_fail << ","
+                      << raw_ser << ","
+                      << raw_ber << ","
+                      << per << ","
+                      << payload_ber << "\n";
+        }
+    }
+}
+
 static void require_true(bool ok, const std::string& name) {
     if (!ok) throw std::runtime_error("Selftest failed: " + name);
     std::cerr << "[PASS] " << name << "\n";
@@ -1650,6 +2108,14 @@ static void run_selftest() {
         decoded.resize(FEC_INFO_BITS);
         std::vector<uint8_t> first_info(info.begin(), info.begin() + FEC_INFO_BITS);
         require_true(decoded == first_info, "FEC selected two-bit correction");
+
+        damaged = llr;
+        for (int pos : {0, 17, 31, 63, 64, 91}) {
+            damaged[size_t(pos)] = coded[size_t(pos)] ? 0.35 : -0.35;
+        }
+        decoded = fec_decode_bits_from_llr(damaged);
+        decoded.resize(FEC_INFO_BITS);
+        require_true(decoded == first_info, "FEC soft BP low-confidence correction");
     }
     {
         std::mt19937 rng(12345);
@@ -1827,11 +2293,25 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+        if (argc >= 2 && std::string(argv[1]) == "measure") {
+            const int trials = argc >= 3 ? std::atoi(argv[2]) : 500;
+            run_statistical_quality_measurement(trials);
+            return 0;
+        }
+
+        if (argc >= 2 && std::string(argv[1]) == "measure-pcm") {
+            const int trials = argc >= 3 ? std::atoi(argv[2]) : 2;
+            run_pcm_quality_measurement(trials);
+            return 0;
+        }
+
         if (argc != 4) {
             std::cerr << "Usage:\n"
                       << "  " << argv[0] << " enc input.bin output.pcm\n"
                       << "  " << argv[0] << " dec input.pcm output.bin\n"
-                      << "  " << argv[0] << " selftest\n";
+                      << "  " << argv[0] << " selftest\n"
+                      << "  " << argv[0] << " measure [trials-per-snr]\n"
+                      << "  " << argv[0] << " measure-pcm [trials-per-snr]\n";
             return 1;
         }
 

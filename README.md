@@ -63,8 +63,9 @@ Current implementation facts:
   streaming acquisition can estimate the required frame length.
 - The FEC is a local experimental LDPC-style systematic sparse parity-check
   code: 64 information bits, 64 parity bits, 128-bit codeword, rate 1/2,
-  weighted bit-flipping decoder.
-- The FEC is not standards-compatible LDPC and is not belief-propagation LDPC.
+  full soft-decision sum-product belief-propagation decoder.
+- The FEC decoder is now real BP, but the code is not standards-compatible
+  WiFi, DVB-S2, or CCSDS LDPC.
 - Final packet acceptance is gated by protocol magic/version, payload length,
   CRC16, and exact payload comparison in tests.
 - Sync acquisition scans possible preamble starts, uses an energy-onset
@@ -153,6 +154,7 @@ bazel build //lab:chirp_modem
 bazel build //lab:p4modem
 bazel build //lab:pcm_impair
 bazel build //lab:pcm_audio_channel_impair
+bazel build //lab:pcm_radio_channel_impair
 bazel build //lab:pcm_to_wav
 bazel build //lab:wav_to_pcm
 ```
@@ -181,6 +183,7 @@ For the standalone chirp modem:
 cd lab
 ./chirp_modem enc input.bin output.pcm
 ./chirp_modem dec output.pcm decoded.bin
+./chirp_modem measure 500
 cmp input.bin decoded.bin
 ```
 
@@ -189,6 +192,7 @@ With Bazel-built binaries from the repository root:
 ```bash
 bazel-bin/lab/chirp_modem enc input.bin output.pcm
 bazel-bin/lab/chirp_modem dec output.pcm decoded.bin
+bazel-bin/lab/chirp_modem measure 500
 cmp input.bin decoded.bin
 ```
 
@@ -321,12 +325,14 @@ information bits: 64
 parity bits:      64
 codeword bits:    128
 rate:             1/2
-decoder:          weighted bit-flipping using hard/soft reliability
+decoder:          full soft-decision sum-product belief propagation
 ```
 
 This code is a compact experimental sparse parity-check code. It is not CCSDS,
-DVB-S2, 802.11, or another standards-compatible LDPC code. It is not a soft
-belief-propagation decoder.
+DVB-S2, 802.11, or another standards-compatible LDPC code. The decoder exchanges
+LLR-domain variable-to-check and check-to-variable messages on the Tanner graph,
+uses the standard parity-check tanh/atanh sum-product update, clips messages for
+numeric stability, and stops early when the hard-decision syndrome is clean.
 
 The chirp body FEC bits are block-interleaved. On RX, symbol metrics are
 converted to bit LLRs, body LLRs are deinterleaved, then FEC decoding is
@@ -402,16 +408,18 @@ BER is bit errors divided by transmitted bits. It should only be used when a
 test compares a known transmitted bitstream with a received bitstream at a
 defined receiver boundary.
 
-Raw BER is not currently measured.
+`./chirp_modem measure` reports raw coded-bit BER before FEC for synthetic AWGN
+and radio-ish channels.
 
 SER is symbol decision errors divided by transmitted symbols. It should only be
 used when transmitted CSS/P4 symbol indices are compared against demodulated
 symbol decisions.
 
-Raw SER is not currently measured.
+`./chirp_modem measure` reports raw CSS SER for the same synthetic channels.
 
 BLER is FEC codeword-level block error rate. FEC BLER is not currently measured
-independently.
+independently; the synthetic measurement reports packet error rate after full
+frame decode and CRC validation.
 
 Most current tests are CRC-gated packet recovery tests, closer to FER/PER
 regression tests than BER tests.
@@ -502,6 +510,97 @@ The default settings are moderate. More severe options are useful for
 exploration, but a passing packet regression should always document the exact
 parameters used.
 
+### BER/SER/PER Measurement Mode
+
+`chirp_modem` includes two synthetic quality measurement modes:
+
+```bash
+./chirp_modem measure [trials-per-snr]      # fast statistical metric/LLR/FEC model
+./chirp_modem measure-pcm [trials-per-snr]  # slow full PCM modem integration model
+```
+
+`measure` generates deterministic 64-byte payloads, encodes real protected modem
+frames, simulates a CSS metric vector for each transmitted symbol, feeds those
+soft metrics through the real interleaver and BP FEC decoder, and prints CSV:
+
+```text
+profile,snr_db,trials,raw_ser,raw_ber,per
+```
+
+Profiles:
+
+- `awgn-metric`: idealized 16-way CSS correlator metrics plus Gaussian metric
+  noise.
+- `radio-metric`: the same metric model with 4 dB effective implementation
+  loss, adjacent-symbol leakage, and deterministic short burst erasures.
+
+`measure-pcm` is the slower end-to-end PCM path. It generates real audio PCM,
+applies AWGN or a radio-ish PCM channel, runs sync/acquisition/demod/FEC/CRC,
+and reports CSV with `sync_fail` and accepted-payload BER. It is useful as an
+integration regression, but it is too slow for 500-packet sweeps with the current
+scalar correlator.
+
+Current local run, `./chirp_modem measure 500`, on 2026-06-13:
+
+| Profile | SNR dB | Raw SER | Raw BER | PER |
+|---------|--------|---------|---------|-----|
+| awgn-metric | 12 | 0 | 0 | 0 |
+| awgn-metric | 9 | 0.00000625 | 0.000003125 | 0 |
+| awgn-metric | 6 | 0.0019375 | 0.00100938 | 0 |
+| awgn-metric | 3 | 0.0495312 | 0.0263531 | 0.098 |
+| awgn-metric | 0 | 0.231387 | 0.123247 | 1 |
+| awgn-metric | -3 | 0.469025 | 0.249942 | 1 |
+| awgn-metric | -6 | 0.6506 | 0.347298 | 1 |
+| radio-metric | 12 | 0.0323437 | 0.0141906 | 0 |
+| radio-metric | 9 | 0.0617 | 0.0273938 | 0.106 |
+| radio-metric | 6 | 0.174838 | 0.0801594 | 0.998 |
+| radio-metric | 3 | 0.381663 | 0.185705 | 1 |
+| radio-metric | 0 | 0.5837 | 0.293388 | 1 |
+| radio-metric | -3 | 0.722931 | 0.37088 | 1 |
+| radio-metric | -6 | 0.805187 | 0.419264 | 1 |
+
+Interpretation:
+
+- The idealized metric model is solid at 6 dB and starts to fail around 3 dB.
+- The radio metric model starts to fail around 9 dB and is essentially broken
+  by 6 dB, a roughly 6 dB implementation/channel penalty.
+- These SNR values are metric-SNR regression points, not calibrated Eb/N0 curves.
+- The penalty is intentionally modeled as receiver/channel imperfection, so it
+  should be treated as a design target to reduce rather than as a property of
+  the BP decoder alone.
+
+### Reducing The Radio Penalty
+
+The current 6 dB gap is too large for a mature LoRa-like CSS modem. The most
+useful next fixes are:
+
+- Calibrate bit LLRs from metric noise variance. The current max-log LLRs are
+  relative scores, not likelihoods scaled by estimated noise/interference.
+- Add a preamble-based SFO/CFO estimator. Estimate sample-rate offset and
+  residual frequency/phase slope before data, then initialize the timing loop
+  from that estimate instead of letting data symbols discover it.
+- Add pilot symbols every 32 or 64 data symbols. Use pilots to update timing,
+  channel/template shape, and metric scaling without decision-directed error
+  propagation.
+- Make the interleaver span time and FEC codewords more deliberately. Current
+  block interleaving is simple; burst errors from fades/echo timing slips should
+  be spread over more codewords.
+- Add a scrambler/randomizer before FEC. CCSDS notes that LDPC alone does not
+  guarantee enough bit transitions for synchronizers; a randomizer also makes
+  FEC and interleaving behavior less data-pattern dependent.
+- Replace the local LDPC-style matrix with a known short-block LDPC, starting
+  with CCSDS `(128,64)` or `(512,256)`. The decoder is now BP-capable, but the
+  matrix is still local and not optimized like WiFi/DVB/CCSDS matrices.
+- Add normalized/offset min-sum as an option after sum-product. It is often more
+  stable with imperfect, non-Gaussian, mis-scaled LLRs and cheaper on small CPUs.
+- Improve acquisition scoring to measure preamble slope and multipath energy,
+  not only sync-symbol correlation. Reject locks with high side-lobe ambiguity.
+- Add a LoRa-style dechirp/FFT or Goertzel-like demodulator variant. The current
+  scalar correlation is clear but slow and does not expose frequency-bin
+  structure as cleanly as a dechirp detector.
+- Measure Eb/N0 and processing gain explicitly. Without a calibrated energy per
+  information bit, comparisons to LoRa/WiFi/DVB curves are only qualitative.
+
 ### Streaming Acquisition Tests
 
 The built-in chirp selftest includes deterministic streaming tests. They feed a
@@ -518,10 +617,10 @@ The buffer bound checked in current selftests is less than 10 seconds of PCM:
 
 Current tests do not prove:
 
-- raw BER vs SNR,
-- raw SER vs SNR,
-- post-FEC BER curves,
-- FEC BLER curves,
+- statistically stable raw BER vs SNR,
+- statistically stable raw SER vs SNR,
+- statistically stable post-FEC BER curves,
+- statistically stable FEC BLER curves,
 - statistical false alarm rate,
 - statistical missed detection rate,
 - performance over real RF recordings,
@@ -663,6 +762,30 @@ bazel test //lab:chirp_radio_channel_impair_test
 These tests are deterministic packet-recovery regressions. They do not estimate
 BER, BLER, SNR margin, or statistical fading performance.
 
+### External Comparison
+
+The receiver now uses the same broad decoder family as common LDPC tooling:
+soft-decision belief propagation / message passing. GNU Radio documents its
+LDPC decoder as a soft-decision BP decoder for AWGN channels with a supplied
+noise variance. That puts the algorithmic class in the right family.
+
+The code construction is not in the same class as current standards:
+
+- WiFi LDPC uses standardized quasi-cyclic LDPC matrices with block lengths
+  648, 1296, and 1944 and rates 1/2, 2/3, 3/4, and 5/6.
+- DVB-S2/S2X uses standardized BCH outer coding plus LDPC inner coding with
+  very large frames and adaptive modulation/coding modes.
+- CCSDS short-block LDPC specifies engineered rate-1/2 codes at (128,64),
+  (256,128), and (512,256), including published parity-check/generator
+  structure and simulated error curves.
+- This modem currently uses a local (128,64) systematic sparse code with a
+  correct BP decoder, but not an optimized standards matrix, not a randomizer,
+  not pilots, and not calibrated LLRs from a known AWGN constellation.
+
+So the current result should be described as: real soft BP decoding for a small
+experimental LDPC-style code, useful for modem experiments, but still well below
+WiFi/DVB-S2/CCSDS-grade channel coding as a system.
+
 ### Streaming / Acquisition Regression
 
 The streaming tests live inside `chirp_modem.cpp` selftest and are run by
@@ -715,11 +838,13 @@ lab/*_test.sh                   Bazel shell regression tests
 - The chirp FEC is experimental and local to this repository.
 - The P4 FEC is also local and should not be described as a standards code.
 - Current tests are mostly packet success/failure tests.
-- Raw BER, raw SER, post-FEC BER, and FEC BLER are not instrumented.
+- Raw BER and raw SER are instrumented only in the synthetic `measure` mode.
+- Post-FEC BER is CRC-gated at packet output, and FEC BLER is not separately
+  instrumented.
 - Statistical false alarm and missed detection rates are not estimated.
 - The current chirp correlator is scalar and becomes slow for long frames.
 - Real RF/audio-path behavior is not validated by the current synthetic tests.
-- No SNR-calibrated additive Gaussian noise test is currently present.
+- `measure` includes sample-SNR AWGN tests, but not calibrated Eb/N0 curves.
 - Multipath, fading, clipping, and impulsive noise are present only as simple
   deterministic regression models, not calibrated channel models.
 - No FM pre-emphasis/de-emphasis, VOX, or adjacent-channel interference model is

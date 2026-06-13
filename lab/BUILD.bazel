@@ -85,6 +85,7 @@ sh_test(
         "//:phone_recording_testdata",
     ],
     size = "small",
+    tags = ["manual"],
 )
 
 sh_test(
@@ -97,6 +98,7 @@ sh_test(
     ],
     size = "large",
     timeout = "long",
+    tags = ["manual"],
 )
 
 sh_test(
@@ -168,6 +170,13 @@ sh_test(
     srcs = ["chirp_selftest_test.sh"],
     data = [":chirp_modem"],
     size = "large",
+)
+
+sh_test(
+    name = "chirp_measure_test",
+    srcs = ["chirp_measure_test.sh"],
+    data = [":chirp_modem"],
+    size = "medium",
 )
 
 sh_test(
