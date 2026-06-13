@@ -14,6 +14,7 @@
 #include <array>
 #include <cassert>
 #include <cmath>
+#include <complex>
 #include <cstdint>
 #include <cstdlib>
 #include <ctime>
@@ -472,6 +473,84 @@ static std::vector<double> make_base_chirp() {
     return chirp;
 }
 
+static const std::array<double, SYMBOL_SAMPLES>& ideal_base_template_array() {
+    static const std::array<double, SYMBOL_SAMPLES> base = [] {
+        const std::vector<double> chirp = make_base_chirp();
+        std::array<double, SYMBOL_SAMPLES> out = {};
+        for (int i = 0; i < SYMBOL_SAMPLES; ++i) out[size_t(i)] = chirp[size_t(i)];
+        double energy = 0.0;
+        for (double v : out) energy += v * v;
+        if (energy > 1e-12) {
+            const double inv = 1.0 / std::sqrt(energy);
+            for (double& v : out) v *= inv;
+        }
+        return out;
+    }();
+    return base;
+}
+
+static void fft128(std::array<std::complex<double>, SYMBOL_SAMPLES>* a, bool inverse) {
+    for (int i = 1, j = 0; i < SYMBOL_SAMPLES; ++i) {
+        int bit = SYMBOL_SAMPLES >> 1;
+        for (; (j & bit) != 0; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) std::swap((*a)[size_t(i)], (*a)[size_t(j)]);
+    }
+
+    for (int len = 2; len <= SYMBOL_SAMPLES; len <<= 1) {
+        const double angle = (inverse ? 2.0 : -2.0) * PI / double(len);
+        const std::complex<double> wlen(std::cos(angle), std::sin(angle));
+        for (int i = 0; i < SYMBOL_SAMPLES; i += len) {
+            std::complex<double> w(1.0, 0.0);
+            for (int j = 0; j < len / 2; ++j) {
+                const std::complex<double> u = (*a)[size_t(i + j)];
+                const std::complex<double> v = (*a)[size_t(i + j + len / 2)] * w;
+                (*a)[size_t(i + j)] = u + v;
+                (*a)[size_t(i + j + len / 2)] = u - v;
+                w *= wlen;
+            }
+        }
+    }
+
+    if (inverse) {
+        for (std::complex<double>& v : *a) v /= double(SYMBOL_SAMPLES);
+    }
+}
+
+static std::array<double, SYMBOL_SAMPLES> circular_chirp_correlation(
+    const std::array<double, SYMBOL_SAMPLES>& samples,
+    const std::array<double, SYMBOL_SAMPLES>& base) {
+    std::array<std::complex<double>, SYMBOL_SAMPLES> x = {};
+    std::array<std::complex<double>, SYMBOL_SAMPLES> y = {};
+    for (int i = 0; i < SYMBOL_SAMPLES; ++i) {
+        x[size_t(i)] = std::complex<double>(samples[size_t(i)], 0.0);
+        y[size_t(i)] = std::complex<double>(base[size_t(i)], 0.0);
+    }
+
+    fft128(&x, false);
+    fft128(&y, false);
+    for (int i = 0; i < SYMBOL_SAMPLES; ++i) {
+        x[size_t(i)] = std::conj(x[size_t(i)]) * y[size_t(i)];
+    }
+    fft128(&x, true);
+
+    std::array<double, SYMBOL_SAMPLES> corr = {};
+    for (int i = 0; i < SYMBOL_SAMPLES; ++i) {
+        corr[size_t(i)] = x[size_t(i)].real();
+    }
+    return corr;
+}
+
+static double cyclic_corr_sample(const std::array<double, SYMBOL_SAMPLES>& corr,
+                                 double idx) {
+    idx = std::fmod(idx, double(SYMBOL_SAMPLES));
+    if (idx < 0.0) idx += SYMBOL_SAMPLES;
+    const int i0 = int(std::floor(idx));
+    const int i1 = (i0 + 1) & (SYMBOL_SAMPLES - 1);
+    const double frac = idx - double(i0);
+    return corr[size_t(i0)] * (1.0 - frac) + corr[size_t(i1)] * frac;
+}
+
 static double cyclic_sample(const std::vector<double>& wave, double idx) {
     const double n = double(wave.size());
     idx = std::fmod(idx, n);
@@ -760,6 +839,33 @@ static double corr_score_adaptive(const std::vector<int16_t>& pcm,
     return std::abs(dot) / std::sqrt(e1 * e2);
 }
 
+static bool fast_symbol_metrics_from_base(const std::vector<int16_t>& pcm,
+                                          double pos,
+                                          double symbol_span,
+                                          const std::array<double, SYMBOL_SAMPLES>& base,
+                                          const double* fractional_offsets,
+                                          int fractional_offset_count,
+                                          SymbolMetrics* m) {
+    if (pos < 0.0 || pos + symbol_span >= double(pcm.size())) return false;
+    const std::array<double, SYMBOL_SAMPLES> samples =
+        normalized_symbol_samples(pcm, pos, symbol_span);
+    double energy = 0.0;
+    for (double v : samples) energy += v * v;
+    if (energy <= 1e-9) return false;
+
+    const std::array<double, SYMBOL_SAMPLES> corr =
+        circular_chirp_correlation(samples, base);
+    for (int s = 0; s < ALPHABET; ++s) {
+        const double shift = double(s * SYMBOL_SAMPLES / ALPHABET);
+        double score = -1.0;
+        for (int i = 0; i < fractional_offset_count; ++i) {
+            score = std::max(score, std::abs(cyclic_corr_sample(corr, shift + fractional_offsets[i])));
+        }
+        m->metric[size_t(s)] = score;
+    }
+    return true;
+}
+
 static void finalize_best_scores(SymbolMetrics* m) {
     m->best_score = -1.0;
     m->second_best_score = -1.0;
@@ -792,32 +898,51 @@ static SymbolMetrics decode_symbol_metrics_at(const std::vector<int16_t>& pcm,
     for (double timing_offset : timing_offsets) {
         SymbolMetrics current;
         current.timing_offset = timing_offset;
-        for (int s = 0; s < ALPHABET; ++s) {
-            double score = -1.0;
-            if (intermediate) {
-                for (int offset_index = 0; offset_index < 3; ++offset_index) {
+        bool used_fast = false;
+        if (adaptive != nullptr && adaptive->valid) {
+            const double adaptive_offsets[3] = {-0.35, 0.0, 0.35};
+            const double centered_offset[1] = {0.0};
+            used_fast = fast_symbol_metrics_from_base(
+                pcm, pos + timing_offset, symbol_span, adaptive->base,
+                intermediate ? adaptive_offsets : centered_offset,
+                intermediate ? 3 : 1, &current);
+        } else {
+            const double ideal_offsets[3] = {-2.0, 0.0, 2.0};
+            const double centered_offset[1] = {0.0};
+            used_fast = fast_symbol_metrics_from_base(
+                pcm, pos + timing_offset, symbol_span, ideal_base_template_array(),
+                intermediate ? ideal_offsets : centered_offset,
+                intermediate ? 3 : 1, &current);
+        }
+
+        if (!used_fast) {
+            for (int s = 0; s < ALPHABET; ++s) {
+                double score = -1.0;
+                if (intermediate) {
+                    for (int offset_index = 0; offset_index < 3; ++offset_index) {
+                        if (adaptive != nullptr && adaptive->valid) {
+                            score = std::max(
+                                score,
+                                corr_score_adaptive(
+                                    pcm, pos + timing_offset, symbol_span,
+                                    adaptive->tpl[size_t(s)][size_t(offset_index)]));
+                        } else {
+                            score = std::max(score, corr_score(pcm, pos + timing_offset,
+                                                               symbol_span,
+                                                               symbol_template(s, offset_index)));
+                        }
+                    }
+                } else {
                     if (adaptive != nullptr && adaptive->valid) {
-                        score = std::max(
-                            score,
-                            corr_score_adaptive(
-                                pcm, pos + timing_offset, symbol_span,
-                                adaptive->tpl[size_t(s)][size_t(offset_index)]));
+                        score = corr_score_adaptive(pcm, pos + timing_offset, symbol_span,
+                                                    adaptive->tpl[size_t(s)][1]);
                     } else {
-                        score = std::max(score, corr_score(pcm, pos + timing_offset,
-                                                           symbol_span,
-                                                           symbol_template(s, offset_index)));
+                        score = corr_score(pcm, pos + timing_offset, symbol_span,
+                                           symbol_template(s, 1));
                     }
                 }
-            } else {
-                if (adaptive != nullptr && adaptive->valid) {
-                    score = corr_score_adaptive(pcm, pos + timing_offset, symbol_span,
-                                                adaptive->tpl[size_t(s)][1]);
-                } else {
-                    score = corr_score(pcm, pos + timing_offset, symbol_span,
-                                       symbol_template(s, 1));
-                }
+                current.metric[size_t(s)] = score;
             }
-            current.metric[size_t(s)] = score;
         }
         finalize_best_scores(&current);
 
@@ -833,6 +958,8 @@ static SymbolMetrics decode_symbol_metrics_at(const std::vector<int16_t>& pcm,
 
 static std::array<double, BITS_PER_SYMBOL> symbol_metrics_to_llr(const SymbolMetrics& m) {
     std::array<double, BITS_PER_SYMBOL> llr = {};
+    const double llr_scale = 6.0;
+
     for (int bit = 0; bit < BITS_PER_SYMBOL; ++bit) {
         double best0 = -std::numeric_limits<double>::infinity();
         double best1 = -std::numeric_limits<double>::infinity();
@@ -844,7 +971,8 @@ static std::array<double, BITS_PER_SYMBOL> symbol_metrics_to_llr(const SymbolMet
         }
 
         // Positive LLR means binary bit 0 is more likely; negative means bit 1.
-        llr[size_t(bit)] = best0 - best1;
+        const double raw = (best0 - best1) * llr_scale;
+        llr[size_t(bit)] = std::max(-8.0, std::min(8.0, raw));
     }
     return llr;
 }

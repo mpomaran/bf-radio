@@ -257,8 +257,24 @@ For the P4 modem:
 
 The chirp/CSS prototype creates an up-chirp over each 128-sample symbol and
 represents raw CSS symbols as cyclic shifts. It uses 16 raw CSS symbols. The
-receiver correlates each candidate symbol window against all 16 templates and
-uses the resulting metric vector to compute bit LLRs.
+receiver measures the cyclic shift of each symbol and uses the resulting metric
+vector to compute bit LLRs.
+
+Chirp spread spectrum is effective at weak SNR because each symbol spreads its
+energy across a relatively long time-bandwidth product. After dechirping, a
+correctly received chirp collapses into a narrow tone/bin while uncorrelated
+noise remains spread across bins. That processing gain makes the decision depend
+on energy accumulated over the whole symbol rather than on one instant in time.
+The long chirp is also tolerant of narrowband interference and moderate timing
+error because a local disturbance damages only part of the swept waveform.
+
+LoRa implements this idea with complex dechirping followed by an FFT: multiply
+the received chirp by a conjugate reference chirp, then choose the strongest FFT
+bin. This prototype uses an equivalent scalar-friendly variant for the current
+real-valued PCM waveform: it normalizes the received symbol, computes a 128-point
+FFT circular correlation with the learned/ideal base chirp, and reads the 16 CSS
+shift metrics from that correlation. The old per-symbol template correlator is
+kept only as a fallback for invalid windows.
 
 For clean synthetic PCM, the receiver can use the same ideal chirp templates as
 the transmitter. For real audio paths, such as a laptop speaker recorded by a
@@ -286,6 +302,12 @@ The learned template has a known cyclic-shift orientation relative to the raw
 CSS symbol numbering. The decoder normalizes that orientation before Gray
 demapping, so the protocol bitstream remains the same as for ideal synthetic
 templates.
+
+Bit LLRs use a max-log best-zero versus best-one comparison over the 16 raw CSS
+symbol metrics, with a conservative fixed scale and clipping before BP FEC. This
+is not yet true calibrated noise-variance LLR estimation, but it gives the BP
+decoder stronger soft information than raw correlation differences while staying
+stable in timing-offset tests.
 
 ### Chirp/CSS Frame Structure
 
@@ -547,13 +569,13 @@ Current local run, `./chirp_modem measure 500`, on 2026-06-13:
 | awgn-metric | 12 | 0 | 0 | 0 |
 | awgn-metric | 9 | 0.00000625 | 0.000003125 | 0 |
 | awgn-metric | 6 | 0.0019375 | 0.00100938 | 0 |
-| awgn-metric | 3 | 0.0495312 | 0.0263531 | 0.098 |
+| awgn-metric | 3 | 0.0495312 | 0.0263531 | 0.066 |
 | awgn-metric | 0 | 0.231387 | 0.123247 | 1 |
 | awgn-metric | -3 | 0.469025 | 0.249942 | 1 |
 | awgn-metric | -6 | 0.6506 | 0.347298 | 1 |
 | radio-metric | 12 | 0.0323437 | 0.0141906 | 0 |
-| radio-metric | 9 | 0.0617 | 0.0273938 | 0.106 |
-| radio-metric | 6 | 0.174838 | 0.0801594 | 0.998 |
+| radio-metric | 9 | 0.0617 | 0.0273938 | 0.098 |
+| radio-metric | 6 | 0.174838 | 0.0801594 | 0.946 |
 | radio-metric | 3 | 0.381663 | 0.185705 | 1 |
 | radio-metric | 0 | 0.5837 | 0.293388 | 1 |
 | radio-metric | -3 | 0.722931 | 0.37088 | 1 |
@@ -574,8 +596,9 @@ Interpretation:
 The current 6 dB gap is too large for a mature LoRa-like CSS modem. The most
 useful next fixes are:
 
-- Calibrate bit LLRs from metric noise variance. The current max-log LLRs are
-  relative scores, not likelihoods scaled by estimated noise/interference.
+- Calibrate bit LLRs from measured metric noise variance. Current max-log LLRs
+  use a conservative fixed scale and clipping, not full likelihoods from an
+  estimated channel/noise model.
 - Add a preamble-based SFO/CFO estimator. Estimate sample-rate offset and
   residual frequency/phase slope before data, then initialize the timing loop
   from that estimate instead of letting data symbols discover it.
@@ -595,9 +618,10 @@ useful next fixes are:
   stable with imperfect, non-Gaussian, mis-scaled LLRs and cheaper on small CPUs.
 - Improve acquisition scoring to measure preamble slope and multipath energy,
   not only sync-symbol correlation. Reject locks with high side-lobe ambiguity.
-- Add a LoRa-style dechirp/FFT or Goertzel-like demodulator variant. The current
-  scalar correlation is clear but slow and does not expose frequency-bin
-  structure as cleanly as a dechirp detector.
+- Continue improving the new FFT circular-correlation demodulator toward a true
+  complex LoRa-style dechirp detector. The current implementation is faster and
+  gives all shift metrics at once, but the waveform is still real PCM rather
+  than an analytic complex baseband chirp.
 - Measure Eb/N0 and processing gain explicitly. Without a calibrated energy per
   information bit, comparisons to LoRa/WiFi/DVB curves are only qualitative.
 
