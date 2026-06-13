@@ -261,9 +261,22 @@ the transmitter. For real audio paths, such as a laptop speaker recorded by a
 phone and then replayed into a computer microphone, the waveform is no longer a
 perfect copy of the generated chirp. The current receiver therefore averages the
 known repeated preamble symbols into a local channel-adapted chirp template and
-uses cyclic shifts of that learned template for data demodulation. Candidate
-frames still must pass FEC and CRC validation; the adaptive template only
-improves the symbol metrics.
+uses cyclic shifts of that learned template for data demodulation. It then
+refines the template with the known sync symbols before any payload decisions
+are trusted.
+
+During full-frame demodulation the receiver also performs decision-directed
+template tracking. Only symbols with a high best-vs-second-best correlation
+margin and a small timing offset are allowed to update the learned base chirp.
+The selected raw CSS symbol is shifted back to the base orientation, polarity is
+aligned against the current template, and the base template is updated with a
+small exponential moving average. The per-symbol template bank is rebuilt from
+that base template. This lets the receiver follow slow speaker/recorder/channel
+shape changes during long frames without letting a weak symbol decision rewrite
+the demodulator.
+
+Candidate frames still must pass FEC and CRC validation; adaptive and
+decision-directed templates only improve the symbol metrics.
 
 The learned template has a known cyclic-shift orientation relative to the raw
 CSS symbol numbering. The decoder normalizes that orientation before Gray
@@ -330,10 +343,13 @@ The chirp receiver:
 - tries a range of symbol spans for sample-rate offset,
 - refines the selected lock,
 - builds a preamble-adaptive channel template when a lock is strong enough,
+- refines that template with the known sync word,
 - tracks data timing with a decision-directed loop,
 - updates timing only when the best-vs-second-best correlation margin is high
   enough,
-- clamps the tracked symbol span to reduce runaway after bad decisions.
+- clamps the tracked symbol span to reduce runaway after bad decisions,
+- updates the adaptive template during the frame only from high-confidence
+  symbol decisions.
 
 This is still a simple experimental timing loop, not a complete RF
 synchronizer.
@@ -465,6 +481,27 @@ preamble symbols. It tries that preamble-adapted template first, then falls back
 to the ideal synthetic template for clean time-scaling cases where adaptation is
 less helpful.
 
+### Synthetic Radio Channel Test
+
+`pcm_radio_channel_impair` is a deterministic raw PCM impairment tool for
+radio-ish and difficult acoustic paths:
+
+```bash
+pcm_radio_channel_impair input.pcm output.pcm
+```
+
+The model applies leading/trailing idle, optional time-scale error, sinusoidal
+timing wander, slow amplitude fading, DC blocking, one-pole low-pass bandwidth
+limiting, two delayed echo/multipath taps, deterministic white noise,
+deterministic impulsive noise, and clipping. It is meant for repeatable
+regression tests. It is not an RF propagation model and its parameters are not
+calibrated to a measured SNR, delay spread, fading distribution, or receiver
+front end.
+
+The default settings are moderate. More severe options are useful for
+exploration, but a passing packet regression should always document the exact
+parameters used.
+
 ### Streaming Acquisition Tests
 
 The built-in chirp selftest includes deterministic streaming tests. They feed a
@@ -488,7 +525,7 @@ Current tests do not prove:
 - statistical false alarm rate,
 - statistical missed detection rate,
 - performance over real RF recordings,
-- multipath or fading tolerance,
+- statistically characterized multipath or fading tolerance,
 - Doppler tolerance,
 - microphone/speaker nonlinearities,
 - FM limiter/de-emphasis/pre-emphasis behavior,
@@ -609,6 +646,23 @@ The 1024-byte chirp timing matrix is omitted from routine tests because the
 current scalar all-symbol correlator is slow at that size without FFT/SIMD
 acceleration.
 
+### Chirp/CSS Synthetic Channel Regression
+
+Scripts:
+
+```bash
+bazel test //lab:chirp_audio_channel_impair_test
+bazel test //lab:chirp_radio_channel_impair_test
+```
+
+| Test | Metric | Payload size | Impairment model | Selected parameters | Success criterion | Result |
+|------|--------|--------------|------------------|---------------------|-------------------|--------|
+| chirp audio channel impairment | PER regression | 6 B | speaker/recorder/microphone-ish PCM channel | leading/trailing silence, fading gain envelope, DC blocker, low-pass, short echo, deterministic noise | CRC/protocol pass + exact payload match | pass |
+| chirp radio channel impairment | PER regression | 6 B | synthetic radio/acoustic PCM channel | 0.3 s leading idle, 1.003x time scale, 0.18-sample wander, slow fade, two echo taps at 19 and 67 samples, deterministic noise and impulses | CRC/protocol pass + exact payload match | pass |
+
+These tests are deterministic packet-recovery regressions. They do not estimate
+BER, BLER, SNR margin, or statistical fading performance.
+
 ### Streaming / Acquisition Regression
 
 The streaming tests live inside `chirp_modem.cpp` selftest and are run by
@@ -650,6 +704,7 @@ lab/chirp_modem.cpp             current chirp/CSS modem prototype
 lab/p4modem.cpp                 older P4 modem prototype
 lab/pcm_impair.cpp              synthetic PCM resampling/bitflip tool
 lab/pcm_audio_channel_impair.cpp synthetic speaker/recorder/microphone channel tool
+lab/pcm_radio_channel_impair.cpp synthetic echo/fading/noise channel tool
 lab/pcm_to_wav.cpp              raw PCM to WAV wrapper
 lab/wav_to_pcm.cpp              WAV to raw modem PCM converter
 lab/*_test.sh                   Bazel shell regression tests
@@ -665,8 +720,10 @@ lab/*_test.sh                   Bazel shell regression tests
 - The current chirp correlator is scalar and becomes slow for long frames.
 - Real RF/audio-path behavior is not validated by the current synthetic tests.
 - No SNR-calibrated additive Gaussian noise test is currently present.
-- No explicit multipath, fading, clipping, FM pre-emphasis/de-emphasis, VOX, or
-  adjacent-channel interference model is currently present.
+- Multipath, fading, clipping, and impulsive noise are present only as simple
+  deterministic regression models, not calibrated channel models.
+- No FM pre-emphasis/de-emphasis, VOX, or adjacent-channel interference model is
+  currently present.
 
 ## Roadmap
 

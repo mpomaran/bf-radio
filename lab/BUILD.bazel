@@ -42,6 +42,13 @@ cc_binary(
 )
 
 cc_binary(
+    name = "pcm_radio_channel_impair",
+    srcs = ["pcm_radio_channel_impair.cpp"],
+    copts = CPP17_COPTS,
+    visibility = ["//visibility:public"],
+)
+
+cc_binary(
     name = "chirp_modem",
     srcs = ["chirp_modem.cpp"],
     copts = CPP17_COPTS,
@@ -101,6 +108,17 @@ sh_test(
         "//:phone_recording_testdata",
     ],
     size = "small",
+)
+
+sh_test(
+    name = "chirp_radio_channel_impair_test",
+    srcs = ["chirp_radio_channel_impair_test.sh"],
+    data = [
+        ":chirp_modem",
+        ":pcm_radio_channel_impair",
+        "//:phone_recording_testdata",
+    ],
+    size = "medium",
 )
 
 sh_test(
