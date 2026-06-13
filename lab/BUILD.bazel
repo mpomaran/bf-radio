@@ -21,6 +21,13 @@ cc_binary(
 )
 
 cc_binary(
+    name = "wav_to_pcm",
+    srcs = ["wav_to_pcm.cpp"],
+    copts = CPP17_COPTS,
+    visibility = ["//visibility:public"],
+)
+
+cc_binary(
     name = "pcm_impair",
     srcs = ["pcm_impair.cpp"],
     copts = CPP17_COPTS,
@@ -45,6 +52,13 @@ sh_test(
     name = "pcm_to_wav_test",
     srcs = ["pcm_to_wav_test.sh"],
     data = [":p4modem", ":pcm_to_wav"],
+    size = "small",
+)
+
+sh_test(
+    name = "wav_to_pcm_test",
+    srcs = ["wav_to_pcm_test.sh"],
+    data = [":pcm_to_wav", ":wav_to_pcm"],
     size = "small",
 )
 

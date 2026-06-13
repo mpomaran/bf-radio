@@ -97,6 +97,8 @@ Current implementation facts:
   optional byte-level bit flips.
 - `lab/pcm_to_wav.cpp`: wraps raw PCM bytes in a WAV file for listening and
   debugging.
+- `lab/wav_to_pcm.cpp`: converts RIFF/WAVE audio to raw modem PCM, including
+  channel downmixing, bit-depth conversion, and sample-rate conversion.
 
 ## Quick Start
 
@@ -116,6 +118,7 @@ bazel build //lab:chirp_modem
 bazel build //lab:p4modem
 bazel build //lab:pcm_impair
 bazel build //lab:pcm_to_wav
+bazel build //lab:wav_to_pcm
 ```
 
 ### Build Chirp Modem Standalone With C++17
@@ -160,6 +163,22 @@ bazel-bin/lab/pcm_to_wav output.pcm output.wav 8000 1
 ```
 
 The WAV converter defaults to 8000 Hz, mono, 16-bit PCM.
+
+### Convert WAV to Modem PCM
+
+```bash
+bazel-bin/lab/wav_to_pcm input.wav output.pcm
+bazel-bin/lab/chirp_modem dec output.pcm decoded.bin
+```
+
+The WAV input may have a different sample rate, channel count, or PCM/float
+sample format. The converter writes raw 8000 Hz mono signed 16-bit little-endian
+PCM by default. An explicit target sample rate may be supplied as the third
+argument:
+
+```bash
+bazel-bin/lab/wav_to_pcm input.wav output.pcm 8000
+```
 
 ## Signal and Protocol Format
 
@@ -561,6 +580,7 @@ lab/chirp_modem.cpp             current chirp/CSS modem prototype
 lab/p4modem.cpp                 older P4 modem prototype
 lab/pcm_impair.cpp              synthetic PCM resampling/bitflip tool
 lab/pcm_to_wav.cpp              raw PCM to WAV wrapper
+lab/wav_to_pcm.cpp              WAV to raw modem PCM converter
 lab/*_test.sh                   Bazel shell regression tests
 ```
 
