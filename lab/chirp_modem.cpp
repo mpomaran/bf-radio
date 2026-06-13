@@ -484,6 +484,140 @@ struct SymbolMetrics {
           best_symbol(0), timing_offset(0.0) {}
 };
 
+struct AdaptiveTemplateBank {
+    std::array<std::array<std::array<double, SYMBOL_SAMPLES>, 3>, ALPHABET> tpl;
+    bool valid;
+
+    AdaptiveTemplateBank() : tpl(), valid(false) {}
+};
+
+static std::array<double, SYMBOL_SAMPLES> normalized_symbol_samples(
+    const std::vector<int16_t>& pcm,
+    double pos,
+    double symbol_span) {
+    std::array<double, SYMBOL_SAMPLES> samples = {};
+    if (pos < 0.0 || pos + symbol_span >= double(pcm.size())) return samples;
+
+    double mean = 0.0;
+    for (int i = 0; i < SYMBOL_SAMPLES; ++i) {
+        const double p = pos + double(i) * symbol_span / SYMBOL_SAMPLES;
+        samples[size_t(i)] = sample_at(pcm, p);
+        mean += samples[size_t(i)];
+    }
+    mean /= SYMBOL_SAMPLES;
+
+    double energy = 0.0;
+    for (double& v : samples) {
+        v -= mean;
+        energy += v * v;
+    }
+    const double rms = std::sqrt(energy / SYMBOL_SAMPLES);
+    if (rms <= 1e-9) {
+        samples.fill(0.0);
+        return samples;
+    }
+    for (double& v : samples) v /= rms;
+    return samples;
+}
+
+static void normalize_template(std::array<double, SYMBOL_SAMPLES>* samples) {
+    double mean = 0.0;
+    for (double v : *samples) mean += v;
+    mean /= SYMBOL_SAMPLES;
+
+    double energy = 0.0;
+    for (double& v : *samples) {
+        v -= mean;
+        energy += v * v;
+    }
+    const double rms = std::sqrt(energy / SYMBOL_SAMPLES);
+    if (rms <= 1e-9) {
+        samples->fill(0.0);
+        return;
+    }
+    for (double& v : *samples) v /= rms;
+}
+
+static double cyclic_array_sample(const std::array<double, SYMBOL_SAMPLES>& samples,
+                                  double p) {
+    while (p < 0.0) p += SYMBOL_SAMPLES;
+    while (p >= SYMBOL_SAMPLES) p -= SYMBOL_SAMPLES;
+    const int i0 = int(std::floor(p));
+    const int i1 = (i0 + 1) % SYMBOL_SAMPLES;
+    const double frac = p - double(i0);
+    return samples[size_t(i0)] * (1.0 - frac) + samples[size_t(i1)] * frac;
+}
+
+static AdaptiveTemplateBank build_adaptive_template_bank(const std::vector<int16_t>& pcm,
+                                                         double preamble_pos,
+                                                         double symbol_span) {
+    AdaptiveTemplateBank bank;
+    std::array<double, SYMBOL_SAMPLES> base = {};
+    int used = 0;
+
+    for (int sym = 0; sym < PREAMBLE_SYMBOLS; ++sym) {
+        std::array<double, SYMBOL_SAMPLES> current =
+            normalized_symbol_samples(pcm, preamble_pos + sym * symbol_span, symbol_span);
+        double energy = 0.0;
+        for (double v : current) energy += v * v;
+        if (energy <= 1e-9) continue;
+
+        if (used > 0) {
+            double dot = 0.0;
+            for (int i = 0; i < SYMBOL_SAMPLES; ++i) {
+                dot += current[size_t(i)] * base[size_t(i)];
+            }
+            if (dot < 0.0) {
+                for (double& v : current) v = -v;
+            }
+        }
+        for (int i = 0; i < SYMBOL_SAMPLES; ++i) {
+            base[size_t(i)] += current[size_t(i)];
+        }
+        ++used;
+    }
+
+    if (used < PREAMBLE_SYMBOLS / 2) return bank;
+    normalize_template(&base);
+
+    const double fractional_offsets[3] = {-0.35, 0.0, 0.35};
+    for (int symbol = 0; symbol < ALPHABET; ++symbol) {
+        const int shift = symbol * SYMBOL_SAMPLES / ALPHABET;
+        for (int offset_index = 0; offset_index < 3; ++offset_index) {
+            const double frac = fractional_offsets[offset_index];
+            for (int n = 0; n < SYMBOL_SAMPLES; ++n) {
+                bank.tpl[size_t(symbol)][size_t(offset_index)][size_t(n)] =
+                    cyclic_array_sample(base, double(n + shift) + frac);
+            }
+            normalize_template(&bank.tpl[size_t(symbol)][size_t(offset_index)]);
+        }
+    }
+    bank.valid = true;
+    return bank;
+}
+
+static double corr_score_adaptive(const std::vector<int16_t>& pcm,
+                                  double pos,
+                                  double symbol_span,
+                                  const std::array<double, SYMBOL_SAMPLES>& tpl) {
+    if (pos < 0.0 || pos + symbol_span >= double(pcm.size())) return 0.0;
+
+    const std::array<double, SYMBOL_SAMPLES> samples =
+        normalized_symbol_samples(pcm, pos, symbol_span);
+    double dot = 0.0;
+    double e1 = 0.0;
+    double e2 = 0.0;
+    for (int i = 0; i < SYMBOL_SAMPLES; ++i) {
+        const double a = samples[size_t(i)];
+        const double b = tpl[size_t(i)];
+        dot += a * b;
+        e1 += a * a;
+        e2 += b * b;
+    }
+    if (e1 <= 1e-9 || e2 <= 1e-9) return 0.0;
+    return std::abs(dot) / std::sqrt(e1 * e2);
+}
+
 static void finalize_best_scores(SymbolMetrics* m) {
     m->best_score = -1.0;
     m->second_best_score = -1.0;
@@ -503,7 +637,8 @@ static void finalize_best_scores(SymbolMetrics* m) {
 static SymbolMetrics decode_symbol_metrics_at(const std::vector<int16_t>& pcm,
                                               double pos,
                                               double symbol_span,
-                                              bool intermediate) {
+                                              bool intermediate,
+                                              const AdaptiveTemplateBank* adaptive = nullptr) {
     static const double timing_offsets[] = {
         -24.0, -18.0, -12.0, -8.0, -4.0, -2.0, -1.0, -0.5,
         0.0,
@@ -519,18 +654,33 @@ static SymbolMetrics decode_symbol_metrics_at(const std::vector<int16_t>& pcm,
             double score = -1.0;
             if (intermediate) {
                 for (int offset_index = 0; offset_index < 3; ++offset_index) {
-                    score = std::max(score, corr_score(pcm, pos + timing_offset,
-                                                       symbol_span,
-                                                       symbol_template(s, offset_index)));
+                    if (adaptive != nullptr && adaptive->valid) {
+                        score = std::max(
+                            score,
+                            corr_score_adaptive(
+                                pcm, pos + timing_offset, symbol_span,
+                                adaptive->tpl[size_t(s)][size_t(offset_index)]));
+                    } else {
+                        score = std::max(score, corr_score(pcm, pos + timing_offset,
+                                                           symbol_span,
+                                                           symbol_template(s, offset_index)));
+                    }
                 }
             } else {
-                score = corr_score(pcm, pos + timing_offset, symbol_span, symbol_template(s, 1));
+                if (adaptive != nullptr && adaptive->valid) {
+                    score = corr_score_adaptive(pcm, pos + timing_offset, symbol_span,
+                                                adaptive->tpl[size_t(s)][1]);
+                } else {
+                    score = corr_score(pcm, pos + timing_offset, symbol_span,
+                                       symbol_template(s, 1));
+                }
             }
             current.metric[size_t(s)] = score;
         }
         finalize_best_scores(&current);
 
-        const double rank = current.best_score - 0.003 * std::abs(timing_offset);
+        const double timing_penalty = (adaptive != nullptr && adaptive->valid) ? 0.012 : 0.003;
+        const double rank = current.best_score - timing_penalty * std::abs(timing_offset);
         if (rank > best_rank) {
             best = current;
             best_rank = rank;
@@ -808,7 +958,8 @@ struct TimingState {
 static std::vector<double> decode_llrs_tracking(const std::vector<int16_t>& pcm,
                                                 double data_pos,
                                                 double symbol_span,
-                                                size_t max_bits = 50000 * BITS_PER_SYMBOL) {
+                                                size_t max_bits = 50000 * BITS_PER_SYMBOL,
+                                                const AdaptiveTemplateBank* adaptive = nullptr) {
     std::vector<double> llrs;
     TimingState timing(data_pos, symbol_span);
     const double min_span = NOMINAL_SPAN * 0.85;
@@ -818,7 +969,8 @@ static std::vector<double> decode_llrs_tracking(const std::vector<int16_t>& pcm,
     const double ki = 0.015;
 
     while (timing.pos + timing.span < double(pcm.size()) && llrs.size() < max_bits) {
-        const SymbolMetrics m = decode_symbol_metrics_at(pcm, timing.pos, timing.span, true);
+        const SymbolMetrics m =
+            decode_symbol_metrics_at(pcm, timing.pos, timing.span, true, adaptive);
         const std::array<double, BITS_PER_SYMBOL> symbol_llr = symbol_metrics_to_llr(m);
         for (double v : symbol_llr) llrs.push_back(v);
 
@@ -1034,6 +1186,15 @@ static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pc
         return result;
     }
 
+    const AdaptiveTemplateBank adaptive =
+        build_adaptive_template_bank(pcm, lock.preamble_pos, lock.symbol_span);
+    const AdaptiveTemplateBank* adaptive_ptr = adaptive.valid ? &adaptive : nullptr;
+    progress_message(verbose, progress_clock,
+                     adaptive.valid
+                         ? "scanner: using preamble-adaptive channel templates"
+                         : "scanner: adaptive templates unavailable, using ideal templates",
+                     true);
+
     const double data_pos = lock.sync_pos + SYNC_SYMBOLS * lock.symbol_span;
     bool saw_rejectable_candidate = false;
     const size_t header_symbols = FEC_CODEWORD_BITS / BITS_PER_SYMBOL;
@@ -1061,72 +1222,89 @@ static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pc
                 return result;
             }
 
-            const std::vector<double> header_llrs =
-                decode_llrs_tracking(pcm, data_pos, candidate_span, FEC_CODEWORD_BITS);
-            if (header_llrs.size() < FEC_CODEWORD_BITS) {
-                result.status = StreamScanStatus::NeedMoreSamples;
-                result.discard_prefix_samples = clamp_discard(frame_start, pcm.size());
+            const int template_modes = adaptive_ptr != nullptr ? 2 : 1;
+            for (int template_mode = 0; template_mode < template_modes; ++template_mode) {
+                const AdaptiveTemplateBank* decode_templates =
+                    (template_mode == 0) ? adaptive_ptr : nullptr;
+                if (template_mode == 1) {
+                    progress_message(verbose, progress_clock,
+                                     "scanner: retrying candidate with ideal templates",
+                                     true);
+                }
+
+                const std::vector<double> header_llrs =
+                    decode_llrs_tracking(pcm, data_pos, candidate_span,
+                                         FEC_CODEWORD_BITS, decode_templates);
+                if (header_llrs.size() < FEC_CODEWORD_BITS) {
+                    result.status = StreamScanStatus::NeedMoreSamples;
+                    result.discard_prefix_samples = clamp_discard(frame_start, pcm.size());
+                    progress_message(verbose, progress_clock,
+                                     "scanner: header LLR extraction stopped at window end",
+                                     true);
+                    return result;
+                }
+
+                std::vector<double> header_tx(
+                    header_llrs.begin(),
+                    header_llrs.begin() + std::ptrdiff_t(FEC_CODEWORD_BITS));
+                const std::vector<uint8_t> header_bits = fec_decode_bits_from_llr(header_tx);
+                const std::vector<uint8_t> header_bytes = bits_to_bytes(header_bits);
+
+                size_t required_fec_bits = 0;
+                if (!parse_protected_header(header_bytes, nullptr, &required_fec_bits)) {
+                    saw_rejectable_candidate = true;
+                    continue;
+                }
                 progress_message(verbose, progress_clock,
-                                 "scanner: header LLR extraction stopped at window end",
+                                 "scanner: protected header decoded, frame FEC bits " +
+                                     std::to_string(required_fec_bits),
                                  true);
-                return result;
-            }
 
-            std::vector<double> header_tx(header_llrs.begin(),
-                                          header_llrs.begin() + std::ptrdiff_t(FEC_CODEWORD_BITS));
-            const std::vector<uint8_t> header_bits = fec_decode_bits_from_llr(header_tx);
-            const std::vector<uint8_t> header_bytes = bits_to_bytes(header_bits);
+                const size_t required_symbols =
+                    (required_fec_bits + BITS_PER_SYMBOL - 1) / BITS_PER_SYMBOL;
+                const double frame_end = data_pos + double(required_symbols) * candidate_span;
+                if (frame_end + candidate_span >= double(pcm.size())) {
+                    result.status = StreamScanStatus::NeedMoreSamples;
+                    result.discard_prefix_samples = clamp_discard(frame_start, pcm.size());
+                    progress_message(
+                        verbose, progress_clock,
+                        "scanner: frame appears valid but incomplete, need more samples",
+                        true);
+                    return result;
+                }
 
-            size_t required_fec_bits = 0;
-            if (!parse_protected_header(header_bytes, nullptr, &required_fec_bits)) {
+                progress_message(verbose, progress_clock,
+                                 "scanner: extracting full frame metrics, symbols " +
+                                     std::to_string(required_symbols),
+                                 true);
+                const std::vector<double> frame_llrs =
+                    decode_llrs_tracking(pcm, data_pos, candidate_span,
+                                         required_fec_bits, decode_templates);
+                if (frame_llrs.size() < required_fec_bits) {
+                    result.status = StreamScanStatus::NeedMoreSamples;
+                    result.discard_prefix_samples = clamp_discard(frame_start, pcm.size());
+                    progress_message(verbose, progress_clock,
+                                     "scanner: full-frame LLR extraction stopped at window end",
+                                     true);
+                    return result;
+                }
+
+                if (decode_exact_payload_from_llrs(frame_llrs, required_fec_bits,
+                                                   &result.payload)) {
+                    result.status = StreamScanStatus::FrameDecoded;
+                    result.estimated_symbol_span = candidate_span;
+                    result.frame_end_sample =
+                        clamp_discard(size_t(std::ceil(frame_end)), pcm.size());
+                    result.discard_prefix_samples = result.frame_end_sample;
+                    progress_message(verbose, progress_clock,
+                                     "scanner: frame decoded, consuming " +
+                                         std::to_string(result.discard_prefix_samples) +
+                                         " samples",
+                                     true);
+                    return result;
+                }
                 saw_rejectable_candidate = true;
-                continue;
             }
-            progress_message(verbose, progress_clock,
-                             "scanner: protected header decoded, frame FEC bits " +
-                                 std::to_string(required_fec_bits),
-                             true);
-
-            const size_t required_symbols =
-                (required_fec_bits + BITS_PER_SYMBOL - 1) / BITS_PER_SYMBOL;
-            const double frame_end = data_pos + double(required_symbols) * candidate_span;
-            if (frame_end + candidate_span >= double(pcm.size())) {
-                result.status = StreamScanStatus::NeedMoreSamples;
-                result.discard_prefix_samples = clamp_discard(frame_start, pcm.size());
-                progress_message(verbose, progress_clock,
-                                 "scanner: frame appears valid but incomplete, need more samples",
-                                 true);
-                return result;
-            }
-
-            progress_message(verbose, progress_clock,
-                             "scanner: extracting full frame metrics, symbols " +
-                                 std::to_string(required_symbols),
-                             true);
-            const std::vector<double> frame_llrs =
-                decode_llrs_tracking(pcm, data_pos, candidate_span, required_fec_bits);
-            if (frame_llrs.size() < required_fec_bits) {
-                result.status = StreamScanStatus::NeedMoreSamples;
-                result.discard_prefix_samples = clamp_discard(frame_start, pcm.size());
-                progress_message(verbose, progress_clock,
-                                 "scanner: full-frame LLR extraction stopped at window end",
-                                 true);
-                return result;
-            }
-
-            if (decode_exact_payload_from_llrs(frame_llrs, required_fec_bits, &result.payload)) {
-                result.status = StreamScanStatus::FrameDecoded;
-                result.estimated_symbol_span = candidate_span;
-                result.frame_end_sample = clamp_discard(size_t(std::ceil(frame_end)), pcm.size());
-                result.discard_prefix_samples = result.frame_end_sample;
-                progress_message(verbose, progress_clock,
-                                 "scanner: frame decoded, consuming " +
-                                     std::to_string(result.discard_prefix_samples) +
-                                     " samples",
-                                 true);
-                return result;
-            }
-            saw_rejectable_candidate = true;
         }
     }
 

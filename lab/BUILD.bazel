@@ -35,6 +35,13 @@ cc_binary(
 )
 
 cc_binary(
+    name = "pcm_audio_channel_impair",
+    srcs = ["pcm_audio_channel_impair.cpp"],
+    copts = CPP17_COPTS,
+    visibility = ["//visibility:public"],
+)
+
+cc_binary(
     name = "chirp_modem",
     srcs = ["chirp_modem.cpp"],
     copts = CPP17_COPTS,
@@ -63,11 +70,22 @@ sh_test(
 )
 
 sh_test(
-    name = "chirp_recorded_wav_reject_test",
-    srcs = ["chirp_recorded_wav_reject_test.sh"],
+    name = "chirp_recorded_wav_test",
+    srcs = ["chirp_recorded_wav_test.sh"],
     data = [
         ":chirp_modem",
         ":wav_to_pcm",
+        "//:phone_recording_testdata",
+    ],
+    size = "small",
+)
+
+sh_test(
+    name = "chirp_audio_channel_impair_test",
+    srcs = ["chirp_audio_channel_impair_test.sh"],
+    data = [
+        ":chirp_modem",
+        ":pcm_audio_channel_impair",
         "//:phone_recording_testdata",
     ],
     size = "small",

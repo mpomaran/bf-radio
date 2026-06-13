@@ -51,6 +51,10 @@ Current implementation facts:
 - Maximum payload size: 4096 bytes.
 - TX maps 4-bit groups through Gray coding before CSS symbol selection.
 - RX computes correlation metrics for all 16 raw CSS symbols.
+- RX can learn an adaptive chirp template from the repeated preamble symbols,
+  which helps with speaker/recorder/microphone paths that reshape the waveform.
+- If the adaptive template does not validate a frame, RX retries the candidate
+  with the ideal synthetic template so clean time-scaling cases still work.
 - RX derives bit LLRs using a max-log style best-0 vs best-1 comparison.
 - Positive LLR means bit 0 is more likely; negative LLR means bit 1 is more
   likely.
@@ -69,6 +73,34 @@ Current implementation facts:
   clamped symbol span updates.
 - A streaming scan API can classify rolling PCM windows as no frame, incomplete
   candidate, decoded frame, or rejected frame-like candidate.
+
+High-level transmit path:
+
+```text
+payload bytes
+-> protected CHRP header + CRC16
+-> header FEC and body FEC
+-> body interleaver
+-> Gray-coded 4-bit groups
+-> 16-shift chirp/CSS symbols
+-> preamble + sync + data + trailing silence
+-> raw 8 kHz PCM16
+```
+
+High-level receive path:
+
+```text
+raw 8 kHz PCM16
+-> streaming preamble/sync acquisition
+-> optional preamble-adaptive channel template
+-> per-symbol correlation metrics
+-> bit LLRs
+-> body deinterleaver
+-> FEC decoder
+-> CHRP magic/version/length validation
+-> CRC16 validation
+-> payload bytes
+```
 
 ### P4 Modem: `lab/p4modem.cpp`
 
@@ -95,6 +127,9 @@ Current implementation facts:
 - `lab/pcm_impair.cpp`: applies deterministic synthetic PCM impairments:
   linear resampling/stretching over the whole stream or a selected region, plus
   optional byte-level bit flips.
+- `lab/pcm_audio_channel_impair.cpp`: applies a deterministic
+  speaker/recorder/microphone-style channel model with silence, gain envelope,
+  simple filtering, echo, and noise.
 - `lab/pcm_to_wav.cpp`: wraps raw PCM bytes in a WAV file for listening and
   debugging.
 - `lab/wav_to_pcm.cpp`: converts RIFF/WAVE audio to raw modem PCM, including
@@ -117,6 +152,7 @@ Useful individual targets:
 bazel build //lab:chirp_modem
 bazel build //lab:p4modem
 bazel build //lab:pcm_impair
+bazel build //lab:pcm_audio_channel_impair
 bazel build //lab:pcm_to_wav
 bazel build //lab:wav_to_pcm
 ```
@@ -220,6 +256,20 @@ represents raw CSS symbols as cyclic shifts. It uses 16 raw CSS symbols. The
 receiver correlates each candidate symbol window against all 16 templates and
 uses the resulting metric vector to compute bit LLRs.
 
+For clean synthetic PCM, the receiver can use the same ideal chirp templates as
+the transmitter. For real audio paths, such as a laptop speaker recorded by a
+phone and then replayed into a computer microphone, the waveform is no longer a
+perfect copy of the generated chirp. The current receiver therefore averages the
+known repeated preamble symbols into a local channel-adapted chirp template and
+uses cyclic shifts of that learned template for data demodulation. Candidate
+frames still must pass FEC and CRC validation; the adaptive template only
+improves the symbol metrics.
+
+The learned template has a known cyclic-shift orientation relative to the raw
+CSS symbol numbering. The decoder normalizes that orientation before Gray
+demapping, so the protocol bitstream remains the same as for ideal synthetic
+templates.
+
 ### Chirp/CSS Frame Structure
 
 The chirp frame is:
@@ -279,6 +329,7 @@ The chirp receiver:
 - uses an energy-onset candidate for common leading-silence cases,
 - tries a range of symbol spans for sample-rate offset,
 - refines the selected lock,
+- builds a preamble-adaptive channel template when a lock is strong enough,
 - tracks data timing with a decision-directed loop,
 - updates timing only when the best-vs-second-best correlation margin is high
   enough,
@@ -394,6 +445,25 @@ mismatch tests, not Doppler-channel validation and not BER tests.
 
 `pcm_impair` can also apply deterministic byte-level bit flips with
 `--bitflip-stride N --bitflip-mask M`.
+
+### Speaker / Recorder / Microphone Channel Test
+
+`pcm_audio_channel_impair` simulates the class of damage seen when a modem PCM
+burst is played through speakers, recorded by a phone, and captured again
+through a microphone:
+
+```bash
+pcm_audio_channel_impair input.pcm output.pcm
+```
+
+The model adds leading/trailing silence, gain envelope, DC blocking, simple
+low-pass filtering, a short echo, and deterministic noise. It is a regression
+tool for modem robustness, not a calibrated acoustic model.
+
+The chirp decoder now learns a channel-adapted chirp template from the repeated
+preamble symbols. It tries that preamble-adapted template first, then falls back
+to the ideal synthetic template for clean time-scaling cases where adaptation is
+less helpful.
 
 ### Streaming Acquisition Tests
 
@@ -579,6 +649,7 @@ lab/BUILD.bazel                 Bazel targets
 lab/chirp_modem.cpp             current chirp/CSS modem prototype
 lab/p4modem.cpp                 older P4 modem prototype
 lab/pcm_impair.cpp              synthetic PCM resampling/bitflip tool
+lab/pcm_audio_channel_impair.cpp synthetic speaker/recorder/microphone channel tool
 lab/pcm_to_wav.cpp              raw PCM to WAV wrapper
 lab/wav_to_pcm.cpp              WAV to raw modem PCM converter
 lab/*_test.sh                   Bazel shell regression tests

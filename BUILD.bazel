@@ -1,6 +1,8 @@
 filegroup(
     name = "phone_recording_testdata",
     srcs = [
+        "testdata/original_encoded.pcm",
+        "testdata/transmitted.txt",
         "testdata/transmitted.wav",
     ],
     visibility = ["//visibility:public"],
