@@ -485,10 +485,11 @@ struct SymbolMetrics {
 };
 
 struct AdaptiveTemplateBank {
+    std::array<double, SYMBOL_SAMPLES> base;
     std::array<std::array<std::array<double, SYMBOL_SAMPLES>, 3>, ALPHABET> tpl;
     bool valid;
 
-    AdaptiveTemplateBank() : tpl(), valid(false) {}
+    AdaptiveTemplateBank() : base(), tpl(), valid(false) {}
 };
 
 static std::array<double, SYMBOL_SAMPLES> normalized_symbol_samples(
@@ -548,6 +549,28 @@ static double cyclic_array_sample(const std::array<double, SYMBOL_SAMPLES>& samp
     return samples[size_t(i0)] * (1.0 - frac) + samples[size_t(i1)] * frac;
 }
 
+static void rebuild_adaptive_templates(AdaptiveTemplateBank* bank) {
+    const double fractional_offsets[3] = {-0.35, 0.0, 0.35};
+    for (int symbol = 0; symbol < ALPHABET; ++symbol) {
+        const int shift = symbol * SYMBOL_SAMPLES / ALPHABET;
+        for (int offset_index = 0; offset_index < 3; ++offset_index) {
+            const double frac = fractional_offsets[offset_index];
+            for (int n = 0; n < SYMBOL_SAMPLES; ++n) {
+                bank->tpl[size_t(symbol)][size_t(offset_index)][size_t(n)] =
+                    cyclic_array_sample(bank->base, double(n + shift) + frac);
+            }
+            normalize_template(&bank->tpl[size_t(symbol)][size_t(offset_index)]);
+        }
+    }
+}
+
+static void update_adaptive_template_bank(AdaptiveTemplateBank* bank,
+                                          const std::vector<int16_t>& pcm,
+                                          double pos,
+                                          double symbol_span,
+                                          int raw_symbol,
+                                          double learning_rate);
+
 static AdaptiveTemplateBank build_adaptive_template_bank(const std::vector<int16_t>& pcm,
                                                          double preamble_pos,
                                                          double symbol_span) {
@@ -579,21 +602,60 @@ static AdaptiveTemplateBank build_adaptive_template_bank(const std::vector<int16
 
     if (used < PREAMBLE_SYMBOLS / 2) return bank;
     normalize_template(&base);
-
-    const double fractional_offsets[3] = {-0.35, 0.0, 0.35};
-    for (int symbol = 0; symbol < ALPHABET; ++symbol) {
-        const int shift = symbol * SYMBOL_SAMPLES / ALPHABET;
-        for (int offset_index = 0; offset_index < 3; ++offset_index) {
-            const double frac = fractional_offsets[offset_index];
-            for (int n = 0; n < SYMBOL_SAMPLES; ++n) {
-                bank.tpl[size_t(symbol)][size_t(offset_index)][size_t(n)] =
-                    cyclic_array_sample(base, double(n + shift) + frac);
-            }
-            normalize_template(&bank.tpl[size_t(symbol)][size_t(offset_index)]);
-        }
-    }
+    bank.base = base;
+    rebuild_adaptive_templates(&bank);
     bank.valid = true;
+
+    const int sync[SYNC_SYMBOLS] = {15, 1, 14, 2, 13, 3, 12, 4};
+    for (int i = 0; i < SYNC_SYMBOLS; ++i) {
+        /*
+          The sync word is known protocol content, so it can safely refine the
+          preamble-learned template before any payload decisions are made.
+        */
+        update_adaptive_template_bank(&bank, pcm,
+                                      preamble_pos + (PREAMBLE_SYMBOLS + i) * symbol_span,
+                                      symbol_span, sync[i], 0.04);
+    }
     return bank;
+}
+
+static void update_adaptive_template_bank(AdaptiveTemplateBank* bank,
+                                          const std::vector<int16_t>& pcm,
+                                          double pos,
+                                          double symbol_span,
+                                          int raw_symbol,
+                                          double learning_rate) {
+    if (bank == nullptr || !bank->valid || raw_symbol < 0 || raw_symbol >= ALPHABET) return;
+    if (learning_rate <= 0.0) return;
+
+    const std::array<double, SYMBOL_SAMPLES> observed =
+        normalized_symbol_samples(pcm, pos, symbol_span);
+    double observed_energy = 0.0;
+    for (double v : observed) observed_energy += v * v;
+    if (observed_energy <= 1e-9) return;
+
+    const int shift = raw_symbol * SYMBOL_SAMPLES / ALPHABET;
+    std::array<double, SYMBOL_SAMPLES> candidate = {};
+    for (int n = 0; n < SYMBOL_SAMPLES; ++n) {
+        candidate[size_t(n)] = cyclic_array_sample(observed, double(n - shift));
+    }
+    normalize_template(&candidate);
+
+    double dot = 0.0;
+    for (int n = 0; n < SYMBOL_SAMPLES; ++n) {
+        dot += candidate[size_t(n)] * bank->base[size_t(n)];
+    }
+    if (dot < 0.0) {
+        for (double& v : candidate) v = -v;
+    }
+
+    const double keep = 1.0 - learning_rate;
+    for (int n = 0; n < SYMBOL_SAMPLES; ++n) {
+        bank->base[size_t(n)] = keep * bank->base[size_t(n)] +
+                                learning_rate * candidate[size_t(n)];
+    }
+    normalize_template(&bank->base);
+    rebuild_adaptive_templates(bank);
 }
 
 static double corr_score_adaptive(const std::vector<int16_t>& pcm,
@@ -959,14 +1021,21 @@ static std::vector<double> decode_llrs_tracking(const std::vector<int16_t>& pcm,
                                                 double data_pos,
                                                 double symbol_span,
                                                 size_t max_bits = 50000 * BITS_PER_SYMBOL,
-                                                const AdaptiveTemplateBank* adaptive = nullptr) {
+                                                AdaptiveTemplateBank* adaptive = nullptr,
+                                                bool decision_directed_update = false) {
     std::vector<double> llrs;
     TimingState timing(data_pos, symbol_span);
     const double min_span = NOMINAL_SPAN * 0.85;
     const double max_span = NOMINAL_SPAN * 1.15;
-    const double confidence_threshold = 0.035;
-    const double kp = 0.55;
-    const double ki = 0.015;
+    const bool adaptive_templates = adaptive != nullptr && adaptive->valid;
+    const double confidence_threshold = adaptive_templates ? 0.055 : 0.035;
+    const double timing_update_max_offset = adaptive_templates ? 4.0 : 24.0;
+    const double template_update_confidence = 0.085;
+    const double template_update_best_score = 0.30;
+    const double template_update_max_timing_offset = 4.0;
+    const double template_learning_rate = 0.010;
+    const double kp = adaptive_templates ? 0.18 : 0.55;
+    const double ki = adaptive_templates ? 0.003 : 0.015;
 
     while (timing.pos + timing.span < double(pcm.size()) && llrs.size() < max_bits) {
         const SymbolMetrics m =
@@ -975,7 +1044,24 @@ static std::vector<double> decode_llrs_tracking(const std::vector<int16_t>& pcm,
         for (double v : symbol_llr) llrs.push_back(v);
 
         const double confidence = m.best_score - m.second_best_score;
-        if (confidence > confidence_threshold) {
+        if (decision_directed_update && adaptive != nullptr && adaptive->valid &&
+            m.best_score > template_update_best_score &&
+            confidence > template_update_confidence &&
+            std::abs(m.timing_offset) <= template_update_max_timing_offset) {
+            /*
+              Decision-directed template tracking:
+              use only high-confidence symbol decisions to slowly adapt the
+              preamble-learned chirp shape. This follows slow speaker/recorder
+              processing changes in long frames while avoiding runaway updates
+              after weak or timing-ambiguous symbols.
+            */
+            update_adaptive_template_bank(adaptive, pcm, timing.pos + m.timing_offset,
+                                          timing.span, m.best_symbol,
+                                          template_learning_rate);
+        }
+
+        if (confidence > confidence_threshold &&
+            std::abs(m.timing_offset) <= timing_update_max_offset) {
             /*
               Sign convention:
               - m.timing_offset is the offset, in samples, that maximized the
@@ -985,6 +1071,12 @@ static std::vector<double> decode_llrs_tracking(const std::vector<int16_t>& pcm,
               - pos advances by span plus a proportional correction.
               - span receives only a small integral correction from filtered
                 timing error and is clamped to avoid runaway after a bad symbol.
+
+              With preamble-adaptive templates, large apparent offsets are often
+              caused by channel-shaped side lobes rather than real sample-clock
+              drift. Those symbols are still demodulated, and may still update
+              the template if their symbol decision is strong, but they do not
+              pull the timing loop.
             */
             timing.timing_error_filtered =
                 0.85 * timing.timing_error_filtered + 0.15 * m.timing_offset;
@@ -1188,7 +1280,6 @@ static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pc
 
     const AdaptiveTemplateBank adaptive =
         build_adaptive_template_bank(pcm, lock.preamble_pos, lock.symbol_span);
-    const AdaptiveTemplateBank* adaptive_ptr = adaptive.valid ? &adaptive : nullptr;
     progress_message(verbose, progress_clock,
                      adaptive.valid
                          ? "scanner: using preamble-adaptive channel templates"
@@ -1222,10 +1313,11 @@ static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pc
                 return result;
             }
 
-            const int template_modes = adaptive_ptr != nullptr ? 2 : 1;
+            const int template_modes = adaptive.valid ? 2 : 1;
             for (int template_mode = 0; template_mode < template_modes; ++template_mode) {
-                const AdaptiveTemplateBank* decode_templates =
-                    (template_mode == 0) ? adaptive_ptr : nullptr;
+                AdaptiveTemplateBank working_adaptive = adaptive;
+                AdaptiveTemplateBank* decode_templates =
+                    (template_mode == 0 && working_adaptive.valid) ? &working_adaptive : nullptr;
                 if (template_mode == 1) {
                     progress_message(verbose, progress_clock,
                                      "scanner: retrying candidate with ideal templates",
@@ -1234,7 +1326,7 @@ static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pc
 
                 const std::vector<double> header_llrs =
                     decode_llrs_tracking(pcm, data_pos, candidate_span,
-                                         FEC_CODEWORD_BITS, decode_templates);
+                                         FEC_CODEWORD_BITS, decode_templates, false);
                 if (header_llrs.size() < FEC_CODEWORD_BITS) {
                     result.status = StreamScanStatus::NeedMoreSamples;
                     result.discard_prefix_samples = clamp_discard(frame_start, pcm.size());
@@ -1279,7 +1371,8 @@ static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pc
                                  true);
                 const std::vector<double> frame_llrs =
                     decode_llrs_tracking(pcm, data_pos, candidate_span,
-                                         required_fec_bits, decode_templates);
+                                         required_fec_bits, decode_templates,
+                                         decode_templates != nullptr);
                 if (frame_llrs.size() < required_fec_bits) {
                     result.status = StreamScanStatus::NeedMoreSamples;
                     result.discard_prefix_samples = clamp_discard(frame_start, pcm.size());

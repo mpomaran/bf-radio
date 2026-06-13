@@ -1,7 +1,10 @@
 filegroup(
     name = "phone_recording_testdata",
     srcs = [
+        "testdata/encoded_2.txt",
         "testdata/original_encoded.pcm",
+        "testdata/original_2_encoded.pcm",
+        "testdata/received2.wav",
         "testdata/transmitted.txt",
         "testdata/transmitted.wav",
     ],
