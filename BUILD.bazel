@@ -1,0 +1,7 @@
+filegroup(
+    name = "phone_recording_testdata",
+    srcs = [
+        "testdata/transmitted.wav",
+    ],
+    visibility = ["//visibility:public"],
+)

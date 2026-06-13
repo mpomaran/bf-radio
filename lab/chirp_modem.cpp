@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <ctime>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -42,7 +43,20 @@ static constexpr double FREQ_LOW = 700.0;
 static constexpr double FREQ_HIGH = 2300.0;
 static constexpr double AMP = 0.55;
 static constexpr double NOMINAL_SPAN = double(SYMBOL_SAMPLES);
+static constexpr double STREAM_DECODE_SYNC_SCORE_THRESHOLD = 0.28;
 static const uint8_t PROTOCOL_MAGIC[4] = {'C', 'H', 'R', 'P'};
+
+static void progress_message(bool enabled,
+                             std::clock_t* last_report,
+                             const std::string& message,
+                             bool force = false) {
+    if (!enabled || last_report == nullptr) return;
+    const std::clock_t now = std::clock();
+    const double elapsed = double(now - *last_report) / double(CLOCKS_PER_SEC);
+    if (!force && elapsed < 0.75) return;
+    *last_report = now;
+    std::cerr << "[progress] " << message << "\n";
+}
 
 static uint16_t crc16_ccitt(const std::vector<uint8_t>& data) {
     uint16_t crc = 0xFFFF;
@@ -713,13 +727,19 @@ static double find_energy_onset(const std::vector<int16_t>& pcm) {
     return 0.0;
 }
 
-static SyncLock find_sync(const std::vector<int16_t>& pcm, bool verbose = true) {
+static SyncLock find_sync(const std::vector<int16_t>& pcm,
+                          bool verbose = true,
+                          std::clock_t* progress_clock = nullptr) {
     SyncLock best;
     if (pcm.size() < size_t((PREAMBLE_SYMBOLS + SYNC_SYMBOLS) * SYMBOL_SAMPLES)) {
         throw std::runtime_error("PCM too short");
     }
 
     const double onset = find_energy_onset(pcm);
+    progress_message(verbose, progress_clock,
+                     "sync acquisition: local search around energy onset sample " +
+                         std::to_string(size_t(std::max(0.0, onset))),
+                     true);
     for (int scale = 88; scale <= 112; scale += 2) {
         const double span = NOMINAL_SPAN * double(scale) / 100.0;
         for (double pre = onset - 0.75 * span; pre <= onset + 0.75 * span; pre += 2.0) {
@@ -731,6 +751,10 @@ static SyncLock find_sync(const std::vector<int16_t>& pcm, bool verbose = true) 
     // leading silence. Fall back to a full sliding scan only if that local lock
     // is weak, which keeps long frames reasonable on Raspberry Pi-class CPUs.
     if (best.score < 0.25) {
+        progress_message(verbose, progress_clock,
+                         "sync acquisition: local score " + std::to_string(best.score) +
+                             " is weak, starting full sliding scan",
+                         true);
         const int coarse_step = SYMBOL_SAMPLES / 2;
         for (int scale = 88; scale <= 112; scale += 4) {
             const double span = NOMINAL_SPAN * double(scale) / 100.0;
@@ -738,10 +762,22 @@ static SyncLock find_sync(const std::vector<int16_t>& pcm, bool verbose = true) 
             if (frame_prefix >= double(pcm.size())) continue;
             for (double pre = 0.0; pre + frame_prefix < double(pcm.size()); pre += coarse_step) {
                 consider_sync_candidate(pcm, pre, span, &best);
+                const double denom = std::max(1.0, double(pcm.size()) - frame_prefix);
+                const int pct = int(std::min(100.0, std::max(0.0, 100.0 * pre / denom)));
+                progress_message(verbose, progress_clock,
+                                 "sync acquisition: full scan scale " +
+                                     std::to_string(scale) + "%, window " +
+                                     std::to_string(pct) + "%, best score " +
+                                     std::to_string(best.score));
             }
         }
     }
 
+    progress_message(verbose, progress_clock,
+                     "sync acquisition: refining best lock at sample " +
+                         std::to_string(size_t(std::max(0.0, best.preamble_pos))) +
+                         ", score " + std::to_string(best.score),
+                     true);
     SyncLock refined = best;
     for (double span = best.symbol_span - 6.0; span <= best.symbol_span + 6.0; span += 1.0) {
         if (span < NOMINAL_SPAN * 0.85 || span > NOMINAL_SPAN * 1.15) continue;
@@ -817,6 +853,16 @@ enum class StreamScanStatus {
     FrameDecoded,
     InvalidFrameRejected
 };
+
+static const char* stream_scan_status_name(StreamScanStatus status) {
+    switch (status) {
+        case StreamScanStatus::NoFrameWindowConsumed: return "NoFrameWindowConsumed";
+        case StreamScanStatus::NeedMoreSamples: return "NeedMoreSamples";
+        case StreamScanStatus::FrameDecoded: return "FrameDecoded";
+        case StreamScanStatus::InvalidFrameRejected: return "InvalidFrameRejected";
+    }
+    return "Unknown";
+}
 
 struct StreamScanResult {
     StreamScanStatus status;
@@ -899,7 +945,9 @@ static bool decode_exact_payload_from_llrs(const std::vector<double>& llrs,
   the protected frame payload and discard_prefix_samples consumes through the
   decoded frame.
 */
-static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pcm) {
+static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pcm,
+                                                  bool verbose = false,
+                                                  std::clock_t* progress_clock = nullptr) {
     StreamScanResult result;
     result.status = StreamScanStatus::NoFrameWindowConsumed;
 
@@ -909,32 +957,55 @@ static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pc
                                                    NOMINAL_SPAN * 0.85));
     const size_t keep_tail_without_lock = max_sync_prefix;
 
-    if (pcm.empty()) return result;
+    if (pcm.empty()) {
+        progress_message(verbose, progress_clock, "scanner: empty PCM window", true);
+        return result;
+    }
 
     size_t energy = 0;
     if (!find_first_energy_sample(pcm, &energy)) {
         result.status = StreamScanStatus::NoFrameWindowConsumed;
         result.discard_prefix_samples = pcm.size();
+        progress_message(verbose, progress_clock,
+                         "scanner: no energy above threshold, consuming " +
+                             std::to_string(pcm.size()) + " samples",
+                         true);
         return result;
     }
 
     if (pcm.size() - energy < min_sync_prefix) {
         result.status = StreamScanStatus::NeedMoreSamples;
         result.discard_prefix_samples = energy;
+        progress_message(verbose, progress_clock,
+                         "scanner: possible signal near sample " + std::to_string(energy) +
+                             ", need more samples for preamble/sync",
+                         true);
         return result;
     }
 
     SyncLock lock;
     try {
-        lock = find_sync(pcm, false);
+        progress_message(verbose, progress_clock,
+                         "scanner: searching sync in " + std::to_string(pcm.size()) +
+                             " samples",
+                         true);
+        lock = find_sync(pcm, verbose, progress_clock);
     } catch (const std::exception&) {
         if (pcm.size() <= keep_tail_without_lock) {
             result.status = StreamScanStatus::NeedMoreSamples;
             result.discard_prefix_samples = std::min(energy, pcm.size());
+            progress_message(verbose, progress_clock,
+                             "scanner: no sync yet, keeping tail for more samples",
+                             true);
             return result;
         }
         result.status = StreamScanStatus::NoFrameWindowConsumed;
         result.discard_prefix_samples = pcm.size() - keep_tail_without_lock;
+        progress_message(verbose, progress_clock,
+                         "scanner: sync not found, consuming " +
+                             std::to_string(result.discard_prefix_samples) +
+                             " inspected samples",
+                         true);
         return result;
     }
 
@@ -942,6 +1013,26 @@ static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pc
     result.estimated_symbol_span = lock.symbol_span;
     const size_t frame_start = size_t(std::max(0.0, std::floor(lock.preamble_pos + 0.5)));
     result.frame_start_sample = frame_start;
+    progress_message(verbose, progress_clock,
+                     "scanner: sync candidate score " + std::to_string(lock.score) +
+                         ", frame_start " + std::to_string(frame_start) +
+                         ", span " + std::to_string(lock.symbol_span),
+                     true);
+
+    if (lock.score < STREAM_DECODE_SYNC_SCORE_THRESHOLD) {
+        result.status = StreamScanStatus::InvalidFrameRejected;
+        const size_t low_score_skip =
+            std::max(frame_start + size_t(std::ceil(lock.symbol_span)), min_sync_prefix / 3);
+        result.discard_prefix_samples = clamp_discard(low_score_skip, pcm.size());
+        progress_message(verbose, progress_clock,
+                         "scanner: sync score below decode threshold " +
+                             std::to_string(STREAM_DECODE_SYNC_SCORE_THRESHOLD) +
+                             ", skipping " +
+                             std::to_string(result.discard_prefix_samples) +
+                             " samples",
+                         true);
+        return result;
+    }
 
     const double data_pos = lock.sync_pos + SYNC_SYMBOLS * lock.symbol_span;
     bool saw_rejectable_candidate = false;
@@ -954,10 +1045,19 @@ static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pc
             const int signed_tenths = sign * tenths;
             const double candidate_span =
                 lock.symbol_span * (1.0 + double(signed_tenths) / 1000.0);
+            const int candidate_index = tenths * 2 + (sign < 0 ? 1 : 0);
+            const int candidate_pct = int(100.0 * double(candidate_index) / 61.0);
+            progress_message(verbose, progress_clock,
+                             "scanner: checking frame candidate spans " +
+                                 std::to_string(candidate_pct) + "%, drift " +
+                                 std::to_string(double(signed_tenths) / 10.0) + "%");
             const double header_end = data_pos + double(header_symbols + 1) * candidate_span;
             if (header_end >= double(pcm.size())) {
                 result.status = StreamScanStatus::NeedMoreSamples;
                 result.discard_prefix_samples = clamp_discard(frame_start, pcm.size());
+                progress_message(verbose, progress_clock,
+                                 "scanner: header candidate is incomplete, need more samples",
+                                 true);
                 return result;
             }
 
@@ -966,6 +1066,9 @@ static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pc
             if (header_llrs.size() < FEC_CODEWORD_BITS) {
                 result.status = StreamScanStatus::NeedMoreSamples;
                 result.discard_prefix_samples = clamp_discard(frame_start, pcm.size());
+                progress_message(verbose, progress_clock,
+                                 "scanner: header LLR extraction stopped at window end",
+                                 true);
                 return result;
             }
 
@@ -979,6 +1082,10 @@ static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pc
                 saw_rejectable_candidate = true;
                 continue;
             }
+            progress_message(verbose, progress_clock,
+                             "scanner: protected header decoded, frame FEC bits " +
+                                 std::to_string(required_fec_bits),
+                             true);
 
             const size_t required_symbols =
                 (required_fec_bits + BITS_PER_SYMBOL - 1) / BITS_PER_SYMBOL;
@@ -986,14 +1093,24 @@ static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pc
             if (frame_end + candidate_span >= double(pcm.size())) {
                 result.status = StreamScanStatus::NeedMoreSamples;
                 result.discard_prefix_samples = clamp_discard(frame_start, pcm.size());
+                progress_message(verbose, progress_clock,
+                                 "scanner: frame appears valid but incomplete, need more samples",
+                                 true);
                 return result;
             }
 
+            progress_message(verbose, progress_clock,
+                             "scanner: extracting full frame metrics, symbols " +
+                                 std::to_string(required_symbols),
+                             true);
             const std::vector<double> frame_llrs =
                 decode_llrs_tracking(pcm, data_pos, candidate_span, required_fec_bits);
             if (frame_llrs.size() < required_fec_bits) {
                 result.status = StreamScanStatus::NeedMoreSamples;
                 result.discard_prefix_samples = clamp_discard(frame_start, pcm.size());
+                progress_message(verbose, progress_clock,
+                                 "scanner: full-frame LLR extraction stopped at window end",
+                                 true);
                 return result;
             }
 
@@ -1002,6 +1119,11 @@ static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pc
                 result.estimated_symbol_span = candidate_span;
                 result.frame_end_sample = clamp_discard(size_t(std::ceil(frame_end)), pcm.size());
                 result.discard_prefix_samples = result.frame_end_sample;
+                progress_message(verbose, progress_clock,
+                                 "scanner: frame decoded, consuming " +
+                                     std::to_string(result.discard_prefix_samples) +
+                                     " samples",
+                                 true);
                 return result;
             }
             saw_rejectable_candidate = true;
@@ -1013,14 +1135,34 @@ static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pc
                         : StreamScanStatus::NoFrameWindowConsumed;
     result.discard_prefix_samples =
         clamp_discard(frame_start + size_t(std::ceil(lock.symbol_span)), pcm.size());
+    progress_message(verbose, progress_clock,
+                     "scanner: candidate rejected, consuming " +
+                         std::to_string(result.discard_prefix_samples) + " samples",
+                     true);
     return result;
 }
 
 static bool decode_payload_from_pcm(const std::vector<int16_t>& pcm,
-                                    std::vector<uint8_t>* payload) {
+                                    std::vector<uint8_t>* payload,
+                                    bool verbose = false) {
     std::vector<int16_t> buffer = pcm;
+    std::clock_t progress_clock = std::clock();
+    progress_message(verbose, &progress_clock,
+                     "decoder: input " + std::to_string(pcm.size()) + " samples (" +
+                         std::to_string(double(pcm.size()) / SAMPLE_RATE) + " s)",
+                     true);
     for (int iter = 0; iter < 128 && !buffer.empty(); ++iter) {
-        const StreamScanResult scan = scan_pcm_window_for_frame(buffer);
+        progress_message(verbose, &progress_clock,
+                         "decoder: scan iteration " + std::to_string(iter + 1) +
+                             ", buffer " + std::to_string(buffer.size()) + " samples",
+                         true);
+        const StreamScanResult scan = scan_pcm_window_for_frame(buffer, verbose, &progress_clock);
+        progress_message(verbose, &progress_clock,
+                         "decoder: scanner returned " +
+                             std::string(stream_scan_status_name(scan.status)) +
+                             ", discard " + std::to_string(scan.discard_prefix_samples) +
+                             " samples",
+                         true);
         if (scan.status == StreamScanStatus::FrameDecoded) {
             *payload = scan.payload;
             return true;
@@ -1041,7 +1183,7 @@ static bool decode_payload_from_pcm(const std::vector<int16_t>& pcm,
 static void decode_file(const std::string& in_pcm_path, const std::string& out_path) {
     const std::vector<int16_t> pcm = read_pcm16(in_pcm_path);
     std::vector<uint8_t> payload;
-    if (!decode_payload_from_pcm(pcm, &payload)) {
+    if (!decode_payload_from_pcm(pcm, &payload, true)) {
         throw std::runtime_error("CRC check failed or valid frame not found");
     }
     write_file(out_path, payload);
