@@ -61,6 +61,7 @@ cc_library(
     srcs = [
         "chirp/bit_utils.cpp",
         "chirp/crc16.cpp",
+        "chirp/demod_metrics.cpp",
         "chirp/fec_ldpc.cpp",
         "chirp/fft.cpp",
         "chirp/file_io.cpp",
@@ -74,6 +75,7 @@ cc_library(
         "chirp/bit_utils.h",
         "chirp/config.h",
         "chirp/crc16.h",
+        "chirp/demod_metrics.h",
         "chirp/fec_ldpc.h",
         "chirp/fft.h",
         "chirp/file_io.h",
@@ -97,6 +99,13 @@ cc_test(
 cc_test(
     name = "crc16_test",
     srcs = ["chirp/crc16_test.cpp"],
+    copts = CPP17_COPTS,
+    deps = [":chirp_modem_lib"],
+)
+
+cc_test(
+    name = "demod_metrics_test",
+    srcs = ["chirp/demod_metrics_test.cpp"],
     copts = CPP17_COPTS,
     deps = [":chirp_modem_lib"],
 )

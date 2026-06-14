@@ -26,6 +26,7 @@
 
 #include "lab/chirp/bit_utils.h"
 #include "lab/chirp/config.h"
+#include "lab/chirp/demod_metrics.h"
 #include "lab/chirp/fec_ldpc.h"
 #include "lab/chirp/fft.h"
 #include "lab/chirp/file_io.h"
@@ -61,6 +62,14 @@ using chirp::config::PhyProfile;
 using chirp::config::current_phy_profile;
 using chirp::dsp::circular_chirp_correlation;
 using chirp::dsp::cyclic_corr_sample;
+using chirp::demod::DemodConfig;
+using chirp::demod::MetricStats;
+using chirp::demod::SymbolMetrics;
+using chirp::demod::calibrated_llr_demod_config;
+using chirp::demod::fixed_llr_demod_config;
+using chirp::demod::llr_mode_name;
+using chirp::demod::metric_stats_observe_known_symbol;
+using chirp::demod::symbol_metrics_to_llr;
 using chirp::fec::FecDecodeResult;
 using chirp::fec::LDPCCodec;
 using chirp::fec::fec_decode_bits_from_llr;
@@ -142,109 +151,6 @@ static double corr_score(const std::vector<int16_t>& pcm,
     }
     if (e1 <= 1e-9 || e2 <= 1e-9) return 0.0;
     return std::abs(dot) / std::sqrt(e1 * e2);
-}
-
-struct SymbolMetrics {
-    std::array<double, ALPHABET> metric;
-    double best_score;
-    double second_best_score;
-    int best_symbol;
-    double timing_offset;
-
-    SymbolMetrics()
-        : metric(), best_score(-1.0), second_best_score(-1.0),
-          best_symbol(0), timing_offset(0.0) {}
-};
-
-struct DemodConfig {
-    double llr_scale;
-    double llr_clip;
-    double llr_temperature;
-    bool use_logsumexp_llr;
-    bool use_noise_variance_llr;
-
-    DemodConfig()
-        : llr_scale(6.0), llr_clip(8.0), llr_temperature(1.0),
-          use_logsumexp_llr(false), use_noise_variance_llr(true) {}
-};
-
-static DemodConfig fixed_llr_demod_config() {
-    DemodConfig cfg;
-    cfg.use_noise_variance_llr = false;
-    return cfg;
-}
-
-static DemodConfig calibrated_llr_demod_config() {
-    DemodConfig cfg;
-    cfg.use_noise_variance_llr = true;
-    cfg.llr_scale = 0.50;
-    cfg.llr_clip = 8.0;
-    return cfg;
-}
-
-static const char* llr_mode_name(const DemodConfig& cfg) {
-    if (cfg.use_logsumexp_llr) return "logsumexp";
-    return cfg.use_noise_variance_llr ? "calibrated-maxlog" : "fixed-maxlog";
-}
-
-struct MetricStats {
-    double winner_mean;
-    double loser_mean;
-    double loser_variance;
-    double mean_peak_margin;
-    double llr_saturation_rate;
-    int samples;
-
-    double winner_sum;
-    double loser_sum;
-    double loser_sq_sum;
-    double margin_sum;
-    int loser_samples;
-    int llr_samples;
-    int llr_saturated;
-
-    MetricStats()
-        : winner_mean(0.0), loser_mean(0.0), loser_variance(1.0),
-          mean_peak_margin(0.0), llr_saturation_rate(0.0), samples(0),
-          winner_sum(0.0), loser_sum(0.0), loser_sq_sum(0.0),
-          margin_sum(0.0), loser_samples(0), llr_samples(0),
-          llr_saturated(0) {}
-};
-
-static void metric_stats_observe_known_symbol(MetricStats* stats,
-                                              const SymbolMetrics& m,
-                                              int expected_symbol) {
-    if (stats == nullptr || expected_symbol < 0 || expected_symbol >= ALPHABET) return;
-    double best_loser = -std::numeric_limits<double>::infinity();
-    const double winner = m.metric[size_t(expected_symbol)];
-    for (int s = 0; s < ALPHABET; ++s) {
-        if (s == expected_symbol) continue;
-        const double loser = m.metric[size_t(s)];
-        stats->loser_sum += loser;
-        stats->loser_sq_sum += loser * loser;
-        ++stats->loser_samples;
-        best_loser = std::max(best_loser, loser);
-    }
-    stats->winner_sum += winner;
-    stats->margin_sum += winner - best_loser;
-    ++stats->samples;
-    stats->winner_mean = stats->winner_sum / std::max(1, stats->samples);
-    stats->loser_mean = stats->loser_sum / std::max(1, stats->loser_samples);
-    const double loser_second_moment =
-        stats->loser_sq_sum / std::max(1, stats->loser_samples);
-    stats->loser_variance =
-        std::max(1e-6, loser_second_moment - stats->loser_mean * stats->loser_mean);
-    stats->mean_peak_margin = stats->margin_sum / std::max(1, stats->samples);
-}
-
-static void metric_stats_observe_llr(MetricStats* stats,
-                                     double llr,
-                                     const DemodConfig& cfg) {
-    if (stats == nullptr) return;
-    ++stats->llr_samples;
-    if (std::abs(llr) >= cfg.llr_clip - 1e-9) ++stats->llr_saturated;
-    stats->llr_saturation_rate =
-        double(stats->llr_saturated) / double(std::max(1, stats->llr_samples));
 }
 
 struct TimingLoopConfig {
@@ -628,63 +534,6 @@ static SymbolMetrics decode_symbol_metrics_at(const std::vector<int16_t>& pcm,
         }
     }
     return best;
-}
-
-static double logsumexp_metric(const std::array<double, ALPHABET>& metric,
-                               const std::vector<int>& symbols,
-                               double temperature) {
-    if (symbols.empty()) return -std::numeric_limits<double>::infinity();
-    const double temp = std::max(1e-6, temperature);
-    double max_v = -std::numeric_limits<double>::infinity();
-    for (int s : symbols) max_v = std::max(max_v, metric[size_t(s)] / temp);
-    double sum = 0.0;
-    for (int s : symbols) sum += std::exp(metric[size_t(s)] / temp - max_v);
-    return temp * (max_v + std::log(std::max(1e-300, sum)));
-}
-
-static double clamp_llr(double value, double clip) {
-    if (value > clip) return clip;
-    if (value < -clip) return -clip;
-    return value;
-}
-
-static std::array<double, BITS_PER_SYMBOL> symbol_metrics_to_llr(
-    const SymbolMetrics& m,
-    const DemodConfig& cfg = DemodConfig(),
-    MetricStats* stats = nullptr) {
-    std::array<double, BITS_PER_SYMBOL> llr = {};
-    const double variance =
-        cfg.use_noise_variance_llr
-            ? std::max(0.50, stats != nullptr ? stats->loser_variance : 1.0)
-            : 1.0;
-
-    for (int bit = 0; bit < BITS_PER_SYMBOL; ++bit) {
-        double best0 = -std::numeric_limits<double>::infinity();
-        double best1 = -std::numeric_limits<double>::infinity();
-        std::vector<int> symbols0;
-        std::vector<int> symbols1;
-        for (int raw = 0; raw < ALPHABET; ++raw) {
-            const uint8_t binary_symbol = gray_to_binary4(uint8_t(raw));
-            const int value = (binary_symbol >> (BITS_PER_SYMBOL - 1 - bit)) & 1;
-            if (value == 0) {
-                best0 = std::max(best0, m.metric[size_t(raw)]);
-                if (cfg.use_logsumexp_llr) symbols0.push_back(raw);
-            } else {
-                best1 = std::max(best1, m.metric[size_t(raw)]);
-                if (cfg.use_logsumexp_llr) symbols1.push_back(raw);
-            }
-        }
-        if (cfg.use_logsumexp_llr) {
-            best0 = logsumexp_metric(m.metric, symbols0, cfg.llr_temperature);
-            best1 = logsumexp_metric(m.metric, symbols1, cfg.llr_temperature);
-        }
-
-        // Positive LLR means binary bit 0 is more likely; negative means bit 1.
-        const double raw = cfg.llr_scale * (best0 - best1) / variance;
-        llr[size_t(bit)] = clamp_llr(raw, cfg.llr_clip);
-        metric_stats_observe_llr(stats, llr[size_t(bit)], cfg);
-    }
-    return llr;
 }
 
 static void encode_file(const std::string& in_path, const std::string& out_pcm_path) {
