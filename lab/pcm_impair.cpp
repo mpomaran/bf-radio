@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <fstream>
 #include <iostream>
@@ -11,6 +12,10 @@ struct Options {
     std::string output;
     std::string region = "all";
     int scale_percent = 100;
+    double time_scale = 1.0;
+    bool scale_percent_set = false;
+    bool time_scale_set = false;
+    bool time_scale_ppm_set = false;
     int region_percent = 25;
     int bitflip_stride = 0;
     uint8_t bitflip_mask = 0x01;
@@ -95,6 +100,28 @@ static std::vector<int16_t> resample_linear(const std::vector<int16_t>& in,
     return out;
 }
 
+static std::vector<int16_t> resample_linear(const std::vector<int16_t>& in,
+                                            double time_scale) {
+    if (in.empty() || time_scale == 1.0) return in;
+    if (time_scale <= 0.0) throw std::runtime_error("Time scale must be positive");
+
+    const size_t out_len = std::max<size_t>(
+        1, size_t(std::llround(double(in.size()) * time_scale)));
+    std::vector<int16_t> out;
+    out.reserve(out_len);
+
+    if (out_len == 1) {
+        out.push_back(in.front());
+        return out;
+    }
+
+    const double step = double(in.size() - 1) / double(out_len - 1);
+    for (size_t i = 0; i < out_len; ++i) {
+        out.push_back(interpolate(in, double(i) * step));
+    }
+    return out;
+}
+
 static std::pair<size_t, size_t> region_bounds(size_t sample_count,
                                                const std::string& region,
                                                int region_percent) {
@@ -123,7 +150,10 @@ static std::vector<int16_t> impair_timing(const std::vector<int16_t>& in,
     out.insert(out.end(), in.begin(), in.begin() + std::ptrdiff_t(begin));
     std::vector<int16_t> segment(in.begin() + std::ptrdiff_t(begin),
                                  in.begin() + std::ptrdiff_t(end));
-    auto scaled = resample_linear(segment, options.scale_percent);
+    const std::vector<int16_t> scaled =
+        options.scale_percent_set
+            ? resample_linear(segment, options.scale_percent)
+            : resample_linear(segment, options.time_scale);
     out.insert(out.end(), scaled.begin(), scaled.end());
     out.insert(out.end(), in.begin() + std::ptrdiff_t(end), in.end());
     return out;
@@ -148,12 +178,24 @@ static int parse_int(const std::string& value, const std::string& name) {
     return result;
 }
 
+static double parse_double(const std::string& value, const std::string& name) {
+    size_t parsed = 0;
+    double result = 0.0;
+    try {
+        result = std::stod(value, &parsed);
+    } catch (...) {
+        throw std::runtime_error("Invalid number for " + name + ": " + value);
+    }
+    if (parsed != value.size()) throw std::runtime_error("Invalid number for " + name);
+    return result;
+}
+
 static Options parse_args(int argc, char** argv) {
     if (argc < 3) {
         throw std::runtime_error(
             "Usage: pcm_impair input.pcm output.pcm [--region all|start|middle|end] "
-            "[--scale-percent N] [--region-percent N] [--bitflip-stride N] "
-            "[--bitflip-mask N]");
+            "[--scale-percent N | --time-scale X | --time-scale-ppm PPM] "
+            "[--region-percent N] [--bitflip-stride N] [--bitflip-mask N]");
     }
 
     Options options;
@@ -171,6 +213,14 @@ static Options parse_args(int argc, char** argv) {
             options.region = require_value(arg);
         } else if (arg == "--scale-percent") {
             options.scale_percent = parse_int(require_value(arg), arg);
+            options.scale_percent_set = true;
+        } else if (arg == "--time-scale") {
+            options.time_scale = parse_double(require_value(arg), arg);
+            options.time_scale_set = true;
+        } else if (arg == "--time-scale-ppm") {
+            const double ppm = parse_double(require_value(arg), arg);
+            options.time_scale = 1.0 + ppm / 1000000.0;
+            options.time_scale_ppm_set = true;
         } else if (arg == "--region-percent") {
             options.region_percent = parse_int(require_value(arg), arg);
         } else if (arg == "--bitflip-stride") {
@@ -180,6 +230,14 @@ static Options parse_args(int argc, char** argv) {
         } else {
             throw std::runtime_error("Unknown argument: " + arg);
         }
+    }
+
+    const int scale_option_count = (options.scale_percent_set ? 1 : 0) +
+                                   (options.time_scale_set ? 1 : 0) +
+                                   (options.time_scale_ppm_set ? 1 : 0);
+    if (scale_option_count > 1) {
+        throw std::runtime_error(
+            "Use only one of --scale-percent, --time-scale, or --time-scale-ppm");
     }
 
     return options;

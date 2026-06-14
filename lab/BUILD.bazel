@@ -235,6 +235,14 @@ sh_test(
 )
 
 sh_test(
+    name = "chirp_realistic_clock_drift_test",
+    srcs = ["chirp_realistic_clock_drift_test.sh"],
+    data = [":chirp_modem", ":pcm_impair"],
+    size = "large",
+    tags = ["manual", "slow"],
+)
+
+sh_test(
     name = "chirp_radio_channel_impair_test",
     srcs = ["chirp_radio_channel_impair_test.sh"],
     data = [
@@ -379,6 +387,7 @@ test_suite(
         ":chirp_corruption_test",
         ":chirp_fec_limits_test",
         ":chirp_fec_performance_test",
+        ":chirp_realistic_clock_drift_test",
         ":chirp_timing_drift_test",
     ],
 )
