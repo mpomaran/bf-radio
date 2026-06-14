@@ -40,11 +40,15 @@ const char* llr_mode_name(const DemodConfig& cfg) {
 }
 
 MetricStats::MetricStats()
-    : winner_mean(0.0), loser_mean(0.0), loser_variance(1.0),
-      mean_peak_margin(0.0), llr_saturation_rate(0.0), samples(0),
-      winner_sum(0.0), loser_sum(0.0), loser_sq_sum(0.0),
-      margin_sum(0.0), loser_samples(0), llr_samples(0),
-      llr_saturated(0) {}
+    : winner_mean(0.0), runner_up_mean(0.0), loser_mean(0.0),
+      loser_variance(1.0), mean_peak_margin(0.0),
+      margin_min(std::numeric_limits<double>::infinity()),
+      llr_saturation_rate(0.0), llr_mean_abs(0.0), llr_max_abs(0.0),
+      symbol_error_rate(0.0), samples(0), winner_sum(0.0),
+      runner_up_sum(0.0), loser_sum(0.0), loser_sq_sum(0.0),
+      margin_sum(0.0), llr_abs_sum(0.0), loser_samples(0),
+      llr_samples(0), llr_saturated(0), symbol_errors(0),
+      margin_samples() {}
 
 void metric_stats_observe_known_symbol(MetricStats* stats,
                                        const SymbolMetrics& m,
@@ -61,15 +65,23 @@ void metric_stats_observe_known_symbol(MetricStats* stats,
         best_loser = std::max(best_loser, loser);
     }
     stats->winner_sum += winner;
-    stats->margin_sum += winner - best_loser;
+    stats->runner_up_sum += best_loser;
+    const double margin = winner - best_loser;
+    stats->margin_sum += margin;
+    stats->margin_min = std::min(stats->margin_min, margin);
+    stats->margin_samples.push_back(margin);
+    if (m.best_symbol != expected_symbol) ++stats->symbol_errors;
     ++stats->samples;
     stats->winner_mean = stats->winner_sum / std::max(1, stats->samples);
+    stats->runner_up_mean = stats->runner_up_sum / std::max(1, stats->samples);
     stats->loser_mean = stats->loser_sum / std::max(1, stats->loser_samples);
     const double loser_second_moment =
         stats->loser_sq_sum / std::max(1, stats->loser_samples);
     stats->loser_variance =
         std::max(1e-6, loser_second_moment - stats->loser_mean * stats->loser_mean);
     stats->mean_peak_margin = stats->margin_sum / std::max(1, stats->samples);
+    stats->symbol_error_rate =
+        double(stats->symbol_errors) / double(std::max(1, stats->samples));
 }
 
 static void metric_stats_observe_llr(MetricStats* stats,
@@ -77,7 +89,11 @@ static void metric_stats_observe_llr(MetricStats* stats,
                                      const DemodConfig& cfg) {
     if (stats == nullptr) return;
     ++stats->llr_samples;
-    if (std::abs(llr) >= cfg.llr_clip - 1e-9) ++stats->llr_saturated;
+    const double abs_llr = std::abs(llr);
+    stats->llr_abs_sum += abs_llr;
+    stats->llr_max_abs = std::max(stats->llr_max_abs, abs_llr);
+    stats->llr_mean_abs = stats->llr_abs_sum / double(std::max(1, stats->llr_samples));
+    if (abs_llr >= cfg.llr_clip - 1e-9) ++stats->llr_saturated;
     stats->llr_saturation_rate =
         double(stats->llr_saturated) / double(std::max(1, stats->llr_samples));
 }

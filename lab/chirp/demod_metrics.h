@@ -8,6 +8,7 @@
 #define BF_RADIO_LAB_CHIRP_DEMOD_METRICS_H_
 
 #include <array>
+#include <vector>
 
 #include "lab/chirp/config.h"
 
@@ -40,19 +41,28 @@ const char* llr_mode_name(const DemodConfig& cfg);
 
 struct MetricStats {
     double winner_mean;
+    double runner_up_mean;
     double loser_mean;
     double loser_variance;
     double mean_peak_margin;
+    double margin_min;
     double llr_saturation_rate;
+    double llr_mean_abs;
+    double llr_max_abs;
+    double symbol_error_rate;
     int samples;
 
     double winner_sum;
+    double runner_up_sum;
     double loser_sum;
     double loser_sq_sum;
     double margin_sum;
+    double llr_abs_sum;
     int loser_samples;
     int llr_samples;
     int llr_saturated;
+    int symbol_errors;
+    std::vector<double> margin_samples;
 
     MetricStats();
 };

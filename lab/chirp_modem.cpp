@@ -179,6 +179,7 @@ enum class TimingSearchProfile {
 };
 
 static TimingSearchProfile g_timing_search_profile = TimingSearchProfile::Local;
+static bool g_rx_diagnostics_enabled = false;
 
 static const char* timing_search_profile_name(TimingSearchProfile profile) {
     switch (profile) {
@@ -196,7 +197,7 @@ static TimingSearchProfile parse_timing_search_profile(const std::string& value)
     throw std::runtime_error("timing search must be full, local, or center");
 }
 
-static std::vector<std::string> strip_global_timing_search_args(int argc, char** argv) {
+static std::vector<std::string> strip_global_receiver_args(int argc, char** argv) {
     std::vector<std::string> args;
     args.reserve(size_t(std::max(0, argc - 1)));
     for (int i = 1; i < argc; ++i) {
@@ -208,6 +209,8 @@ static std::vector<std::string> strip_global_timing_search_args(int argc, char**
             g_timing_search_profile = parse_timing_search_profile(argv[++i]);
         } else if (arg == "--timing-search") {
             throw std::runtime_error("--timing-search requires full, local, or center");
+        } else if (arg == "--rx-diagnostics" || arg == "--diagnostics") {
+            g_rx_diagnostics_enabled = true;
         } else {
             args.push_back(arg);
         }
@@ -250,6 +253,9 @@ struct TimingDiagnostics {
     int timing_search_local_count;
     int timing_search_center_count;
     double average_offsets_per_symbol;
+    double timing_offset_initial_samples;
+    double timing_offset_final_samples;
+    int timing_corrections_applied;
 
     double pilot_margin_sum;
     double pilot_offset_sq_sum;
@@ -267,8 +273,9 @@ struct TimingDiagnostics {
           span_estimate_mean(NOMINAL_SPAN), span_estimate_min(NOMINAL_SPAN),
           span_estimate_max(NOMINAL_SPAN), timing_search_full_count(0),
           timing_search_local_count(0), timing_search_center_count(0),
-          average_offsets_per_symbol(0.0), pilot_margin_sum(0.0),
-          pilot_offset_sq_sum(0.0), timing_error_sq_sum(0.0),
+          average_offsets_per_symbol(0.0), timing_offset_initial_samples(0.0),
+          timing_offset_final_samples(0.0), timing_corrections_applied(0),
+          pilot_margin_sum(0.0), pilot_offset_sq_sum(0.0), timing_error_sq_sum(0.0),
           span_sum(0.0), timing_error_samples(0), span_samples(0),
           timing_search_symbols(0), timing_search_offsets(0) {}
 };
@@ -682,6 +689,22 @@ static double sync_score_at(const std::vector<int16_t>& pcm,
     return total / double(SYNC_SYMBOLS + 4 * 0.35);
 }
 
+static double preamble_score_at(const std::vector<int16_t>& pcm,
+                                double preamble_pos,
+                                double span) {
+    if (preamble_pos < 0.0 ||
+        preamble_pos + PREAMBLE_SYMBOLS * span >= double(pcm.size())) {
+        return -1.0;
+    }
+    double total = 0.0;
+    int probes = 0;
+    for (int i = 0; i < PREAMBLE_SYMBOLS; i += 4) {
+        total += corr_score(pcm, preamble_pos + i * span, span, symbol_template(0, 1));
+        ++probes;
+    }
+    return probes > 0 ? total / double(probes) : -1.0;
+}
+
 static void consider_sync_candidate(const std::vector<int16_t>& pcm,
                                     double preamble_pos,
                                     double span,
@@ -823,6 +846,11 @@ static void timing_diag_record_span(TimingDiagnostics* diag, double span) {
 
 static void timing_diag_record_error(TimingDiagnostics* diag, double error) {
     if (diag == nullptr) return;
+    if (diag->timing_corrections_applied == 0) {
+        diag->timing_offset_initial_samples = error;
+    }
+    diag->timing_offset_final_samples = error;
+    ++diag->timing_corrections_applied;
     diag->timing_error_sq_sum += error * error;
     ++diag->timing_error_samples;
     diag->timing_error_rms =
@@ -1387,10 +1415,20 @@ static bool decode_payload_from_pcm(const std::vector<int16_t>& pcm,
     return false;
 }
 
-static void decode_file(const std::string& in_pcm_path, const std::string& out_path) {
+static void print_receiver_diagnostics_for_pcm(const std::vector<int16_t>& pcm,
+                                               bool decode_ok,
+                                               const std::vector<uint8_t>& payload);
+
+static void decode_file(const std::string& in_pcm_path,
+                        const std::string& out_path,
+                        bool rx_diagnostics = false) {
     const std::vector<int16_t> pcm = read_pcm16(in_pcm_path);
     std::vector<uint8_t> payload;
-    if (!decode_payload_from_pcm(pcm, &payload, true)) {
+    const bool ok = decode_payload_from_pcm(pcm, &payload, true);
+    if (rx_diagnostics) {
+        print_receiver_diagnostics_for_pcm(pcm, ok, payload);
+    }
+    if (!ok) {
         throw std::runtime_error("CRC check failed or valid frame not found");
     }
     write_file(out_path, payload);
@@ -1709,19 +1747,129 @@ struct DecodeAttemptDiagnostics {
     FecDecodeResult header_fec;
     FecDecodeResult body_fec;
     bool sync_locked;
+    double preamble_score;
     double sync_score;
+    size_t detected_start_sample;
     double estimated_symbol_span;
     double selected_candidate_span;
+    size_t number_of_symbols;
+    size_t payload_bytes;
+    size_t required_fec_bits;
+    bool crc_ok;
     std::vector<uint8_t> header_decoded_bytes;
     MetricStats metric_stats;
     TimingDiagnostics timing_diag;
 
     DecodeAttemptDiagnostics()
         : ok(false), cause(DecodeFailureCause::Sync), header_fec(), body_fec(),
-          sync_locked(false), sync_score(0.0), estimated_symbol_span(0.0),
-          selected_candidate_span(0.0), header_decoded_bytes(),
+          sync_locked(false), preamble_score(0.0), sync_score(0.0),
+          detected_start_sample(0), estimated_symbol_span(0.0),
+          selected_candidate_span(0.0), number_of_symbols(0), payload_bytes(0),
+          required_fec_bits(0), crc_ok(false), header_decoded_bytes(),
           metric_stats(), timing_diag() {}
 };
+
+struct ReceiverDiagnostics {
+    DecodeAttemptDiagnostics decode;
+    DemodConfig demod_cfg;
+    bool fec_enabled;
+    const char* fec_mode;
+
+    ReceiverDiagnostics()
+        : decode(), demod_cfg(calibrated_llr_demod_config()), fec_enabled(true),
+          fec_mode("ldpc-bp") {}
+};
+
+static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
+    const std::vector<int16_t>& pcm,
+    std::vector<uint8_t>* decoded_payload,
+    const DemodConfig& demod_cfg);
+
+static double percentile_from_samples(std::vector<double> samples, double percentile) {
+    if (samples.empty()) return 0.0;
+    std::sort(samples.begin(), samples.end());
+    const double clamped = std::max(0.0, std::min(100.0, percentile));
+    const size_t index = size_t(std::floor((clamped / 100.0) * double(samples.size() - 1)));
+    return samples[index];
+}
+
+static double finite_or_zero(double value) {
+    return std::isfinite(value) ? value : 0.0;
+}
+
+static void print_receiver_diagnostics_json(const ReceiverDiagnostics& rx) {
+    const DecodeAttemptDiagnostics& d = rx.decode;
+    const MetricStats& m = d.metric_stats;
+    const TimingDiagnostics& t = d.timing_diag;
+    const double selected_span =
+        d.selected_candidate_span > 0.0 ? d.selected_candidate_span : d.estimated_symbol_span;
+    const double estimated_clock_ppm =
+        selected_span > 0.0 ? (selected_span / NOMINAL_SPAN - 1.0) * 1000000.0 : 0.0;
+    const int ldpc_iterations =
+        std::max(d.header_fec.max_iterations, d.body_fec.max_iterations);
+    const bool ldpc_success =
+        d.header_fec.all_blocks_ok &&
+        (d.body_fec.block_count == 0 || d.body_fec.all_blocks_ok);
+    const int fec_failed_blocks = d.header_fec.failed_blocks + d.body_fec.failed_blocks;
+    const int fec_syndrome =
+        d.header_fec.total_syndrome_weight + d.body_fec.total_syndrome_weight;
+    const double margin_min =
+        std::isfinite(m.margin_min) ? m.margin_min : 0.0;
+
+    std::cerr
+        << "rx_diagnostics={"
+        << "\"preamble_score\":" << finite_or_zero(d.preamble_score) << ","
+        << "\"sync_score\":" << finite_or_zero(d.sync_score) << ","
+        << "\"detected_start_sample\":" << d.detected_start_sample << ","
+        << "\"number_of_symbols\":" << d.number_of_symbols << ","
+        << "\"payload_bytes\":" << d.payload_bytes << ","
+        << "\"fec_enabled\":" << (rx.fec_enabled ? "true" : "false") << ","
+        << "\"fec_mode\":\"" << rx.fec_mode << "\","
+        << "\"estimated_clock_ppm\":" << finite_or_zero(estimated_clock_ppm) << ","
+        << "\"timing_offset_initial_samples\":"
+        << finite_or_zero(t.timing_offset_initial_samples) << ","
+        << "\"timing_offset_final_samples\":"
+        << finite_or_zero(t.timing_offset_final_samples) << ","
+        << "\"timing_corrections_applied\":" << t.timing_corrections_applied << ","
+        << "\"pilot_count\":" << t.pilot_count << ","
+        << "\"pilot_interval_symbols\":" << PILOT_INTERVAL_SYMBOLS << ","
+        << "\"winner_score_mean\":" << finite_or_zero(m.winner_mean) << ","
+        << "\"runner_up_score_mean\":" << finite_or_zero(m.runner_up_mean) << ","
+        << "\"margin_mean\":" << finite_or_zero(m.mean_peak_margin) << ","
+        << "\"margin_p05\":"
+        << finite_or_zero(percentile_from_samples(m.margin_samples, 5.0)) << ","
+        << "\"margin_min\":" << finite_or_zero(margin_min) << ","
+        << "\"symbol_error_estimate_on_known_symbols\":"
+        << finite_or_zero(m.symbol_error_rate) << ","
+        << "\"llr_mean_abs\":" << finite_or_zero(m.llr_mean_abs) << ","
+        << "\"llr_max_abs\":" << finite_or_zero(m.llr_max_abs) << ","
+        << "\"llr_saturation_count\":" << m.llr_saturated << ","
+        << "\"llr_saturation_rate\":" << finite_or_zero(m.llr_saturation_rate) << ","
+        << "\"llr_clip_value\":" << rx.demod_cfg.llr_clip << ","
+        << "\"llr_scale_used\":" << rx.demod_cfg.llr_scale << ","
+        << "\"ldpc_iterations_used\":" << ldpc_iterations << ","
+        << "\"ldpc_decode_success\":" << (ldpc_success ? "true" : "false") << ","
+        << "\"fec_failed_blocks\":" << fec_failed_blocks << ","
+        << "\"fec_syndrome_weight\":" << fec_syndrome << ","
+        << "\"crc_ok\":" << (d.crc_ok ? "true" : "false") << ","
+        << "\"decode_success\":" << (d.ok ? "true" : "false") << ","
+        << "\"failure_cause\":\"" << decode_failure_cause_name(d.cause) << "\""
+        << "}\n";
+}
+
+static void print_receiver_diagnostics_for_pcm(const std::vector<int16_t>& pcm,
+                                               bool decode_ok,
+                                               const std::vector<uint8_t>& payload) {
+    ReceiverDiagnostics rx_diag;
+    std::vector<uint8_t> diagnostic_payload;
+    rx_diag.demod_cfg = calibrated_llr_demod_config();
+    rx_diag.decode = diagnose_pcm_decode_attempt(pcm, &diagnostic_payload,
+                                                 rx_diag.demod_cfg);
+    if (decode_ok && rx_diag.decode.ok && diagnostic_payload.size() != payload.size()) {
+        rx_diag.decode.payload_bytes = payload.size();
+    }
+    print_receiver_diagnostics_json(rx_diag);
+}
 
 static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
     const std::vector<int16_t>& pcm,
@@ -1731,7 +1879,10 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
     try {
         const SyncLock lock = find_sync(pcm, false, nullptr);
         diag.sync_locked = true;
+        diag.preamble_score = preamble_score_at(pcm, lock.preamble_pos, lock.symbol_span);
         diag.sync_score = lock.score;
+        diag.detected_start_sample =
+            size_t(std::max(0.0, std::floor(lock.preamble_pos + 0.5)));
         diag.estimated_symbol_span = lock.symbol_span;
         if (lock.score < STREAM_DECODE_SYNC_SCORE_THRESHOLD) {
             diag.cause = DecodeFailureCause::FalseLock;
@@ -1798,11 +1949,13 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
                     diag.header_fec = header_fec;
                     diag.header_decoded_bytes = header_bytes;
                     diag.selected_candidate_span = candidate_span;
+                    diag.required_fec_bits = required_fec_bits;
                     diag.metric_stats = metric_stats;
                     diag.timing_diag = timing_diag;
 
                     const size_t required_symbols =
                         (required_fec_bits + BITS_PER_SYMBOL - 1) / BITS_PER_SYMBOL;
+                    diag.number_of_symbols = required_symbols;
                     const size_t required_physical_symbols =
                         required_symbols + pilot_count_for_data_symbols(required_symbols);
                     const double frame_end =
@@ -1835,9 +1988,12 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
                     if (ok) {
                         diag.ok = true;
                         diag.cause = DecodeFailureCause::None;
+                        diag.crc_ok = true;
+                        diag.payload_bytes = payload.size();
                         if (decoded_payload) *decoded_payload = payload;
                         return diag;
                     }
+                    diag.crc_ok = false;
                     if (!diag.body_fec.all_blocks_ok) diag.cause = DecodeFailureCause::BodyFec;
                     else diag.cause = DecodeFailureCause::ConvergedButCrc;
                 }
@@ -2803,7 +2959,7 @@ static void run_selftest() {
 
 int main(int argc, char** argv) {
     try {
-        const std::vector<std::string> args = strip_global_timing_search_args(argc, argv);
+        const std::vector<std::string> args = strip_global_receiver_args(argc, argv);
 
         if (args.size() == 1 && args[0] == "selftest") {
             run_selftest();
@@ -2898,6 +3054,7 @@ int main(int argc, char** argv) {
                       << "  " << argv[0] << " selftest\n"
                       << "  " << argv[0]
                       << " [--timing-search=full|local|center] <command> ...\n"
+                      << "  " << argv[0] << " [--rx-diagnostics] dec input.pcm output.bin\n"
                       << "  " << argv[0] << " measure-metric [trials-per-snr]\n"
                       << "  " << argv[0] << " measure [trials-per-snr]  # legacy alias\n"
                       << "  " << argv[0] << " measure-pcm [trials-per-snr]\n"
@@ -2911,7 +3068,7 @@ int main(int argc, char** argv) {
         if (mode == "enc") {
             encode_file(args[1], args[2]);
         } else if (mode == "dec") {
-            decode_file(args[1], args[2]);
+            decode_file(args[1], args[2], g_rx_diagnostics_enabled);
         } else {
             throw std::runtime_error("Mode must be enc or dec");
         }
