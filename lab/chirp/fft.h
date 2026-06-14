@@ -17,7 +17,49 @@ namespace dsp {
 
 void fft128(std::array<std::complex<double>, config::SYMBOL_SAMPLES>* a, bool inverse);
 
+struct PrecomputedChirpTemplate {
+    std::array<std::complex<double>, config::SYMBOL_SAMPLES> fft;
+
+    PrecomputedChirpTemplate() : fft() {}
+};
+
+struct CircularCorrelationScratch {
+    std::array<std::complex<double>, config::SYMBOL_SAMPLES> samples_fft;
+
+    CircularCorrelationScratch() {}
+};
+
+struct FftCorrelationDiagnostics {
+    unsigned long long base_fft_cache_hits;
+    unsigned long long base_fft_cache_misses;
+    unsigned long long sample_ffts_computed;
+    int base_fft_cache_entries;
+    int base_fft_cache_capacity;
+
+    FftCorrelationDiagnostics()
+        : base_fft_cache_hits(0),
+          base_fft_cache_misses(0),
+          sample_ffts_computed(0),
+          base_fft_cache_entries(0),
+          base_fft_cache_capacity(0) {}
+};
+
+void reset_circular_chirp_correlation_diagnostics();
+FftCorrelationDiagnostics circular_chirp_correlation_diagnostics();
+
+PrecomputedChirpTemplate make_precomputed_chirp_template(
+    const std::array<double, config::SYMBOL_SAMPLES>& base);
+
+std::array<double, config::SYMBOL_SAMPLES> circular_chirp_correlation_precomputed(
+    const std::array<double, config::SYMBOL_SAMPLES>& samples,
+    const PrecomputedChirpTemplate& base,
+    CircularCorrelationScratch* scratch);
+
 std::array<double, config::SYMBOL_SAMPLES> circular_chirp_correlation(
+    const std::array<double, config::SYMBOL_SAMPLES>& samples,
+    const std::array<double, config::SYMBOL_SAMPLES>& base);
+
+std::array<double, config::SYMBOL_SAMPLES> circular_chirp_correlation_uncached(
     const std::array<double, config::SYMBOL_SAMPLES>& samples,
     const std::array<double, config::SYMBOL_SAMPLES>& base);
 

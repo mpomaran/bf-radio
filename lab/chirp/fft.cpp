@@ -2,9 +2,144 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 
 namespace chirp {
 namespace dsp {
+namespace {
+
+constexpr int kBaseFftCacheCapacity = 8;
+
+struct BaseFftCacheEntry {
+    bool valid;
+    uint64_t hash;
+    unsigned long long last_used;
+    std::array<double, config::SYMBOL_SAMPLES> base;
+    std::array<std::complex<double>, config::SYMBOL_SAMPLES> fft;
+
+    BaseFftCacheEntry()
+        : valid(false), hash(0), last_used(0), base(), fft() {}
+};
+
+struct BaseFftCache {
+    std::array<BaseFftCacheEntry, kBaseFftCacheCapacity> entries;
+    FftCorrelationDiagnostics diagnostics;
+    unsigned long long clock;
+
+    BaseFftCache() : entries(), diagnostics(), clock(0) {
+        diagnostics.base_fft_cache_capacity = kBaseFftCacheCapacity;
+    }
+};
+
+// The receive path is currently single-threaded. Keeping this cache thread-local
+// avoids cross-thread synchronization and keeps repeated-template acceleration
+// deterministic for normal tests and command-line decoding.
+thread_local BaseFftCache g_base_fft_cache;
+
+uint64_t double_bits(double value) {
+    uint64_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+uint64_t hash_base(const std::array<double, config::SYMBOL_SAMPLES>& base) {
+    uint64_t hash = 1469598103934665603ULL;
+    for (double value : base) {
+        uint64_t bits = double_bits(value);
+        for (int i = 0; i < 8; ++i) {
+            hash ^= uint8_t(bits & 0xFFU);
+            hash *= 1099511628211ULL;
+            bits >>= 8;
+        }
+    }
+    return hash;
+}
+
+bool base_bits_equal(const std::array<double, config::SYMBOL_SAMPLES>& a,
+                     const std::array<double, config::SYMBOL_SAMPLES>& b) {
+    for (int i = 0; i < config::SYMBOL_SAMPLES; ++i) {
+        if (double_bits(a[size_t(i)]) != double_bits(b[size_t(i)])) return false;
+    }
+    return true;
+}
+
+int cache_entry_count(const BaseFftCache& cache) {
+    int count = 0;
+    for (const BaseFftCacheEntry& entry : cache.entries) {
+        if (entry.valid) ++count;
+    }
+    return count;
+}
+
+void fill_base_fft(const std::array<double, config::SYMBOL_SAMPLES>& base,
+                   std::array<std::complex<double>, config::SYMBOL_SAMPLES>* out) {
+    for (int i = 0; i < config::SYMBOL_SAMPLES; ++i) {
+        (*out)[size_t(i)] = std::complex<double>(base[size_t(i)], 0.0);
+    }
+    fft128(out, false);
+}
+
+const std::array<std::complex<double>, config::SYMBOL_SAMPLES>& cached_base_fft(
+    const std::array<double, config::SYMBOL_SAMPLES>& base) {
+    BaseFftCache& cache = g_base_fft_cache;
+    const uint64_t hash = hash_base(base);
+    ++cache.clock;
+
+    for (BaseFftCacheEntry& entry : cache.entries) {
+        if (entry.valid && entry.hash == hash && base_bits_equal(entry.base, base)) {
+            entry.last_used = cache.clock;
+            ++cache.diagnostics.base_fft_cache_hits;
+            cache.diagnostics.base_fft_cache_entries = cache_entry_count(cache);
+            return entry.fft;
+        }
+    }
+
+    BaseFftCacheEntry* victim = &cache.entries[0];
+    for (BaseFftCacheEntry& entry : cache.entries) {
+        if (!entry.valid) {
+            victim = &entry;
+            break;
+        }
+        if (entry.last_used < victim->last_used) victim = &entry;
+    }
+
+    victim->valid = true;
+    victim->hash = hash;
+    victim->last_used = cache.clock;
+    victim->base = base;
+    fill_base_fft(base, &victim->fft);
+    ++cache.diagnostics.base_fft_cache_misses;
+    cache.diagnostics.base_fft_cache_entries = cache_entry_count(cache);
+    return victim->fft;
+}
+
+std::array<double, config::SYMBOL_SAMPLES> circular_chirp_correlation_with_base_fft(
+    const std::array<double, config::SYMBOL_SAMPLES>& samples,
+    const std::array<std::complex<double>, config::SYMBOL_SAMPLES>& base_fft,
+    CircularCorrelationScratch* scratch) {
+    CircularCorrelationScratch local_scratch;
+    CircularCorrelationScratch* work = scratch != nullptr ? scratch : &local_scratch;
+    for (int i = 0; i < config::SYMBOL_SAMPLES; ++i) {
+        work->samples_fft[size_t(i)] = std::complex<double>(samples[size_t(i)], 0.0);
+    }
+
+    fft128(&work->samples_fft, false);
+    ++g_base_fft_cache.diagnostics.sample_ffts_computed;
+    for (int i = 0; i < config::SYMBOL_SAMPLES; ++i) {
+        work->samples_fft[size_t(i)] =
+            std::conj(work->samples_fft[size_t(i)]) * base_fft[size_t(i)];
+    }
+    fft128(&work->samples_fft, true);
+
+    std::array<double, config::SYMBOL_SAMPLES> corr = {};
+    for (int i = 0; i < config::SYMBOL_SAMPLES; ++i) {
+        corr[size_t(i)] = work->samples_fft[size_t(i)].real();
+    }
+    return corr;
+}
+
+}  // namespace
 
 void fft128(std::array<std::complex<double>, config::SYMBOL_SAMPLES>* a, bool inverse) {
     int j = 0;
@@ -38,7 +173,38 @@ void fft128(std::array<std::complex<double>, config::SYMBOL_SAMPLES>* a, bool in
     }
 }
 
+void reset_circular_chirp_correlation_diagnostics() {
+    g_base_fft_cache = BaseFftCache();
+}
+
+FftCorrelationDiagnostics circular_chirp_correlation_diagnostics() {
+    g_base_fft_cache.diagnostics.base_fft_cache_entries =
+        cache_entry_count(g_base_fft_cache);
+    g_base_fft_cache.diagnostics.base_fft_cache_capacity = kBaseFftCacheCapacity;
+    return g_base_fft_cache.diagnostics;
+}
+
+PrecomputedChirpTemplate make_precomputed_chirp_template(
+    const std::array<double, config::SYMBOL_SAMPLES>& base) {
+    PrecomputedChirpTemplate out;
+    fill_base_fft(base, &out.fft);
+    return out;
+}
+
+std::array<double, config::SYMBOL_SAMPLES> circular_chirp_correlation_precomputed(
+    const std::array<double, config::SYMBOL_SAMPLES>& samples,
+    const PrecomputedChirpTemplate& base,
+    CircularCorrelationScratch* scratch) {
+    return circular_chirp_correlation_with_base_fft(samples, base.fft, scratch);
+}
+
 std::array<double, config::SYMBOL_SAMPLES> circular_chirp_correlation(
+    const std::array<double, config::SYMBOL_SAMPLES>& samples,
+    const std::array<double, config::SYMBOL_SAMPLES>& base) {
+    return circular_chirp_correlation_with_base_fft(samples, cached_base_fft(base), nullptr);
+}
+
+std::array<double, config::SYMBOL_SAMPLES> circular_chirp_correlation_uncached(
     const std::array<double, config::SYMBOL_SAMPLES>& samples,
     const std::array<double, config::SYMBOL_SAMPLES>& base) {
     std::array<std::complex<double>, config::SYMBOL_SAMPLES> x = {};
@@ -49,6 +215,7 @@ std::array<double, config::SYMBOL_SAMPLES> circular_chirp_correlation(
     }
 
     fft128(&x, false);
+    ++g_base_fft_cache.diagnostics.sample_ffts_computed;
     fft128(&y, false);
     for (int i = 0; i < config::SYMBOL_SAMPLES; ++i) {
         x[size_t(i)] = std::conj(x[size_t(i)]) * y[size_t(i)];

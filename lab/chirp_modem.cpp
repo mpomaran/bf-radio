@@ -60,8 +60,11 @@ using chirp::config::SYMBOL_SAMPLES;
 using chirp::config::SYNC_SYMBOLS;
 using chirp::config::PhyProfile;
 using chirp::config::current_phy_profile;
-using chirp::dsp::circular_chirp_correlation;
+using chirp::dsp::CircularCorrelationScratch;
+using chirp::dsp::PrecomputedChirpTemplate;
+using chirp::dsp::circular_chirp_correlation_precomputed;
 using chirp::dsp::cyclic_corr_sample;
+using chirp::dsp::make_precomputed_chirp_template;
 using chirp::demod::DemodConfig;
 using chirp::demod::MetricStats;
 using chirp::demod::SymbolMetrics;
@@ -220,11 +223,18 @@ struct TimingDiagnostics {
 
 struct AdaptiveTemplateBank {
     std::array<double, SYMBOL_SAMPLES> base;
+    PrecomputedChirpTemplate base_fft;
     std::array<std::array<std::array<double, SYMBOL_SAMPLES>, 3>, ALPHABET> tpl;
     bool valid;
 
-    AdaptiveTemplateBank() : base(), tpl(), valid(false) {}
+    AdaptiveTemplateBank() : base(), base_fft(), tpl(), valid(false) {}
 };
+
+static const PrecomputedChirpTemplate& ideal_base_precomputed_template() {
+    static const PrecomputedChirpTemplate tpl =
+        make_precomputed_chirp_template(ideal_base_template_array());
+    return tpl;
+}
 
 static std::array<double, SYMBOL_SAMPLES> normalized_symbol_samples(
     const std::vector<int16_t>& pcm,
@@ -284,6 +294,7 @@ static double cyclic_array_sample(const std::array<double, SYMBOL_SAMPLES>& samp
 }
 
 static void rebuild_adaptive_templates(AdaptiveTemplateBank* bank) {
+    bank->base_fft = make_precomputed_chirp_template(bank->base);
     const double fractional_offsets[3] = {-0.35, 0.0, 0.35};
     for (int symbol = 0; symbol < ALPHABET; ++symbol) {
         const int shift = symbol * SYMBOL_SAMPLES / ALPHABET;
@@ -417,7 +428,7 @@ static double corr_score_adaptive(const std::vector<int16_t>& pcm,
 static bool fast_symbol_metrics_from_base(const std::vector<int16_t>& pcm,
                                           double pos,
                                           double symbol_span,
-                                          const std::array<double, SYMBOL_SAMPLES>& base,
+                                          const PrecomputedChirpTemplate& base_fft,
                                           const double* fractional_offsets,
                                           int fractional_offset_count,
                                           SymbolMetrics* m) {
@@ -428,8 +439,9 @@ static bool fast_symbol_metrics_from_base(const std::vector<int16_t>& pcm,
     for (double v : samples) energy += v * v;
     if (energy <= 1e-9) return false;
 
+    CircularCorrelationScratch scratch;
     const std::array<double, SYMBOL_SAMPLES> corr =
-        circular_chirp_correlation(samples, base);
+        circular_chirp_correlation_precomputed(samples, base_fft, &scratch);
     for (int s = 0; s < ALPHABET; ++s) {
         const double shift = double(s * SYMBOL_SAMPLES / ALPHABET);
         double score = -1.0;
@@ -479,14 +491,14 @@ static SymbolMetrics decode_symbol_metrics_at(const std::vector<int16_t>& pcm,
             const double adaptive_offsets[3] = {-0.35, 0.0, 0.35};
             const double centered_offset[1] = {0.0};
             used_fast = fast_symbol_metrics_from_base(
-                pcm, pos + timing_offset, symbol_span, adaptive->base,
+                pcm, pos + timing_offset, symbol_span, adaptive->base_fft,
                 intermediate ? adaptive_offsets : centered_offset,
                 intermediate ? 3 : 1, &current);
         } else {
             const double ideal_offsets[3] = {-2.0, 0.0, 2.0};
             const double centered_offset[1] = {0.0};
             used_fast = fast_symbol_metrics_from_base(
-                pcm, pos + timing_offset, symbol_span, ideal_base_template_array(),
+                pcm, pos + timing_offset, symbol_span, ideal_base_precomputed_template(),
                 intermediate ? ideal_offsets : centered_offset,
                 intermediate ? 3 : 1, &current);
         }
