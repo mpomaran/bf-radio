@@ -40,6 +40,7 @@ static constexpr int FEC_CODEWORD_BITS = FEC_INFO_BITS + FEC_PARITY_BITS;
 static constexpr int MAX_PAYLOAD_BYTES = 4096;
 static constexpr int PROTOCOL_HEADER_BYTES = 8;
 static constexpr int CRC_BYTES = 2;
+static constexpr int PHY_VERSION = 1;
 static constexpr uint8_t PROTOCOL_VERSION = 1;
 static constexpr double PI = 3.14159265358979323846;
 static constexpr double FREQ_LOW = 700.0;
@@ -48,6 +49,53 @@ static constexpr double AMP = 0.55;
 static constexpr double NOMINAL_SPAN = double(SYMBOL_SAMPLES);
 static constexpr double STREAM_DECODE_SYNC_SCORE_THRESHOLD = 0.28;
 static const uint8_t PROTOCOL_MAGIC[4] = {'C', 'H', 'R', 'P'};
+
+struct PhyProfile {
+    int phy_version;
+    int protocol_version;
+    int sample_rate;
+    int symbol_samples;
+    int alphabet;
+    int bits_per_symbol;
+    int preamble_symbols;
+    int sync_symbols;
+    int pilot_interval_symbols;
+    int pilot_symbol;
+    double fec_rate;
+    bool legacy_compatible;
+    bool same_bitrate_as_legacy;
+    bool same_channel_as_legacy;
+    double occupied_audio_bandwidth_hz;
+    double required_audio_bandwidth_hz;
+};
+
+static PhyProfile current_phy_profile() {
+    PhyProfile p;
+    p.phy_version = PHY_VERSION;
+    p.protocol_version = PROTOCOL_VERSION;
+    p.sample_rate = SAMPLE_RATE;
+    p.symbol_samples = SYMBOL_SAMPLES;
+    p.alphabet = ALPHABET;
+    p.bits_per_symbol = BITS_PER_SYMBOL;
+    p.preamble_symbols = PREAMBLE_SYMBOLS;
+    p.sync_symbols = SYNC_SYMBOLS;
+    p.pilot_interval_symbols = PILOT_INTERVAL_SYMBOLS;
+    p.pilot_symbol = PILOT_SYMBOL;
+    p.fec_rate = double(FEC_INFO_BITS) / double(FEC_CODEWORD_BITS);
+    p.legacy_compatible = true;
+    p.same_bitrate_as_legacy = true;
+    p.same_channel_as_legacy = true;
+    p.occupied_audio_bandwidth_hz = FREQ_HIGH - FREQ_LOW;
+    p.required_audio_bandwidth_hz = p.occupied_audio_bandwidth_hz + 200.0;
+    return p;
+}
+
+static void print_not_same_bitrate_notice() {
+    const PhyProfile p = current_phy_profile();
+    if (!p.same_bitrate_as_legacy) {
+        std::cerr << "NOT SAME BITRATE: this mode trades bitrate/latency/overhead for robustness.\n";
+    }
+}
 
 static void progress_message(bool enabled,
                              std::clock_t* last_report,
@@ -216,6 +264,20 @@ static std::vector<uint8_t> insert_pilot_symbols(const std::vector<uint8_t>& dat
   This is still a tiny local experimental code. The decoder algorithm is now a
   real BP decoder, but the code construction is not WiFi, DVB-S2, or CCSDS LDPC.
 */
+struct FecDecodeResult {
+    std::vector<uint8_t> bits;
+    bool all_blocks_ok;
+    int block_count;
+    int failed_blocks;
+    int max_iterations;
+    int max_syndrome_weight;
+    int total_syndrome_weight;
+
+    FecDecodeResult()
+        : bits(), all_blocks_ok(true), block_count(0), failed_blocks(0),
+          max_iterations(0), max_syndrome_weight(0), total_syndrome_weight(0) {}
+};
+
 class LDPCCodec {
     static constexpr int K = FEC_INFO_BITS;
     static constexpr int P = FEC_PARITY_BITS;
@@ -241,6 +303,11 @@ public:
     }
 
     static std::vector<uint8_t> decode_from_llr(const std::vector<double>& llr_bits) {
+        return decode_from_llr_result(llr_bits).bits;
+    }
+
+    static FecDecodeResult decode_from_llr_result(const std::vector<double>& llr_bits) {
+        FecDecodeResult result;
         std::vector<uint8_t> decoded;
         decoded.reserve(((llr_bits.size() + N - 1) / N) * K);
         for (size_t pos = 0; pos < llr_bits.size(); pos += N) {
@@ -249,9 +316,17 @@ public:
                 chunk[size_t(i)] = (pos + size_t(i) < llr_bits.size()) ? llr_bits[pos + size_t(i)] : 4.0;
             }
             const auto decoded_chunk = decode_chunk_from_llr(chunk);
-            decoded.insert(decoded.end(), decoded_chunk.begin(), decoded_chunk.end());
+            decoded.insert(decoded.end(), decoded_chunk.bits.begin(), decoded_chunk.bits.end());
+            ++result.block_count;
+            result.max_iterations = std::max(result.max_iterations, decoded_chunk.iterations);
+            result.max_syndrome_weight =
+                std::max(result.max_syndrome_weight, decoded_chunk.syndrome_weight);
+            result.total_syndrome_weight += decoded_chunk.syndrome_weight;
+            if (!decoded_chunk.ok) ++result.failed_blocks;
         }
-        return decoded;
+        result.bits = decoded;
+        result.all_blocks_ok = result.failed_blocks == 0;
+        return result;
     }
 
     static std::vector<uint8_t> decode_hard(const std::vector<uint8_t>& bits) {
@@ -277,6 +352,15 @@ public:
     }
 
 private:
+    struct ChunkDecodeResult {
+        std::array<uint8_t, K> bits;
+        bool ok;
+        int iterations;
+        int syndrome_weight;
+
+        ChunkDecodeResult() : bits(), ok(false), iterations(0), syndrome_weight(0) {}
+    };
+
     static uint64_t info_mask(int n) {
         const int r0 = n & 63;
         const int r1 = (11 * n + 7) & 63;
@@ -359,7 +443,7 @@ private:
         return bits;
     }
 
-    static std::array<uint8_t, K> decode_chunk_from_llr(const std::array<double, N>& input_llr) {
+    static ChunkDecodeResult decode_chunk_from_llr(const std::array<double, N>& input_llr) {
         std::array<double, N> channel_llr = {};
         for (int i = 0; i < N; ++i) {
             channel_llr[size_t(i)] = clamp_message(input_llr[size_t(i)]);
@@ -380,10 +464,14 @@ private:
         std::array<double, N> posterior = channel_llr;
         std::array<uint8_t, N> bits = hard_decision(posterior);
         std::array<uint8_t, P> syndrome = {};
-        if (compute_syndrome(bits, &syndrome) == 0) {
-            std::array<uint8_t, K> decoded = {};
-            for (int i = 0; i < K; ++i) decoded[size_t(i)] = bits[size_t(i)] & 1;
-            return decoded;
+        int syndrome_weight = compute_syndrome(bits, &syndrome);
+        if (syndrome_weight == 0) {
+            ChunkDecodeResult result;
+            result.ok = true;
+            result.iterations = 0;
+            result.syndrome_weight = 0;
+            for (int i = 0; i < K; ++i) result.bits[size_t(i)] = bits[size_t(i)] & 1;
+            return result;
         }
 
         for (int iter = 0; iter < MAX_ITER; ++iter) {
@@ -411,7 +499,15 @@ private:
             }
 
             bits = hard_decision(posterior);
-            if (compute_syndrome(bits, &syndrome) == 0) break;
+            syndrome_weight = compute_syndrome(bits, &syndrome);
+            if (syndrome_weight == 0) {
+                ChunkDecodeResult result;
+                result.ok = true;
+                result.iterations = iter + 1;
+                result.syndrome_weight = 0;
+                for (int i = 0; i < K; ++i) result.bits[size_t(i)] = bits[size_t(i)] & 1;
+                return result;
+            }
 
             for (int row = 0; row < P; ++row) {
                 for (int edge = 0; edge < check_degree[size_t(row)]; ++edge) {
@@ -423,9 +519,12 @@ private:
             }
         }
 
-        std::array<uint8_t, K> decoded = {};
-        for (int i = 0; i < K; ++i) decoded[size_t(i)] = bits[size_t(i)] & 1;
-        return decoded;
+        ChunkDecodeResult result;
+        result.ok = false;
+        result.iterations = MAX_ITER;
+        result.syndrome_weight = syndrome_weight;
+        for (int i = 0; i < K; ++i) result.bits[size_t(i)] = bits[size_t(i)] & 1;
+        return result;
     }
 };
 
@@ -435,6 +534,10 @@ static std::vector<uint8_t> fec_encode_bits(const std::vector<uint8_t>& info_bit
 
 static std::vector<uint8_t> fec_decode_bits_from_llr(const std::vector<double>& llr_bits) {
     return LDPCCodec::decode_from_llr(llr_bits);
+}
+
+static FecDecodeResult fec_decode_bits_from_llr_result(const std::vector<double>& llr_bits) {
+    return LDPCCodec::decode_from_llr_result(llr_bits);
 }
 
 static std::vector<uint8_t> fec_decode_bits_hard(const std::vector<uint8_t>& bits) {
@@ -1138,6 +1241,7 @@ static void encode_file(const std::string& in_path, const std::string& out_pcm_p
     const std::vector<uint8_t> payload = read_file(in_path);
     const std::vector<int16_t> pcm = encode_payload_to_pcm(payload);
     write_pcm16(out_pcm_path, pcm);
+    print_not_same_bitrate_notice();
     std::cerr << "Encoded " << payload.size() << " bytes into "
               << pcm.size() << " PCM samples, duration "
               << double(pcm.size()) / SAMPLE_RATE << " s\n";
@@ -1455,18 +1559,24 @@ static bool find_first_energy_sample(const std::vector<int16_t>& pcm, size_t* sa
 
 static bool decode_exact_payload_from_llrs(const std::vector<double>& llrs,
                                            size_t fec_bit_count,
-                                           std::vector<uint8_t>* payload) {
+                                           std::vector<uint8_t>* payload,
+                                           FecDecodeResult* header_fec_result = nullptr,
+                                           FecDecodeResult* body_fec_result = nullptr) {
     if (llrs.size() < fec_bit_count || fec_bit_count < FEC_CODEWORD_BITS) return false;
 
     const std::vector<double> fec_llrs = descramble_llrs(llrs);
     std::vector<double> header_llrs(fec_llrs.begin(),
                                     fec_llrs.begin() + std::ptrdiff_t(FEC_CODEWORD_BITS));
-    const std::vector<uint8_t> header_bits = fec_decode_bits_from_llr(header_llrs);
+    const FecDecodeResult header_result = fec_decode_bits_from_llr_result(header_llrs);
+    if (header_fec_result) *header_fec_result = header_result;
+    const std::vector<uint8_t>& header_bits = header_result.bits;
     std::vector<uint8_t> bytes = bits_to_bytes(header_bits);
     bytes.resize(PROTOCOL_HEADER_BYTES);
 
     size_t required_fec_bits = 0;
-    if (!parse_protected_header(bytes, nullptr, &required_fec_bits)) return false;
+    if (!parse_protected_header(bytes, nullptr, &required_fec_bits)) {
+        return false;
+    }
     if (required_fec_bits != fec_bit_count) return false;
 
     const size_t body_fec_bits = fec_bit_count - FEC_CODEWORD_BITS;
@@ -1474,9 +1584,13 @@ static bool decode_exact_payload_from_llrs(const std::vector<double>& llrs,
         std::vector<double> body_tx_llrs(fec_llrs.begin() + std::ptrdiff_t(FEC_CODEWORD_BITS),
                                          fec_llrs.begin() + std::ptrdiff_t(fec_bit_count));
         const std::vector<double> body_fec_llrs = deinterleave_soft(body_tx_llrs);
-        const std::vector<uint8_t> body_bits = fec_decode_bits_from_llr(body_fec_llrs);
+        const FecDecodeResult body_result = fec_decode_bits_from_llr_result(body_fec_llrs);
+        if (body_fec_result) *body_fec_result = body_result;
+        const std::vector<uint8_t>& body_bits = body_result.bits;
         const std::vector<uint8_t> body_bytes = bits_to_bytes(body_bits);
         bytes.insert(bytes.end(), body_bytes.begin(), body_bytes.end());
+    } else if (body_fec_result) {
+        *body_fec_result = FecDecodeResult();
     }
     return parse_protected_frame(bytes, payload);
 }
@@ -1642,8 +1756,9 @@ static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pc
                     header_llrs.begin(),
                     header_llrs.begin() + std::ptrdiff_t(FEC_CODEWORD_BITS));
                 header_tx = descramble_llrs(header_tx);
-                const std::vector<uint8_t> header_bits = fec_decode_bits_from_llr(header_tx);
-                const std::vector<uint8_t> header_bytes = bits_to_bytes(header_bits);
+                const FecDecodeResult header_fec =
+                    fec_decode_bits_from_llr_result(header_tx);
+                const std::vector<uint8_t> header_bytes = bits_to_bytes(header_fec.bits);
 
                 size_t required_fec_bits = 0;
                 if (!parse_protected_header(header_bytes, nullptr, &required_fec_bits)) {
@@ -1915,9 +2030,10 @@ static std::vector<int16_t> apply_quality_radio_channel(const std::vector<int16_
     return out;
 }
 
-static RawLinkMetrics measure_raw_link_metrics(const std::vector<int16_t>& pcm,
-                                               const std::vector<uint8_t>& expected_tx_bits,
-                                               const std::vector<uint8_t>& expected_symbols) {
+static RawLinkMetrics measure_raw_link_metrics_core(const std::vector<int16_t>& pcm,
+                                                    const std::vector<uint8_t>& expected_tx_bits,
+                                                    const std::vector<uint8_t>& expected_symbols,
+                                                    bool oracle_select_best_candidate) {
     RawLinkMetrics metrics;
     metrics.symbols = expected_symbols.size();
     metrics.bits = expected_tx_bits.size();
@@ -2004,6 +2120,13 @@ static RawLinkMetrics measure_raw_link_metrics(const std::vector<int16_t>& pcm,
                     (template_mode == 0 && adaptive.valid) ? &adaptive : nullptr;
                 const RawLinkMetrics candidate =
                     measure_candidate(candidate_span, adaptive_ptr);
+                /*
+                  Receiver-selected raw metrics must not use TX truth to pick a
+                  candidate. In this branch the candidate is chosen solely from
+                  the receiver's deterministic scan order; expected bits are
+                  compared only after selection to count SER/BER.
+                */
+                if (!oracle_select_best_candidate) return candidate;
                 if (candidate.bit_errors < metrics.bit_errors) metrics = candidate;
             }
         }
@@ -2013,6 +2136,192 @@ static RawLinkMetrics measure_raw_link_metrics(const std::vector<int16_t>& pcm,
         metrics.bit_errors = metrics.bits / 2;
     }
     return metrics;
+}
+
+static RawLinkMetrics measure_receiver_selected_raw_link_metrics(
+    const std::vector<int16_t>& pcm,
+    const std::vector<uint8_t>& expected_tx_bits,
+    const std::vector<uint8_t>& expected_symbols) {
+    return measure_raw_link_metrics_core(pcm, expected_tx_bits, expected_symbols, false);
+}
+
+static RawLinkMetrics measure_oracle_raw_link_metrics(
+    const std::vector<int16_t>& pcm,
+    const std::vector<uint8_t>& expected_tx_bits,
+    const std::vector<uint8_t>& expected_symbols) {
+    return measure_raw_link_metrics_core(pcm, expected_tx_bits, expected_symbols, true);
+}
+
+enum class DecodeFailureCause {
+    None,
+    Sync,
+    HeaderFec,
+    BodyFec,
+    Crc,
+    FalseLock,
+    Incomplete,
+    ConvergedButCrc
+};
+
+static const char* decode_failure_cause_name(DecodeFailureCause cause) {
+    switch (cause) {
+        case DecodeFailureCause::None: return "none";
+        case DecodeFailureCause::Sync: return "sync";
+        case DecodeFailureCause::HeaderFec: return "header_fec";
+        case DecodeFailureCause::BodyFec: return "body_fec";
+        case DecodeFailureCause::Crc: return "crc";
+        case DecodeFailureCause::FalseLock: return "false_lock";
+        case DecodeFailureCause::Incomplete: return "incomplete";
+        case DecodeFailureCause::ConvergedButCrc: return "converged_but_crc";
+    }
+    return "unknown";
+}
+
+static std::string bytes_to_hex_string(const std::vector<uint8_t>& bytes) {
+    static const char hex[] = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(bytes.size() * 2);
+    for (uint8_t b : bytes) {
+        out.push_back(hex[(b >> 4) & 0x0F]);
+        out.push_back(hex[b & 0x0F]);
+    }
+    return out;
+}
+
+struct DecodeAttemptDiagnostics {
+    bool ok;
+    DecodeFailureCause cause;
+    FecDecodeResult header_fec;
+    FecDecodeResult body_fec;
+    bool sync_locked;
+    double sync_score;
+    double estimated_symbol_span;
+    double selected_candidate_span;
+    std::vector<uint8_t> header_decoded_bytes;
+
+    DecodeAttemptDiagnostics()
+        : ok(false), cause(DecodeFailureCause::Sync), header_fec(), body_fec(),
+          sync_locked(false), sync_score(0.0), estimated_symbol_span(0.0),
+          selected_candidate_span(0.0), header_decoded_bytes() {}
+};
+
+static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
+    const std::vector<int16_t>& pcm,
+    std::vector<uint8_t>* decoded_payload) {
+    DecodeAttemptDiagnostics diag;
+    try {
+        const SyncLock lock = find_sync(pcm, false, nullptr);
+        diag.sync_locked = true;
+        diag.sync_score = lock.score;
+        diag.estimated_symbol_span = lock.symbol_span;
+        if (lock.score < STREAM_DECODE_SYNC_SCORE_THRESHOLD) {
+            diag.cause = DecodeFailureCause::FalseLock;
+            return diag;
+        }
+
+        const AdaptiveTemplateBank adaptive =
+            build_adaptive_template_bank(pcm, lock.preamble_pos, lock.symbol_span);
+        const double data_pos = lock.sync_pos + SYNC_SYMBOLS * lock.symbol_span;
+        const size_t header_symbols = FEC_CODEWORD_BITS / BITS_PER_SYMBOL;
+        bool saw_incomplete = false;
+        bool saw_header_candidate = false;
+        bool saw_valid_header = false;
+
+        for (int tenths = 0; tenths <= 30; ++tenths) {
+            const int signs[] = {1, -1};
+            for (int sign : signs) {
+                if (tenths == 0 && sign < 0) continue;
+                const int signed_tenths = sign * tenths;
+                const double candidate_span =
+                    lock.symbol_span * (1.0 + double(signed_tenths) / 1000.0);
+                const double header_end =
+                    data_pos + double(header_symbols + 1) * candidate_span;
+                if (header_end >= double(pcm.size())) {
+                    saw_incomplete = true;
+                    continue;
+                }
+
+                const int template_modes = adaptive.valid ? 2 : 1;
+                for (int template_mode = 0; template_mode < template_modes; ++template_mode) {
+                    AdaptiveTemplateBank working_adaptive = adaptive;
+                    AdaptiveTemplateBank* adaptive_ptr =
+                        (template_mode == 0 && working_adaptive.valid) ? &working_adaptive : nullptr;
+                    std::vector<double> header_llrs =
+                        decode_llrs_tracking(pcm, data_pos, candidate_span,
+                                             FEC_CODEWORD_BITS, adaptive_ptr, false);
+                    if (header_llrs.size() < FEC_CODEWORD_BITS) {
+                        saw_incomplete = true;
+                        continue;
+                    }
+                    header_llrs = descramble_llrs(header_llrs);
+                    const FecDecodeResult header_fec =
+                        fec_decode_bits_from_llr_result(header_llrs);
+                    std::vector<uint8_t> header_bytes = bits_to_bytes(header_fec.bits);
+                    header_bytes.resize(PROTOCOL_HEADER_BYTES);
+                    if (!saw_header_candidate) {
+                        diag.header_fec = header_fec;
+                        diag.header_decoded_bytes = header_bytes;
+                        diag.selected_candidate_span = candidate_span;
+                        saw_header_candidate = true;
+                    }
+
+                    size_t required_fec_bits = 0;
+                    if (!parse_protected_header(header_bytes, nullptr, &required_fec_bits)) {
+                        continue;
+                    }
+                    saw_valid_header = true;
+                    diag.header_fec = header_fec;
+                    diag.header_decoded_bytes = header_bytes;
+                    diag.selected_candidate_span = candidate_span;
+
+                    const size_t required_symbols =
+                        (required_fec_bits + BITS_PER_SYMBOL - 1) / BITS_PER_SYMBOL;
+                    const size_t required_physical_symbols =
+                        required_symbols + pilot_count_for_data_symbols(required_symbols);
+                    const double frame_end =
+                        data_pos + double(required_physical_symbols) * candidate_span;
+                    if (frame_end + candidate_span >= double(pcm.size())) {
+                        saw_incomplete = true;
+                        continue;
+                    }
+
+                    AdaptiveTemplateBank full_adaptive = adaptive;
+                    AdaptiveTemplateBank* full_adaptive_ptr =
+                        (template_mode == 0 && full_adaptive.valid) ? &full_adaptive : nullptr;
+                    const std::vector<double> frame_llrs =
+                        decode_llrs_tracking(pcm, data_pos, candidate_span,
+                                             required_fec_bits, full_adaptive_ptr,
+                                             full_adaptive_ptr != nullptr);
+                    if (frame_llrs.size() < required_fec_bits) {
+                        saw_incomplete = true;
+                        continue;
+                    }
+
+                    std::vector<uint8_t> payload;
+                    const bool ok = decode_exact_payload_from_llrs(frame_llrs, required_fec_bits,
+                                                                   &payload,
+                                                                   &diag.header_fec,
+                                                                   &diag.body_fec);
+                    if (ok) {
+                        diag.ok = true;
+                        diag.cause = DecodeFailureCause::None;
+                        if (decoded_payload) *decoded_payload = payload;
+                        return diag;
+                    }
+                    if (!diag.body_fec.all_blocks_ok) diag.cause = DecodeFailureCause::BodyFec;
+                    else diag.cause = DecodeFailureCause::ConvergedButCrc;
+                }
+            }
+        }
+        if (!saw_valid_header) {
+            diag.cause = saw_incomplete ? DecodeFailureCause::Incomplete
+                                        : DecodeFailureCause::HeaderFec;
+        }
+        return diag;
+    } catch (const std::exception&) {
+        diag.cause = DecodeFailureCause::Sync;
+        return diag;
+    }
 }
 
 static size_t count_payload_bit_errors(const std::vector<uint8_t>& expected,
@@ -2153,21 +2462,60 @@ static void run_statistical_quality_measurement(int trials_per_point = 500) {
 
 static void run_pcm_quality_measurement(int trials_per_point = 2) {
     if (trials_per_point <= 0) throw std::runtime_error("measure trials must be positive");
-    const double snr_points[] = {24.0, 18.0, 12.0, 6.0, 3.0, 0.0, -3.0, -6.0, -9.0, -12.0};
+    const double smoke_snr_points[] = {24.0};
+    const double full_snr_points[] = {24.0, 18.0, 12.0, 6.0, 3.0, 0.0, -3.0, -6.0};
+    const double* snr_points = trials_per_point == 1 ? smoke_snr_points : full_snr_points;
+    const size_t snr_point_count =
+        trials_per_point == 1
+            ? sizeof(smoke_snr_points) / sizeof(smoke_snr_points[0])
+            : sizeof(full_snr_points) / sizeof(full_snr_points[0]);
     const char* profiles[] = {"awgn", "radio"};
     std::mt19937 rng(0xBEEFu);
+    const PhyProfile phy = current_phy_profile();
 
-    std::cout << "profile,snr_db,trials,sync_fail,raw_ser,raw_ber,per,payload_ber_accepted\n";
+    std::cout
+        << "profile,phy_version,protocol_version,snr_db,trials,"
+        << "sample_rate,symbol_samples,alphabet,bits_per_symbol,"
+        << "pilot_interval,pilot_symbol,fec_rate,legacy_compatible,"
+        << "same_bitrate_as_legacy,same_channel_as_legacy,occupied_audio_bandwidth_hz,"
+        << "required_audio_bandwidth_hz,net_payload_bitrate_bps,"
+        << "coded_bitrate_bps,frame_duration_s,overhead_ratio,"
+        << "estimated_EsN0_db,estimated_EbN0_db,processing_gain_db,"
+        << "sync_fail,header_fec_fail,body_fec_fail,crc_fail,"
+        << "false_lock,incomplete,converged_but_crc,"
+        << "rx_raw_ser,rx_raw_ber,oracle_raw_ser,oracle_raw_ber,"
+        << "per,payload_ber_accepted,header_fec_failed_blocks,"
+        << "body_fec_failed_blocks,max_fec_iterations,max_syndrome_weight,"
+        << "metric_noise_variance,llr_saturation_rate\n";
     for (const char* profile : profiles) {
-        for (double snr_db : snr_points) {
-            size_t raw_symbols = 0;
-            size_t raw_symbol_errors = 0;
-            size_t raw_bits = 0;
-            size_t raw_bit_errors = 0;
+        for (size_t snr_index = 0; snr_index < snr_point_count; ++snr_index) {
+            const double snr_db = snr_points[snr_index];
+            size_t rx_raw_symbols = 0;
+            size_t rx_raw_symbol_errors = 0;
+            size_t rx_raw_bits = 0;
+            size_t rx_raw_bit_errors = 0;
+            size_t oracle_raw_symbols = 0;
+            size_t oracle_raw_symbol_errors = 0;
+            size_t oracle_raw_bits = 0;
+            size_t oracle_raw_bit_errors = 0;
             size_t sync_fail = 0;
+            size_t header_fec_fail = 0;
+            size_t body_fec_fail = 0;
+            size_t crc_fail = 0;
+            size_t false_lock = 0;
+            size_t incomplete = 0;
+            size_t converged_but_crc = 0;
             size_t packet_errors = 0;
             size_t accepted_payload_bits = 0;
             size_t accepted_payload_bit_errors = 0;
+            size_t header_fec_failed_blocks = 0;
+            size_t body_fec_failed_blocks = 0;
+            int max_fec_iterations = 0;
+            int max_syndrome_weight = 0;
+            size_t frame_samples_accum = 0;
+            size_t tx_bits_accum = 0;
+            size_t payload_bits_accum = 0;
+            size_t physical_symbol_accum = 0;
 
             for (int trial = 0; trial < trials_per_point; ++trial) {
                 std::vector<uint8_t> payload(64);
@@ -2180,50 +2528,266 @@ static void run_pcm_quality_measurement(int trials_per_point = 2) {
                 const std::vector<uint8_t> tx_bits = build_frame_tx_bits(frame);
                 const std::vector<uint8_t> expected_symbols = bits_to_symbols(tx_bits);
                 const std::vector<int16_t> clean = encode_frame_bytes_to_pcm(frame);
+                const size_t data_symbols =
+                    (tx_bits.size() + BITS_PER_SYMBOL - 1) / BITS_PER_SYMBOL;
+                const size_t physical_symbols =
+                    data_symbols + pilot_count_for_data_symbols(data_symbols) +
+                    PREAMBLE_SYMBOLS + SYNC_SYMBOLS;
+                frame_samples_accum += clean.size();
+                tx_bits_accum += tx_bits.size();
+                payload_bits_accum += payload.size() * 8;
+                physical_symbol_accum += physical_symbols;
 
                 std::vector<int16_t> impaired =
                     std::string(profile) == "radio"
                         ? apply_quality_radio_channel(clean, snr_db, &rng)
                         : add_awgn_for_snr(clean, snr_db, &rng);
 
-                const RawLinkMetrics raw =
-                    measure_raw_link_metrics(impaired, tx_bits, expected_symbols);
-                raw_symbols += raw.symbols;
-                raw_symbol_errors += raw.symbol_errors;
-                raw_bits += raw.bits;
-                raw_bit_errors += raw.bit_errors;
-                if (!raw.sync_locked) ++sync_fail;
+                const RawLinkMetrics rx_raw =
+                    measure_receiver_selected_raw_link_metrics(impaired, tx_bits,
+                                                               expected_symbols);
+                rx_raw_symbols += rx_raw.symbols;
+                rx_raw_symbol_errors += rx_raw.symbol_errors;
+                rx_raw_bits += rx_raw.bits;
+                rx_raw_bit_errors += rx_raw.bit_errors;
+
+                const RawLinkMetrics oracle_raw =
+                    measure_oracle_raw_link_metrics(impaired, tx_bits,
+                                                    expected_symbols);
+                oracle_raw_symbols += oracle_raw.symbols;
+                oracle_raw_symbol_errors += oracle_raw.symbol_errors;
+                oracle_raw_bits += oracle_raw.bits;
+                oracle_raw_bit_errors += oracle_raw.bit_errors;
 
                 std::vector<uint8_t> decoded;
-                const bool ok = decode_payload_from_pcm(impaired, &decoded, false);
-                if (!ok || decoded != payload) {
+                const DecodeAttemptDiagnostics diag =
+                    diagnose_pcm_decode_attempt(impaired, &decoded);
+                header_fec_failed_blocks += size_t(diag.header_fec.failed_blocks);
+                body_fec_failed_blocks += size_t(diag.body_fec.failed_blocks);
+                max_fec_iterations =
+                    std::max(max_fec_iterations,
+                             std::max(diag.header_fec.max_iterations,
+                                      diag.body_fec.max_iterations));
+                max_syndrome_weight =
+                    std::max(max_syndrome_weight,
+                             std::max(diag.header_fec.max_syndrome_weight,
+                                      diag.body_fec.max_syndrome_weight));
+
+                if (!diag.ok || decoded != payload) {
                     ++packet_errors;
+                    switch (diag.cause) {
+                        case DecodeFailureCause::Sync: ++sync_fail; break;
+                        case DecodeFailureCause::HeaderFec: ++header_fec_fail; break;
+                        case DecodeFailureCause::BodyFec: ++body_fec_fail; break;
+                        case DecodeFailureCause::Crc: ++crc_fail; break;
+                        case DecodeFailureCause::FalseLock: ++false_lock; break;
+                        case DecodeFailureCause::Incomplete: ++incomplete; break;
+                        case DecodeFailureCause::ConvergedButCrc:
+                            ++converged_but_crc;
+                            ++crc_fail;
+                            break;
+                        case DecodeFailureCause::None:
+                            ++crc_fail;
+                            break;
+                    }
                 } else {
                     accepted_payload_bits += payload.size() * 8;
                     accepted_payload_bit_errors += count_payload_bit_errors(payload, decoded);
                 }
             }
 
-            const double raw_ser =
-                raw_symbols ? double(raw_symbol_errors) / double(raw_symbols) : 1.0;
-            const double raw_ber =
-                raw_bits ? double(raw_bit_errors) / double(raw_bits) : 0.5;
+            const double rx_raw_ser =
+                rx_raw_symbols ? double(rx_raw_symbol_errors) / double(rx_raw_symbols) : 1.0;
+            const double rx_raw_ber =
+                rx_raw_bits ? double(rx_raw_bit_errors) / double(rx_raw_bits) : 0.5;
+            const double oracle_raw_ser =
+                oracle_raw_symbols
+                    ? double(oracle_raw_symbol_errors) / double(oracle_raw_symbols)
+                    : 1.0;
+            const double oracle_raw_ber =
+                oracle_raw_bits
+                    ? double(oracle_raw_bit_errors) / double(oracle_raw_bits)
+                    : 0.5;
             const double per = double(packet_errors) / double(trials_per_point);
             const double payload_ber =
                 accepted_payload_bits
                     ? double(accepted_payload_bit_errors) / double(accepted_payload_bits)
                     : 0.0;
+            const double frame_duration_s =
+                frame_samples_accum
+                    ? double(frame_samples_accum) /
+                          double(trials_per_point * SAMPLE_RATE)
+                    : 0.0;
+            const double net_payload_bitrate =
+                frame_duration_s > 0.0
+                    ? double(payload_bits_accum) / double(trials_per_point) / frame_duration_s
+                    : 0.0;
+            const double coded_bitrate =
+                frame_duration_s > 0.0
+                    ? double(tx_bits_accum) / double(trials_per_point) / frame_duration_s
+                    : 0.0;
+            const double carried_raw_bits =
+                double(physical_symbol_accum) * double(BITS_PER_SYMBOL) /
+                double(trials_per_point);
+            const double useful_payload_bits =
+                double(payload_bits_accum) / double(trials_per_point);
+            const double overhead_ratio =
+                carried_raw_bits > 0.0
+                    ? std::max(0.0, (carried_raw_bits - useful_payload_bits) /
+                                        carried_raw_bits)
+                    : 0.0;
+            const double estimated_ebn0 =
+                net_payload_bitrate > 0.0
+                    ? snr_db + 10.0 * std::log10(phy.occupied_audio_bandwidth_hz /
+                                                 net_payload_bitrate)
+                    : snr_db;
+            const double processing_gain =
+                coded_bitrate > 0.0
+                    ? 10.0 * std::log10(phy.occupied_audio_bandwidth_hz /
+                                        coded_bitrate)
+                    : 0.0;
 
             std::cout << profile << ","
+                      << phy.phy_version << ","
+                      << phy.protocol_version << ","
                       << snr_db << ","
                       << trials_per_point << ","
+                      << phy.sample_rate << ","
+                      << phy.symbol_samples << ","
+                      << phy.alphabet << ","
+                      << phy.bits_per_symbol << ","
+                      << phy.pilot_interval_symbols << ","
+                      << phy.pilot_symbol << ","
+                      << phy.fec_rate << ","
+                      << (phy.legacy_compatible ? 1 : 0) << ","
+                      << (phy.same_bitrate_as_legacy ? 1 : 0) << ","
+                      << (phy.same_channel_as_legacy ? 1 : 0) << ","
+                      << phy.occupied_audio_bandwidth_hz << ","
+                      << phy.required_audio_bandwidth_hz << ","
+                      << net_payload_bitrate << ","
+                      << coded_bitrate << ","
+                      << frame_duration_s << ","
+                      << overhead_ratio << ","
+                      << snr_db << ","
+                      << estimated_ebn0 << ","
+                      << processing_gain << ","
                       << sync_fail << ","
-                      << raw_ser << ","
-                      << raw_ber << ","
+                      << header_fec_fail << ","
+                      << body_fec_fail << ","
+                      << crc_fail << ","
+                      << false_lock << ","
+                      << incomplete << ","
+                      << converged_but_crc << ","
+                      << rx_raw_ser << ","
+                      << rx_raw_ber << ","
+                      << oracle_raw_ser << ","
+                      << oracle_raw_ber << ","
                       << per << ","
-                      << payload_ber << "\n";
+                      << payload_ber << ","
+                      << header_fec_failed_blocks << ","
+                      << body_fec_failed_blocks << ","
+                      << max_fec_iterations << ","
+                      << max_syndrome_weight << ","
+                      << 0.0 << ","
+                      << 0.0 << "\n";
         }
     }
+}
+
+static void run_pcm_debug_measurement(const std::string& profile,
+                                      double snr_db,
+                                      int trials) {
+    if (profile != "awgn" && profile != "radio") {
+        throw std::runtime_error("measure-pcm-debug --profile must be awgn or radio");
+    }
+    if (trials <= 0) throw std::runtime_error("measure-pcm-debug trials must be positive");
+
+    std::mt19937 rng(0xBEEFu);
+    std::cout << "measure-pcm-debug profile=" << profile
+              << " snr_db=" << snr_db
+              << " trials=" << trials
+              << " rng_seed=0xBEEF\n";
+
+    for (int trial = 0; trial < trials; ++trial) {
+        std::vector<uint8_t> payload(64);
+        for (size_t i = 0; i < payload.size(); ++i) {
+            payload[i] = uint8_t((trial * 131 + int(i) * 17 + int(rng())) & 0xFF);
+        }
+
+        const std::vector<uint8_t> frame =
+            build_protected_frame(payload, PROTOCOL_MAGIC, PROTOCOL_VERSION, 0);
+        const std::vector<uint8_t> tx_bits = build_frame_tx_bits(frame);
+        const std::vector<uint8_t> expected_symbols = bits_to_symbols(tx_bits);
+        const std::vector<int16_t> clean = encode_frame_bytes_to_pcm(frame);
+        const std::vector<int16_t> impaired =
+            profile == "radio" ? apply_quality_radio_channel(clean, snr_db, &rng)
+                                : add_awgn_for_snr(clean, snr_db, &rng);
+
+        std::vector<uint8_t> decoded;
+        const DecodeAttemptDiagnostics diag =
+            diagnose_pcm_decode_attempt(impaired, &decoded);
+        const bool payload_ok = diag.ok && decoded == payload;
+        if (payload_ok) {
+            std::cout << "trial=" << trial << " status=ok"
+                      << " sync_score=" << diag.sync_score
+                      << " selected_candidate_span=" << diag.selected_candidate_span
+                      << "\n";
+            continue;
+        }
+
+        const std::vector<uint8_t> header_bits(
+            tx_bits.begin(),
+            tx_bits.begin() + std::ptrdiff_t(std::min(tx_bits.size(),
+                                                      size_t(FEC_CODEWORD_BITS))));
+        const std::vector<uint8_t> header_symbols(
+            expected_symbols.begin(),
+            expected_symbols.begin() +
+                std::ptrdiff_t(std::min(expected_symbols.size(),
+                                        size_t(FEC_CODEWORD_BITS / BITS_PER_SYMBOL))));
+        const RawLinkMetrics header_raw =
+            measure_receiver_selected_raw_link_metrics(impaired, header_bits, header_symbols);
+        const RawLinkMetrics oracle_raw =
+            measure_oracle_raw_link_metrics(impaired, tx_bits, expected_symbols);
+        const bool oracle_candidate_would_succeed = oracle_raw.bit_errors == 0;
+
+        std::cout << "trial=" << trial << " status=fail"
+                  << " cause=" << decode_failure_cause_name(diag.cause) << "\n";
+        std::cout << "reproduction rng_seed=0xBEEF trial_index=" << trial
+                  << " profile=" << profile
+                  << " snr_db=" << snr_db << "\n";
+        std::cout << "sync_locked=" << (diag.sync_locked ? 1 : 0)
+                  << " sync_score=" << diag.sync_score
+                  << " estimated_symbol_span=" << diag.estimated_symbol_span
+                  << " selected_candidate_span=" << diag.selected_candidate_span
+                  << " estimated_sample_rate_error_percent="
+                  << (diag.selected_candidate_span > 0.0
+                          ? 100.0 * (diag.selected_candidate_span / NOMINAL_SPAN - 1.0)
+                          : 0.0)
+                  << "\n";
+        std::cout << "header_raw_symbol_errors=" << header_raw.symbol_errors
+                  << " header_raw_symbols=" << header_raw.symbols
+                  << " header_raw_bit_errors=" << header_raw.bit_errors
+                  << " header_raw_bits=" << header_raw.bits << "\n";
+        std::cout << "header_fec_all_blocks_ok=" << (diag.header_fec.all_blocks_ok ? 1 : 0)
+                  << " header_fec_failed_blocks=" << diag.header_fec.failed_blocks
+                  << " header_fec_block_count=" << diag.header_fec.block_count
+                  << " header_fec_max_iterations=" << diag.header_fec.max_iterations
+                  << " header_fec_max_syndrome_weight="
+                  << diag.header_fec.max_syndrome_weight
+                  << " header_fec_total_syndrome_weight="
+                  << diag.header_fec.total_syndrome_weight << "\n";
+        std::cout << "header_decoded_bytes_hex="
+                  << bytes_to_hex_string(diag.header_decoded_bytes) << "\n";
+        std::cout << "oracle_candidate_would_succeed="
+                  << (oracle_candidate_would_succeed ? 1 : 0)
+                  << " oracle_raw_symbol_errors=" << oracle_raw.symbol_errors
+                  << " oracle_raw_symbols=" << oracle_raw.symbols
+                  << " oracle_raw_bit_errors=" << oracle_raw.bit_errors
+                  << " oracle_raw_bits=" << oracle_raw.bits << "\n";
+        return;
+    }
+
+    std::cout << "no_failure_reproduced=1\n";
 }
 
 static void require_true(bool ok, const std::string& name) {
@@ -2528,15 +3092,47 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+        if (argc >= 2 && std::string(argv[1]) == "measure-metric") {
+            const int trials = argc >= 3 ? std::atoi(argv[2]) : 500;
+            std::cerr << "NOTE: measure-metric is a synthetic metric-channel model, "
+                      << "not the real PCM waveform receiver.\n";
+            run_statistical_quality_measurement(trials);
+            return 0;
+        }
+
         if (argc >= 2 && std::string(argv[1]) == "measure") {
             const int trials = argc >= 3 ? std::atoi(argv[2]) : 500;
+            std::cerr << "WARNING: 'measure' is a legacy alias for synthetic "
+                      << "metric-channel measurement; use 'measure-pcm' for "
+                      << "waveform/PCM receiver measurement.\n";
             run_statistical_quality_measurement(trials);
             return 0;
         }
 
         if (argc >= 2 && std::string(argv[1]) == "measure-pcm") {
             const int trials = argc >= 3 ? std::atoi(argv[2]) : 2;
+            print_not_same_bitrate_notice();
             run_pcm_quality_measurement(trials);
+            return 0;
+        }
+
+        if (argc >= 2 && std::string(argv[1]) == "measure-pcm-debug") {
+            std::string profile = "radio";
+            double snr_db = 24.0;
+            int trials = 20;
+            for (int i = 2; i < argc; ++i) {
+                const std::string arg = argv[i];
+                if (arg == "--profile" && i + 1 < argc) {
+                    profile = argv[++i];
+                } else if (arg == "--snr" && i + 1 < argc) {
+                    snr_db = std::atof(argv[++i]);
+                } else if (arg == "--trials" && i + 1 < argc) {
+                    trials = std::atoi(argv[++i]);
+                } else {
+                    throw std::runtime_error("Unknown measure-pcm-debug argument");
+                }
+            }
+            run_pcm_debug_measurement(profile, snr_db, trials);
             return 0;
         }
 
@@ -2545,8 +3141,10 @@ int main(int argc, char** argv) {
                       << "  " << argv[0] << " enc input.bin output.pcm\n"
                       << "  " << argv[0] << " dec input.pcm output.bin\n"
                       << "  " << argv[0] << " selftest\n"
-                      << "  " << argv[0] << " measure [trials-per-snr]\n"
-                      << "  " << argv[0] << " measure-pcm [trials-per-snr]\n";
+                      << "  " << argv[0] << " measure-metric [trials-per-snr]\n"
+                      << "  " << argv[0] << " measure [trials-per-snr]  # legacy alias\n"
+                      << "  " << argv[0] << " measure-pcm [trials-per-snr]\n"
+                      << "  " << argv[0] << " measure-pcm-debug --profile radio --snr 24 --trials 20\n";
             return 1;
         }
 

@@ -47,7 +47,11 @@ Current implementation facts:
 - `SYMBOL_SAMPLES = 128`, so one symbol is 128 samples = 16 ms = 256 PCM bytes.
 - Preamble: 48 symbols of raw CSS symbol 0.
 - Sync sequence: `15, 1, 14, 2, 13, 3, 12, 4`.
+- PHY profile version: `1`. The measurement/accounting diagnostics do not by
+  themselves change the over-the-air waveform, frame, FEC, or symbol layout.
 - Pilot symbol: raw CSS symbol `10` inserted every 32 protected data symbols.
+  This deliberately changes bitrate/latency/overhead in exchange for more
+  robust timing and template tracking.
 - Protected frame header: magic `CHRP`, version `1`, payload length, flags.
 - Maximum payload size: 4096 bytes.
 - TX scrambles protected FEC bits with a deterministic PRBS before Gray/CSS
@@ -71,13 +75,19 @@ Current implementation facts:
 - The FEC decoder is now real BP, but the code is not standards-compatible
   WiFi, DVB-S2, or CCSDS LDPC.
 - Final packet acceptance is gated by protocol magic/version, payload length,
-  CRC16, and exact payload comparison in tests.
+  CRC16, and exact payload comparison in tests. FEC convergence is reported as
+  diagnostics; a nonzero final syndrome is not silently hidden.
 - Sync acquisition scans possible preamble starts, uses an energy-onset
   candidate, tries candidate symbol spans, and locally refines the best lock.
 - Timing tracking uses a decision-directed loop with confidence gating and
   clamped symbol span updates.
 - A streaming scan API can classify rolling PCM windows as no frame, incomplete
   candidate, decoded frame, or rejected frame-like candidate.
+- The default PHY reports `same_bitrate_as_legacy=true` and
+  `same_channel_as_legacy=true`. A future non-legacy robustness profile that
+  changes bitrate, latency, overhead, symbol count, pilot overhead, FEC rate, or
+  frame duration must print:
+  `NOT SAME BITRATE: this mode trades bitrate/latency/overhead for robustness.`
 
 High-level transmit path:
 
@@ -191,7 +201,7 @@ For the standalone chirp modem:
 cd lab
 ./chirp_modem enc input.bin output.pcm
 ./chirp_modem dec output.pcm decoded.bin
-./chirp_modem measure 500
+./chirp_modem measure-pcm 1
 cmp input.bin decoded.bin
 ```
 
@@ -200,9 +210,39 @@ With Bazel-built binaries from the repository root:
 ```bash
 bazel-bin/lab/chirp_modem enc input.bin output.pcm
 bazel-bin/lab/chirp_modem dec output.pcm decoded.bin
-bazel-bin/lab/chirp_modem measure 500
+bazel-bin/lab/chirp_modem measure-pcm 1
 cmp input.bin decoded.bin
 ```
+
+### Chirp Measurement Modes
+
+There are two measurement paths:
+
+- `measure-metric [trials-per-snr]` is a fast synthetic metric-channel model.
+  It does not run the PCM waveform receiver. The old `measure` command remains
+  as a legacy alias and prints a warning.
+- `measure-pcm [trials-per-snr]` runs generated PCM through the real waveform
+  receiver path. Its CSV separates receiver-selected raw errors from oracle
+  debug errors:
+
+```text
+rx_raw_ser,rx_raw_ber      receiver-selected hypothesis
+oracle_raw_ser,oracle_raw_ber  best debug hypothesis using known TX bits
+```
+
+Use `rx_raw_*` and `PER` when judging modem quality. The `oracle_raw_*` columns
+are only for diagnosing whether the receiver is losing performance in
+acquisition/timing/template selection.
+
+The PCM measurement also prints PHY/accounting columns such as PHY version,
+protocol version, `same_bitrate_as_legacy`, `same_channel_as_legacy`, pilot
+spacing, FEC rate, estimated occupied audio bandwidth, frame duration, net
+payload bitrate, coded bitrate, overhead ratio, estimated Eb/N0, and coarse
+failure counters for sync, header FEC, body FEC, CRC, false-lock, incomplete
+frame, and converged-but-CRC-failed cases. The bandwidth number is an
+intentionally simple estimator based on the configured chirp sweep from 700 Hz
+to 2300 Hz plus guard margin; it is useful for accounting, not a regulatory
+spectral mask measurement.
 
 ### Convert PCM to WAV
 
@@ -545,16 +585,19 @@ parameters used.
 
 ### BER/SER/PER Measurement Mode
 
-`chirp_modem` includes two synthetic quality measurement modes:
+`chirp_modem` includes two quality measurement modes:
 
 ```bash
-./chirp_modem measure [trials-per-snr]      # fast statistical metric/LLR/FEC model
-./chirp_modem measure-pcm [trials-per-snr]  # slow full PCM modem integration model
+./chirp_modem measure-metric [trials-per-snr]  # fast statistical metric/LLR/FEC model
+./chirp_modem measure [trials-per-snr]         # legacy alias with warning
+./chirp_modem measure-pcm [trials-per-snr]     # real PCM waveform receiver path
+./chirp_modem measure-pcm-debug --profile radio --snr 24 --trials 20
 ```
 
-`measure` generates deterministic 64-byte payloads, encodes real protected modem
-frames, simulates a CSS metric vector for each transmitted symbol, feeds those
-soft metrics through the real interleaver and BP FEC decoder, and prints CSV:
+`measure-metric` generates deterministic 64-byte payloads, encodes real
+protected modem frames, simulates a CSS metric vector for each transmitted
+symbol, feeds those soft metrics through the real interleaver and BP FEC
+decoder, and prints CSV:
 
 ```text
 profile,snr_db,trials,raw_ser,raw_ber,per
@@ -569,11 +612,24 @@ Profiles:
 
 `measure-pcm` is the slower end-to-end PCM path. It generates real audio PCM,
 applies AWGN or a radio-ish PCM channel, runs sync/acquisition/demod/FEC/CRC,
-and reports CSV with `sync_fail` and accepted-payload BER. It is useful as an
-integration regression, but it is too slow for 500-packet sweeps with the current
-scalar correlator.
+and reports CSV with PHY accounting, coarse failure causes, receiver-selected
+raw SER/BER, oracle debug SER/BER, PER, and accepted-payload BER. Use
+`rx_raw_ser`, `rx_raw_ber`, and `per` for quality claims. The `oracle_raw_*`
+columns are only a diagnostic for "could a better candidate selection have
+helped?".
 
-Current local run, `./chirp_modem measure 500`, on 2026-06-13:
+The PCM measurement is not yet a calibrated standards-style Eb/N0 compliance
+test. It prints estimated Eb/N0 and processing gain from the configured audio
+bandwidth and measured frame duration so overhead changes are visible.
+
+`measure-pcm-debug` is a deterministic first-failure tool. It uses the same
+seeded payload/channel generation as `measure-pcm` and prints the trial index,
+sync score, selected candidate span, estimated sample-rate error, header raw
+SER/BER counts, FEC syndrome diagnostics, decoded header bytes before
+validation, and whether the oracle raw candidate would have been error-free.
+
+Historical local metric-model run, `./chirp_modem measure-metric 500`, on
+2026-06-13:
 
 | Profile | SNR dB | Raw SER | Raw BER | PER |
 |---------|--------|---------|---------|-----|

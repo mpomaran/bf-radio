@@ -15,14 +15,16 @@ if [ -z "$modem" ]; then
   modem="$(rlocation lab/chirp_modem)"
 fi
 
-out="$TEST_TMPDIR/measure.csv"
-"$modem" measure 500 >"$out"
+out="$TEST_TMPDIR/measure_metric.csv"
+err="$TEST_TMPDIR/measure_metric.err"
+"$modem" measure-metric 500 >"$out" 2>"$err"
 
 grep -q '^profile,snr_db,trials,raw_ser,raw_ber,per$' "$out"
 grep -q '^awgn-metric,12,500,' "$out"
 grep -q '^radio-metric,12,500,' "$out"
 grep -q '^awgn-metric,-6,500,' "$out"
 grep -q '^radio-metric,-6,500,' "$out"
+grep -q 'synthetic metric-channel model' "$err"
 
 line_count="$(wc -l < "$out" | tr -d ' ')"
 if [ "$line_count" -ne 15 ]; then
@@ -31,4 +33,35 @@ if [ "$line_count" -ne 15 ]; then
   exit 1
 fi
 
-echo "Chirp 500-packet measurement test OK"
+alias_out="$TEST_TMPDIR/measure_alias.csv"
+alias_err="$TEST_TMPDIR/measure_alias.err"
+"$modem" measure 10 >"$alias_out" 2>"$alias_err"
+grep -q "legacy alias" "$alias_err"
+grep -q '^profile,snr_db,trials,raw_ser,raw_ber,per$' "$alias_out"
+
+pcm_out="$TEST_TMPDIR/measure_pcm.csv"
+pcm_err="$TEST_TMPDIR/measure_pcm.err"
+"$modem" measure-pcm 1 >"$pcm_out" 2>"$pcm_err"
+if grep -q 'NOT SAME BITRATE' "$pcm_err"; then
+  echo "Default measure-pcm unexpectedly printed NOT SAME BITRATE"
+  cat "$pcm_err"
+  exit 1
+fi
+grep -q '^profile,phy_version,protocol_version,snr_db,trials,' "$pcm_out"
+grep -q 'same_bitrate_as_legacy,same_channel_as_legacy' "$pcm_out"
+grep -q 'rx_raw_ser,rx_raw_ber,oracle_raw_ser,oracle_raw_ber' "$pcm_out"
+grep -q '^awgn,1,1,24,1,' "$pcm_out"
+grep -q '^radio,1,1,24,1,' "$pcm_out"
+
+payload="$TEST_TMPDIR/default_payload.bin"
+encoded="$TEST_TMPDIR/default_payload.pcm"
+enc_err="$TEST_TMPDIR/default_enc.err"
+printf 'default profile smoke payload' >"$payload"
+"$modem" enc "$payload" "$encoded" 2>"$enc_err"
+if grep -q 'NOT SAME BITRATE' "$enc_err"; then
+  echo "Default enc unexpectedly printed NOT SAME BITRATE"
+  cat "$enc_err"
+  exit 1
+fi
+
+echo "Chirp measurement tests OK"
