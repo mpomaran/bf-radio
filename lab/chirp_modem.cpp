@@ -14,11 +14,9 @@
 #include <array>
 #include <cassert>
 #include <cmath>
-#include <complex>
 #include <cstdint>
 #include <cstdlib>
 #include <ctime>
-#include <fstream>
 #include <iostream>
 #include <limits>
 #include <random>
@@ -33,7 +31,9 @@
 #include "lab/chirp/file_io.h"
 #include "lab/chirp/frame.h"
 #include "lab/chirp/interleaver.h"
+#include "lab/chirp/modulator.h"
 #include "lab/chirp/pcm_io.h"
+#include "lab/chirp/waveform.h"
 
 using chirp::bits::binary_to_gray4;
 using chirp::bits::bits_to_bytes;
@@ -41,18 +41,12 @@ using chirp::bits::bits_to_symbols;
 using chirp::bits::bytes_to_bits;
 using chirp::bits::descramble_llrs;
 using chirp::bits::gray_to_binary4;
-using chirp::bits::scramble_bits;
 using chirp::config::ALPHABET;
-using chirp::config::AMP;
 using chirp::config::BITS_PER_SYMBOL;
-using chirp::config::CRC_BYTES;
 using chirp::config::FEC_CODEWORD_BITS;
 using chirp::config::FEC_INFO_BITS;
-using chirp::config::FREQ_HIGH;
-using chirp::config::FREQ_LOW;
 using chirp::config::NOMINAL_SPAN;
 using chirp::config::PHY_VERSION;
-using chirp::config::PI;
 using chirp::config::PILOT_INTERVAL_SYMBOLS;
 using chirp::config::PILOT_SYMBOL;
 using chirp::config::PREAMBLE_SYMBOLS;
@@ -85,6 +79,13 @@ using chirp::io::read_file;
 using chirp::io::read_pcm16;
 using chirp::io::write_file;
 using chirp::io::write_pcm16;
+using chirp::modulator::build_frame_tx_bits;
+using chirp::modulator::encode_frame_bytes_to_pcm;
+using chirp::modulator::encode_payload_to_pcm;
+using chirp::modulator::pilot_count_for_data_symbols;
+using chirp::waveform::append_symbol_pcm;
+using chirp::waveform::ideal_base_template_array;
+using chirp::waveform::symbol_template;
 
 static void print_not_same_bitrate_notice() {
     const PhyProfile p = current_phy_profile();
@@ -103,94 +104,6 @@ static void progress_message(bool enabled,
     if (!force && elapsed < 0.75) return;
     *last_report = now;
     std::cerr << "[progress] " << message << "\n";
-}
-
-static size_t pilot_count_for_data_symbols(size_t data_symbols) {
-    if (data_symbols == 0) return 0;
-    return (data_symbols - 1) / size_t(PILOT_INTERVAL_SYMBOLS);
-}
-
-static std::vector<uint8_t> insert_pilot_symbols(const std::vector<uint8_t>& data_symbols) {
-    std::vector<uint8_t> out;
-    out.reserve(data_symbols.size() + pilot_count_for_data_symbols(data_symbols.size()));
-    for (size_t i = 0; i < data_symbols.size(); ++i) {
-        if (i > 0 && (i % size_t(PILOT_INTERVAL_SYMBOLS)) == 0) {
-            out.push_back(uint8_t(PILOT_SYMBOL));
-        }
-        out.push_back(data_symbols[i]);
-    }
-    return out;
-}
-
-static std::vector<double> make_base_chirp() {
-    std::vector<double> chirp(SYMBOL_SAMPLES);
-    const double duration = double(SYMBOL_SAMPLES) / SAMPLE_RATE;
-    const double sweep = (FREQ_HIGH - FREQ_LOW) / duration;
-
-    for (int n = 0; n < SYMBOL_SAMPLES; ++n) {
-        const double t = double(n) / SAMPLE_RATE;
-        const double phase = 2.0 * PI * (FREQ_LOW * t + 0.5 * sweep * t * t);
-        chirp[size_t(n)] = AMP * std::cos(phase);
-    }
-    return chirp;
-}
-
-static const std::array<double, SYMBOL_SAMPLES>& ideal_base_template_array() {
-    static const std::array<double, SYMBOL_SAMPLES> base = [] {
-        const std::vector<double> chirp = make_base_chirp();
-        std::array<double, SYMBOL_SAMPLES> out = {};
-        for (int i = 0; i < SYMBOL_SAMPLES; ++i) out[size_t(i)] = chirp[size_t(i)];
-        double energy = 0.0;
-        for (double v : out) energy += v * v;
-        if (energy > 1e-12) {
-            const double inv = 1.0 / std::sqrt(energy);
-            for (double& v : out) v *= inv;
-        }
-        return out;
-    }();
-    return base;
-}
-
-static double cyclic_sample(const std::vector<double>& wave, double idx) {
-    const double n = double(wave.size());
-    idx = std::fmod(idx, n);
-    if (idx < 0.0) idx += n;
-    const int i0 = int(std::floor(idx));
-    const int i1 = (i0 + 1) % int(wave.size());
-    const double frac = idx - i0;
-    return wave[size_t(i0)] + (wave[size_t(i1)] - wave[size_t(i0)]) * frac;
-}
-
-static std::vector<double> make_symbol_wave(double symbol) {
-    static const std::vector<double> base = make_base_chirp();
-    const double shift = symbol * double(SYMBOL_SAMPLES) / ALPHABET;
-    std::vector<double> out(SYMBOL_SAMPLES);
-    for (int n = 0; n < SYMBOL_SAMPLES; ++n) {
-        out[size_t(n)] = cyclic_sample(base, double(n) + shift);
-    }
-    return out;
-}
-
-static const std::vector<double>& symbol_template(int symbol, int offset_index) {
-    static const double offsets[] = {-0.25, 0.0, 0.25};
-    static const std::vector<std::vector<double> > templates = [] {
-        std::vector<std::vector<double> > out;
-        out.reserve(ALPHABET * 3);
-        for (int symbol = 0; symbol < ALPHABET; ++symbol) {
-            for (double offset : offsets) out.push_back(make_symbol_wave(double(symbol) + offset));
-        }
-        return out;
-    }();
-    return templates[size_t(symbol * 3 + offset_index)];
-}
-
-static void append_symbol_pcm(std::vector<int16_t>& pcm, int raw_symbol) {
-    const std::vector<double> wave = make_symbol_wave(double(raw_symbol & 0x0F));
-    for (double x : wave) {
-        int v = int(std::round(x * 32767.0));
-        v = std::max(-32768, std::min(32767, v));
-        pcm.push_back(int16_t(v));
-    }
 }
 
 static double sample_at(const std::vector<int16_t>& pcm, double pos) {
@@ -772,45 +685,6 @@ static std::array<double, BITS_PER_SYMBOL> symbol_metrics_to_llr(
         metric_stats_observe_llr(stats, llr[size_t(bit)], cfg);
     }
     return llr;
-}
-
-static std::vector<uint8_t> build_frame_tx_bits(const std::vector<uint8_t>& frame) {
-    if (frame.size() < PROTOCOL_HEADER_BYTES + CRC_BYTES) {
-        throw std::runtime_error("Protected frame too short");
-    }
-
-    std::vector<uint8_t> header(frame.begin(), frame.begin() + PROTOCOL_HEADER_BYTES);
-    std::vector<uint8_t> body(frame.begin() + PROTOCOL_HEADER_BYTES, frame.end());
-    const std::vector<uint8_t> header_fec = fec_encode_bits(bytes_to_bits(header));
-    const std::vector<uint8_t> body_fec = fec_encode_bits(bytes_to_bits(body));
-    const std::vector<uint8_t> body_tx_bits = interleave(body_fec);
-
-    std::vector<uint8_t> tx_bits;
-    tx_bits.reserve(header_fec.size() + body_tx_bits.size());
-    tx_bits.insert(tx_bits.end(), header_fec.begin(), header_fec.end());
-    tx_bits.insert(tx_bits.end(), body_tx_bits.begin(), body_tx_bits.end());
-    return scramble_bits(tx_bits);
-}
-
-static std::vector<int16_t> encode_frame_bytes_to_pcm(const std::vector<uint8_t>& frame) {
-    const std::vector<uint8_t> tx_bits = build_frame_tx_bits(frame);
-    const std::vector<uint8_t> symbols = insert_pilot_symbols(bits_to_symbols(tx_bits));
-
-    std::vector<int16_t> pcm;
-    pcm.reserve((PREAMBLE_SYMBOLS + SYNC_SYMBOLS + symbols.size()) * SYMBOL_SAMPLES + SAMPLE_RATE / 4);
-    for (int i = 0; i < PREAMBLE_SYMBOLS; ++i) append_symbol_pcm(pcm, 0);
-
-    const int sync[SYNC_SYMBOLS] = {15, 1, 14, 2, 13, 3, 12, 4};
-    for (int s : sync) append_symbol_pcm(pcm, s);
-    for (uint8_t s : symbols) append_symbol_pcm(pcm, s);
-    pcm.insert(pcm.end(), SAMPLE_RATE / 4, 0);
-    return pcm;
-}
-
-static std::vector<int16_t> encode_payload_to_pcm(const std::vector<uint8_t>& payload) {
-    const std::vector<uint8_t> frame =
-        build_protected_frame(payload, PROTOCOL_MAGIC, PROTOCOL_VERSION, 0);
-    return encode_frame_bytes_to_pcm(frame);
 }
 
 static void encode_file(const std::string& in_path, const std::string& out_pcm_path) {

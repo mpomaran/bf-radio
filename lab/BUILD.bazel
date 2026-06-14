@@ -66,7 +66,9 @@ cc_library(
         "chirp/file_io.cpp",
         "chirp/frame.cpp",
         "chirp/interleaver.cpp",
+        "chirp/modulator.cpp",
         "chirp/pcm_io.cpp",
+        "chirp/waveform.cpp",
     ],
     hdrs = [
         "chirp/bit_utils.h",
@@ -77,7 +79,9 @@ cc_library(
         "chirp/file_io.h",
         "chirp/frame.h",
         "chirp/interleaver.h",
+        "chirp/modulator.h",
         "chirp/pcm_io.h",
+        "chirp/waveform.h",
     ],
     copts = CPP17_COPTS,
     visibility = ["//visibility:public"],
@@ -107,6 +111,20 @@ cc_test(
 cc_test(
     name = "interleaver_test",
     srcs = ["chirp/interleaver_test.cpp"],
+    copts = CPP17_COPTS,
+    deps = [":chirp_modem_lib"],
+)
+
+cc_test(
+    name = "modulator_test",
+    srcs = ["chirp/modulator_test.cpp"],
+    copts = CPP17_COPTS,
+    deps = [":chirp_modem_lib"],
+)
+
+cc_test(
+    name = "waveform_test",
+    srcs = ["chirp/waveform_test.cpp"],
     copts = CPP17_COPTS,
     deps = [":chirp_modem_lib"],
 )
