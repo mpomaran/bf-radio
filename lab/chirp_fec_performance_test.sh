@@ -13,6 +13,19 @@ rlocation() {
 modem="$(rlocation lab/chirp_modem.exe)"
 if [ -z "$modem" ]; then modem="$(rlocation lab/chirp_modem)"; fi
 
+test_start_s=$(date +%s)
+section_start_s=$test_start_s
+encode_invocations=0
+decode_invocations=0
+
+print_timing_summary() {
+  local label="$1"
+  local now_s
+  now_s=$(date +%s)
+  echo "TIMING section=${label} wall_s=$((now_s - section_start_s)) encode_invocations=${encode_invocations} decode_invocations=${decode_invocations}"
+  section_start_s=$now_s
+}
+
 symbol_bytes=$((128 * 2))
 preamble_bytes=$((48 * symbol_bytes))
 sync_bytes=$((8 * symbol_bytes))
@@ -42,6 +55,7 @@ corrupt_burst() {
 }
 
 roundtrip_ok() {
+  decode_invocations=$((decode_invocations + 1))
   "$modem" dec "$2" "$3" >/dev/null 2>&1 && cmp -s "$1" "$3"
 }
 
@@ -64,6 +78,7 @@ for payload_size in "${payload_sizes[@]}"; do
   encoded="$TEST_TMPDIR/chirp_encoded_${payload_size}.pcm"
   decoded="$TEST_TMPDIR/chirp_decoded_${payload_size}.bin"
   make_payload "$payload_size" "$payload"
+  encode_invocations=$((encode_invocations + 1))
   "$modem" enc "$payload" "$encoded" >/dev/null 2>&1
   encoded_size=$(wc -c < "$encoded")
   echo "PAYLOAD ${payload_size}B encoded=${encoded_size}B"
@@ -88,6 +103,9 @@ for payload_size in "${payload_sizes[@]}"; do
     fi
   done
   echo "  SUMMARY payload=${payload_size}B preamble_ok=${preamble_ok}B header_ok=${header_ok}B data_ok=${data_ok}B"
+  print_timing_summary "payload_${payload_size}B"
 done
 
+section_start_s=$test_start_s
+print_timing_summary "total"
 echo "Chirp FEC performance matrix completed"

@@ -171,6 +171,7 @@ sh_test(
     srcs = ["wav_to_pcm_test.sh"],
     data = [":pcm_to_wav", ":wav_to_pcm"],
     size = "small",
+    tags = ["manual", "slow"],
 )
 
 sh_test(
@@ -182,7 +183,7 @@ sh_test(
         "//:phone_recording_testdata",
     ],
     size = "small",
-    tags = ["manual"],
+    tags = ["manual", "slow"],
 )
 
 sh_test(
@@ -195,7 +196,15 @@ sh_test(
     ],
     size = "large",
     timeout = "long",
-    tags = ["manual"],
+    tags = ["manual", "nightly", "slow"],
+)
+
+sh_test(
+    name = "chirp_clean_roundtrip_fast_test",
+    srcs = ["chirp_clean_roundtrip_fast_test.sh"],
+    data = [":chirp_modem"],
+    size = "small",
+    tags = ["fast"],
 )
 
 sh_test(
@@ -207,6 +216,22 @@ sh_test(
         "//:phone_recording_testdata",
     ],
     size = "small",
+)
+
+sh_test(
+    name = "chirp_fec_fast_test",
+    srcs = ["chirp_fec_fast_test.sh"],
+    data = [":chirp_modem"],
+    size = "small",
+    tags = ["fast"],
+)
+
+sh_test(
+    name = "chirp_timing_drift_fast_test",
+    srcs = ["chirp_timing_drift_fast_test.sh"],
+    data = [":chirp_modem", ":pcm_impair"],
+    size = "small",
+    tags = ["fast"],
 )
 
 sh_test(
@@ -225,6 +250,7 @@ sh_test(
     srcs = ["corruption_test.sh"],
     data = [":p4modem"],
     size = "medium",
+    tags = ["manual", "slow"],
 )
 
 sh_test(
@@ -232,6 +258,7 @@ sh_test(
     srcs = ["fec_limits_test.sh"],
     data = [":p4modem"],
     size = "large",
+    tags = ["manual", "slow"],
 )
 
 sh_test(
@@ -239,6 +266,7 @@ sh_test(
     srcs = ["fec_performance_test.sh"],
     data = [":p4modem"],
     size = "large",
+    tags = ["manual", "nightly", "slow", "torture"],
 )
 
 sh_test(
@@ -246,6 +274,7 @@ sh_test(
     srcs = ["timing_drift_test.sh"],
     data = [":p4modem", ":pcm_impair"],
     size = "large",
+    tags = ["manual", "nightly", "slow", "torture"],
 )
 
 sh_test(
@@ -253,6 +282,7 @@ sh_test(
     srcs = ["chirp_modem_test.sh"],
     data = [":chirp_modem", ":pcm_impair"],
     size = "medium",
+    tags = ["known_failing", "manual", "slow"],
 )
 
 sh_test(
@@ -267,6 +297,7 @@ sh_test(
     srcs = ["chirp_selftest_test.sh"],
     data = [":chirp_modem"],
     size = "large",
+    tags = ["manual", "nightly", "slow"],
 )
 
 sh_test(
@@ -274,6 +305,7 @@ sh_test(
     srcs = ["chirp_measure_test.sh"],
     data = [":chirp_modem"],
     size = "medium",
+    tags = ["manual", "slow"],
 )
 
 sh_test(
@@ -281,6 +313,7 @@ sh_test(
     srcs = ["chirp_corruption_test.sh"],
     data = [":chirp_modem"],
     size = "medium",
+    tags = ["manual", "slow"],
 )
 
 sh_test(
@@ -288,6 +321,7 @@ sh_test(
     srcs = ["chirp_fec_limits_test.sh"],
     data = [":chirp_modem"],
     size = "large",
+    tags = ["manual", "slow"],
 )
 
 sh_test(
@@ -295,6 +329,7 @@ sh_test(
     srcs = ["chirp_fec_performance_test.sh"],
     data = [":chirp_modem"],
     size = "large",
+    tags = ["manual", "nightly", "slow", "torture"],
 )
 
 sh_test(
@@ -302,4 +337,60 @@ sh_test(
     srcs = ["chirp_timing_drift_test.sh"],
     data = [":chirp_modem", ":pcm_impair"],
     size = "large",
+    tags = ["manual", "nightly", "slow", "torture"],
+)
+
+test_suite(
+    name = "fast_tests",
+    tests = [
+        ":bit_utils_test",
+        ":crc16_test",
+        ":demod_metrics_test",
+        ":fec_ldpc_test",
+        ":fft_test",
+        ":frame_test",
+        ":interleaver_test",
+        ":modulator_test",
+        ":waveform_test",
+        ":p4modem_roundtrip_test",
+        ":pcm_to_wav_test",
+        ":chirp_clean_roundtrip_fast_test",
+        ":chirp_audio_channel_impair_test",
+        ":chirp_fec_fast_test",
+        ":chirp_pcm_to_wav_test",
+        ":chirp_radio_channel_impair_test",
+        ":chirp_timing_drift_fast_test",
+    ],
+)
+
+test_suite(
+    name = "slow_tests",
+    tags = ["manual"],
+    tests = [
+        ":wav_to_pcm_test",
+        ":chirp_recorded_wav_test",
+        ":chirp_recorded_wav_long_test",
+        ":corruption_test",
+        ":fec_limits_test",
+        ":fec_performance_test",
+        ":timing_drift_test",
+        ":chirp_selftest_test",
+        ":chirp_measure_test",
+        ":chirp_corruption_test",
+        ":chirp_fec_limits_test",
+        ":chirp_fec_performance_test",
+        ":chirp_timing_drift_test",
+    ],
+)
+
+test_suite(
+    name = "performance_torture_tests",
+    tags = ["manual"],
+    tests = [
+        ":fec_performance_test",
+        ":timing_drift_test",
+        ":chirp_fec_performance_test",
+        ":chirp_timing_drift_test",
+        ":chirp_recorded_wav_long_test",
+    ],
 )

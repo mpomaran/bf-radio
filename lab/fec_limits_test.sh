@@ -22,6 +22,19 @@ if [ -z "$modem" ]; then
   modem="$(rlocation lab/p4modem)"
 fi
 
+test_start_s=$(date +%s)
+section_start_s=$test_start_s
+encode_invocations=0
+decode_invocations=0
+
+print_timing_summary() {
+  local label="$1"
+  local now_s
+  now_s=$(date +%s)
+  echo "TIMING section=${label} wall_s=$((now_s - section_start_s)) encode_invocations=${encode_invocations} decode_invocations=${decode_invocations}"
+  section_start_s=$now_s
+}
+
 # Generate 256-byte deterministic payload
 printf '\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f' > "$payload"
 for i in {1..15}; do
@@ -29,6 +42,7 @@ for i in {1..15}; do
 done
 
 # Encode once
+encode_invocations=$((encode_invocations + 1))
 "$modem" enc "$payload" "$encoded" 2>&1 | grep -i "encoded" | head -1
 encoded_size=$(wc -c < "$encoded")
 
@@ -42,6 +56,7 @@ test_corruption() {
   local label="$1"
   local testfile="$2"
   
+  decode_invocations=$((decode_invocations + 1))
   if "$modem" dec "$testfile" "$decoded" 2>/dev/null && [ -s "$decoded" ]; then
     decoded_size=$(wc -c < "$decoded")
     errors=$(cmp -l "$payload" "$decoded" 2>/dev/null | wc -l)
@@ -101,6 +116,7 @@ for size in 1 4 8 16 32 64; do
   corrupt_burst "$test_file" 1000 $size
   test_corruption "Burst of $size bytes at offset 1000" "$test_file"
 done
+print_timing_summary "single_burst_sizes"
 
 echo ""
 echo "TEST CATEGORY 2: Burst Position Sensitivity"
@@ -114,6 +130,7 @@ for pos in "${positions[@]}"; do
     test_corruption "8-byte burst at offset $pos" "$test_file"
   fi
 done
+print_timing_summary "burst_position_sensitivity"
 
 echo ""
 echo "TEST CATEGORY 3: Multiple Bursts"
@@ -132,6 +149,7 @@ corrupt_burst "$test_3burst" 500 4
 corrupt_burst "$test_3burst" 5000 4
 corrupt_burst "$test_3burst" 20000 4
 test_corruption "Three 4-byte bursts spread throughout" "$test_3burst"
+print_timing_summary "multiple_bursts"
 
 echo ""
 echo "TEST CATEGORY 4: Dense Errors"
@@ -145,6 +163,7 @@ for offset in 2000 4000 6000 8000; do
   fi
 done
 test_corruption "4-byte bursts every 2KB (4 total)" "$test_dense"
+print_timing_summary "dense_errors"
 
 echo ""
 echo "TEST CATEGORY 5: Preamble/Sync Region Sensitivity"
@@ -159,6 +178,7 @@ test_sync="$TEST_TMPDIR/test_sync.pcm"
 cp "$encoded" "$test_sync"
 corrupt_burst "$test_sync" 850 4
 test_corruption "4-byte burst in sync region (byte 850)" "$test_sync"
+print_timing_summary "preamble_sync_sensitivity"
 
 echo ""
 echo "=== SUMMARY OF FINDINGS ==="
@@ -170,4 +190,6 @@ echo "  - Encoding Ratio: ~$((encoded_size / 256)):1"
 echo ""
 echo "See README.md for detailed findings and capacity planning."
 echo ""
+section_start_s=$test_start_s
+print_timing_summary "total"
 exit 0

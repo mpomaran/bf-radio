@@ -20,6 +20,19 @@ resolve_tool() {
 
 modem="$(resolve_tool chirp_modem)"
 impair="$(resolve_tool pcm_impair)"
+
+test_start_s=$(date +%s)
+section_start_s=$test_start_s
+encode_invocations=0
+decode_invocations=0
+
+print_timing_summary() {
+  local label="$1"
+  local now_s
+  now_s=$(date +%s)
+  echo "TIMING section=${label} wall_s=$((now_s - section_start_s)) encode_invocations=${encode_invocations} decode_invocations=${decode_invocations}"
+  section_start_s=$now_s
+}
 payload_sizes=(4 8 16 32 64 128 256 512)
 regions=(all)
 scales=(95 100 105)
@@ -35,6 +48,7 @@ make_payload() {
 }
 
 decode_ok() {
+  decode_invocations=$((decode_invocations + 1))
   "$modem" dec "$2" "$3" >/dev/null 2>&1 && cmp -s "$1" "$3"
 }
 
@@ -44,6 +58,7 @@ for payload_size in "${payload_sizes[@]}"; do
   encoded="$TEST_TMPDIR/chirp_encoded_${payload_size}.pcm"
   decoded="$TEST_TMPDIR/chirp_decoded_${payload_size}.bin"
   make_payload "$payload_size" "$payload"
+  encode_invocations=$((encode_invocations + 1))
   "$modem" enc "$payload" "$encoded" >/dev/null 2>&1
   decode_ok "$payload" "$encoded" "$decoded" || { echo "FAIL clean roundtrip payload=${payload_size}B"; exit 1; }
   echo "PAYLOAD ${payload_size}B"
@@ -67,6 +82,9 @@ for payload_size in "${payload_sizes[@]}"; do
       echo "  RESULT payload=${payload_size}B region=$region bitflips=$bitflip ok=[$ok_scales ] fail=[$fail_scales ]"
     done
   done
+  print_timing_summary "payload_${payload_size}B"
 done
 
+section_start_s=$test_start_s
+print_timing_summary "total"
 echo "Chirp timing drift matrix completed"

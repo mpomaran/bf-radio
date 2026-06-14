@@ -17,6 +17,19 @@ rlocation() {
 modem="$(rlocation lab/chirp_modem.exe)"
 if [ -z "$modem" ]; then modem="$(rlocation lab/chirp_modem)"; fi
 
+test_start_s=$(date +%s)
+section_start_s=$test_start_s
+encode_invocations=0
+decode_invocations=0
+
+print_timing_summary() {
+  local label="$1"
+  local now_s
+  now_s=$(date +%s)
+  echo "TIMING section=${label} wall_s=$((now_s - section_start_s)) encode_invocations=${encode_invocations} decode_invocations=${decode_invocations}"
+  section_start_s=$now_s
+}
+
 for ((i=0; i<256; ++i)); do
   printf '%b' "\\x$(printf '%02x' $i)" >> "$payload"
 done
@@ -33,11 +46,14 @@ corrupt_burst() {
 }
 
 roundtrip_ok() {
+  decode_invocations=$((decode_invocations + 1))
   "$modem" dec "$2" "$3" >/dev/null 2>&1 && cmp -s "$1" "$3"
 }
 
+encode_invocations=$((encode_invocations + 1))
 "$modem" enc "$payload" "$encoded" >/dev/null 2>&1
 roundtrip_ok "$payload" "$encoded" "$decoded" || { echo "FAIL clean roundtrip"; exit 1; }
+print_timing_summary "setup_clean_roundtrip"
 encoded_size=$(wc -c < "$encoded")
 data_start=$(((48 + 8) * 128 * 2))
 mid_data_offset=$((data_start + (encoded_size - data_start) / 2))
@@ -67,4 +83,6 @@ for offset in $((data_start)) $((data_start + 2048)) $mid_data_offset; do
   fi
 done
 
+section_start_s=$test_start_s
+print_timing_summary "total"
 echo "Chirp FEC limits test OK"

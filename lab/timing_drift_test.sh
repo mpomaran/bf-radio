@@ -25,6 +25,19 @@ resolve_tool() {
 modem="$(resolve_tool p4modem)"
 impair="$(resolve_tool pcm_impair)"
 
+test_start_s=$(date +%s)
+section_start_s=$test_start_s
+encode_invocations=0
+decode_invocations=0
+
+print_timing_summary() {
+  local label="$1"
+  local now_s
+  now_s=$(date +%s)
+  echo "TIMING section=${label} wall_s=$((now_s - section_start_s)) encode_invocations=${encode_invocations} decode_invocations=${decode_invocations}"
+  section_start_s=$now_s
+}
+
 make_payload() {
   local size="$1"
   local file="$2"
@@ -38,6 +51,7 @@ decode_ok() {
   local original="$1"
   local pcm="$2"
   local decoded="$3"
+  decode_invocations=$((decode_invocations + 1))
   "$modem" dec "$pcm" "$decoded" >/dev/null 2>&1 && cmp -s "$original" "$decoded"
 }
 
@@ -98,6 +112,7 @@ for payload_size in "${payload_sizes[@]}"; do
   encoded="$TEST_TMPDIR/encoded_${payload_size}.pcm"
   decoded="$TEST_TMPDIR/decoded_${payload_size}.bin"
   make_payload "$payload_size" "$payload"
+  encode_invocations=$((encode_invocations + 1))
   "$modem" enc "$payload" "$encoded" >/dev/null 2>&1
 
   if ! decode_ok "$payload" "$encoded" "$decoded"; then
@@ -114,7 +129,10 @@ for payload_size in "${payload_sizes[@]}"; do
       done
     done
   done
+  print_timing_summary "payload_${payload_size}B"
   echo ""
 done
 
+section_start_s=$test_start_s
+print_timing_summary "total"
 echo "Timing drift matrix completed"

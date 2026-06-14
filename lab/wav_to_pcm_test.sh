@@ -24,6 +24,19 @@ find_runfile() {
 pcm_to_wav="$(find_runfile lab/pcm_to_wav)"
 wav_to_pcm="$(find_runfile lab/wav_to_pcm)"
 
+test_start_s=$(date +%s)
+section_start_s=$test_start_s
+encode_invocations=0
+decode_invocations=0
+
+print_timing_summary() {
+  local label="$1"
+  local now_s
+  now_s=$(date +%s)
+  echo "TIMING section=${label} wall_s=$((now_s - section_start_s)) encode_invocations=${encode_invocations} decode_invocations=${decode_invocations}"
+  section_start_s=$now_s
+}
+
 raw="$TEST_TMPDIR/input.pcm"
 wav="$TEST_TMPDIR/input.wav"
 roundtrip="$TEST_TMPDIR/roundtrip.pcm"
@@ -46,9 +59,11 @@ done
 "$pcm_to_wav" "$raw" "$wav" 8000 1 >/dev/null 2>&1
 "$wav_to_pcm" "$wav" "$roundtrip" >/dev/null 2>&1
 cmp -s "$raw" "$roundtrip"
+print_timing_summary "pcm_wav_roundtrip"
 
 "$pcm_to_wav" "$raw" "$wav" 16000 1 >/dev/null 2>&1
 "$wav_to_pcm" "$wav" "$resampled" 8000 >/dev/null 2>&1
+print_timing_summary "resample_16000_to_8000"
 resampled_size=$(wc -c < "$resampled")
 if [ "$resampled_size" -ne 256 ]; then
   echo "Expected 128 samples / 256 bytes after 16000->8000 conversion, got $resampled_size bytes"
@@ -63,6 +78,7 @@ printf '\x00\x80\xff' >> "$wav8"
 printf '\x00\x80\x00\x00\x00\x7f' > "$expected"
 "$wav_to_pcm" "$wav8" "$converted" >/dev/null 2>&1
 cmp -s "$expected" "$converted"
+print_timing_summary "pcm8"
 
 # 24-bit PCM: signed samples -8388608, 0, 8388607 map to full-scale int16.
 printf '\x52\x49\x46\x46\x2d\x00\x00\x00\x57\x41\x56\x45' > "$wav24"
@@ -72,6 +88,7 @@ printf '\x00\x00\x80\x00\x00\x00\xff\xff\x7f' >> "$wav24"
 printf '\x00\x80\x00\x00\xff\x7f' > "$expected"
 "$wav_to_pcm" "$wav24" "$converted" >/dev/null 2>&1
 cmp -s "$expected" "$converted"
+print_timing_summary "pcm24"
 
 # 32-bit IEEE float: -1.0, 0.0, +1.0 map to clamped full-scale int16.
 printf '\x52\x49\x46\x46\x30\x00\x00\x00\x57\x41\x56\x45' > "$wavf32"
@@ -81,5 +98,8 @@ printf '\x00\x00\x80\xbf\x00\x00\x00\x00\x00\x00\x80\x3f' >> "$wavf32"
 printf '\x00\x80\x00\x00\xff\x7f' > "$expected"
 "$wav_to_pcm" "$wavf32" "$converted" >/dev/null 2>&1
 cmp -s "$expected" "$converted"
+print_timing_summary "float32"
 
+section_start_s=$test_start_s
+print_timing_summary "total"
 echo "WAV to PCM conversion tests OK"

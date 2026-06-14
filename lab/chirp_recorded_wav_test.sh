@@ -26,12 +26,28 @@ wav_to_pcm="$(find_runfile lab/wav_to_pcm)"
 recording="$(rlocation testdata/transmitted.wav)"
 expected="$(rlocation testdata/transmitted.txt)"
 
+test_start_s=$(date +%s)
+section_start_s=$test_start_s
+encode_invocations=0
+decode_invocations=0
+
+print_timing_summary() {
+  local label="$1"
+  local now_s
+  now_s=$(date +%s)
+  echo "TIMING section=${label} wall_s=$((now_s - section_start_s)) encode_invocations=${encode_invocations} decode_invocations=${decode_invocations}"
+  section_start_s=$now_s
+}
+
 pcm="$TEST_TMPDIR/recorded.pcm"
 decoded="$TEST_TMPDIR/decoded.bin"
 log="$TEST_TMPDIR/decode.log"
 
 "$wav_to_pcm" "$recording" "$pcm" 8000 >"$TEST_TMPDIR/convert.log" 2>&1
+print_timing_summary "wav_to_pcm"
+decode_invocations=$((decode_invocations + 1))
 timeout 20 "$chirp_modem" dec "$pcm" "$decoded" >"$log" 2>&1
+print_timing_summary "decode"
 
 if ! grep -q "\[progress\]" "$log"; then
   echo "Decoder did not emit progress output"
@@ -40,4 +56,6 @@ if ! grep -q "\[progress\]" "$log"; then
 fi
 
 cmp -s "$expected" "$decoded"
+section_start_s=$test_start_s
+print_timing_summary "total"
 echo "Recorded WAV decode/progress test OK"

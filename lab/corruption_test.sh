@@ -23,6 +23,19 @@ if [ -z "$modem" ]; then
   modem="$(rlocation lab/p4modem)"
 fi
 
+test_start_s=$(date +%s)
+section_start_s=$test_start_s
+encode_invocations=0
+decode_invocations=0
+
+print_timing_summary() {
+  local label="$1"
+  local now_s
+  now_s=$(date +%s)
+  echo "TIMING section=${label} wall_s=$((now_s - section_start_s)) encode_invocations=${encode_invocations} decode_invocations=${decode_invocations}"
+  section_start_s=$now_s
+}
+
 # Generate 256-byte deterministic payload (0x00-0xFF repeated 16 times)
 printf '\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f' > "$payload"
 for i in {1..15}; do
@@ -33,12 +46,14 @@ echo "=== P4Modem Corruption Test ==="
 echo "Payload: 256 bytes"
 
 # Encode
+encode_invocations=$((encode_invocations + 1))
 "$modem" enc "$payload" "$encoded" 2>&1 | head -1
 encoded_size=$(wc -c < "$encoded")
 echo "Encoded size: $encoded_size bytes"
 echo ""
 
 # Verify baseline: clean encode/decode
+decode_invocations=$((decode_invocations + 1))
 "$modem" dec "$encoded" "$decoded" 2>/dev/null
 if cmp -s "$payload" "$decoded"; then
   echo "OK Baseline: Clean roundtrip verified"
@@ -83,6 +98,7 @@ byte_new=$((16#$byte_hex ^ 1))
 printf "\\x$(printf '%02x' $byte_new)" > "$TEST_TMPDIR/test1.b"
 cat "$TEST_TMPDIR/test1.h" "$TEST_TMPDIR/test1.b" "$TEST_TMPDIR/test1.t" > "$TEST_TMPDIR/test1.pcm"
 
+decode_invocations=$((decode_invocations + 1))
 if "$modem" dec "$TEST_TMPDIR/test1.pcm" "$decoded" 2>/dev/null && [ -s "$decoded" ]; then
   errors=$(cmp -l "$payload" "$decoded" 2>/dev/null | wc -l)
   if [ "$errors" -eq 0 ]; then
@@ -98,6 +114,7 @@ fi
 echo -n "2. 4-byte burst at byte 1000 (data region): "
 cp "$encoded" "$TEST_TMPDIR/test2.pcm"
 corrupt_burst "$TEST_TMPDIR/test2.pcm" 1000 4
+decode_invocations=$((decode_invocations + 1))
 if "$modem" dec "$TEST_TMPDIR/test2.pcm" "$decoded" 2>/dev/null && [ -s "$decoded" ]; then
   errors=$(cmp -l "$payload" "$decoded" 2>/dev/null | wc -l)
   if [ "$errors" -eq 0 ]; then
@@ -113,6 +130,7 @@ fi
 echo -n "3. 16-byte burst at byte 2000 (data region): "
 cp "$encoded" "$TEST_TMPDIR/test3.pcm"
 corrupt_burst "$TEST_TMPDIR/test3.pcm" 2000 16
+decode_invocations=$((decode_invocations + 1))
 if "$modem" dec "$TEST_TMPDIR/test3.pcm" "$decoded" 2>/dev/null && [ -s "$decoded" ]; then
   errors=$(cmp -l "$payload" "$decoded" 2>/dev/null | wc -l)
   if [ "$errors" -eq 0 ]; then
@@ -130,6 +148,7 @@ cp "$encoded" "$TEST_TMPDIR/test4.pcm"
 corrupt_burst "$TEST_TMPDIR/test4.pcm" 500 2
 corrupt_burst "$TEST_TMPDIR/test4.pcm" 1500 2
 corrupt_burst "$TEST_TMPDIR/test4.pcm" 3000 2
+decode_invocations=$((decode_invocations + 1))
 if "$modem" dec "$TEST_TMPDIR/test4.pcm" "$decoded" 2>/dev/null && [ -s "$decoded" ]; then
   errors=$(cmp -l "$payload" "$decoded" 2>/dev/null | wc -l)
   if [ "$errors" -eq 0 ]; then
@@ -147,4 +166,6 @@ echo "- LDPC (3,6) code with rate 0.82 provides excellent burst error recovery"
 echo "- Significantly better spectral efficiency than repetition codes"
 echo "- Suitable for production narrowband FM communications"
 echo ""
+section_start_s=$test_start_s
+print_timing_summary "total"
 exit 0
