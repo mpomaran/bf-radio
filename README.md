@@ -592,6 +592,8 @@ parameters used.
 ./chirp_modem measure [trials-per-snr]         # legacy alias with warning
 ./chirp_modem measure-pcm [trials-per-snr]     # real PCM waveform receiver path
 ./chirp_modem measure-pcm-debug --profile radio --snr 24 --trials 20
+./chirp_modem measure-pcm-sweep --profile radio --trials 100
+./chirp_modem compare-demod --profile radio --snr 9 --trials 100
 ```
 
 `measure-metric` generates deterministic 64-byte payloads, encodes real
@@ -627,6 +629,15 @@ seeded payload/channel generation as `measure-pcm` and prints the trial index,
 sync score, selected candidate span, estimated sample-rate error, header raw
 SER/BER counts, FEC syndrome diagnostics, decoded header bytes before
 validation, and whether the oracle raw candidate would have been error-free.
+
+The real PCM receiver now has explicit demodulator modes. `fixed-maxlog`
+matches the old fixed-scale max-log LLR sign convention. `calibrated-maxlog`
+keeps the same waveform and FEC, but estimates metric noise from receiver-visible
+preamble, sync, and pilot symbols, then uses that to reduce overconfident LLR
+saturation before BP decoding. Pilots also feed timing/template diagnostics and
+are rejected for timing updates when their margin is weak or their timing offset
+is an outlier. This does not change occupied bandwidth, required channel width,
+symbol count, pilot spacing, or FEC rate.
 
 Historical local metric-model run, `./chirp_modem measure-metric 500`, on
 2026-06-13:

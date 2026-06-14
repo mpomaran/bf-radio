@@ -791,6 +791,162 @@ struct SymbolMetrics {
           best_symbol(0), timing_offset(0.0) {}
 };
 
+struct DemodConfig {
+    double llr_scale;
+    double llr_clip;
+    double llr_temperature;
+    bool use_logsumexp_llr;
+    bool use_noise_variance_llr;
+
+    DemodConfig()
+        : llr_scale(6.0), llr_clip(8.0), llr_temperature(1.0),
+          use_logsumexp_llr(false), use_noise_variance_llr(true) {}
+};
+
+static DemodConfig fixed_llr_demod_config() {
+    DemodConfig cfg;
+    cfg.use_noise_variance_llr = false;
+    return cfg;
+}
+
+static DemodConfig calibrated_llr_demod_config() {
+    DemodConfig cfg;
+    cfg.use_noise_variance_llr = true;
+    cfg.llr_scale = 0.50;
+    cfg.llr_clip = 8.0;
+    return cfg;
+}
+
+static const char* llr_mode_name(const DemodConfig& cfg) {
+    if (cfg.use_logsumexp_llr) return "logsumexp";
+    return cfg.use_noise_variance_llr ? "calibrated-maxlog" : "fixed-maxlog";
+}
+
+struct MetricStats {
+    double winner_mean;
+    double loser_mean;
+    double loser_variance;
+    double mean_peak_margin;
+    double llr_saturation_rate;
+    int samples;
+
+    double winner_sum;
+    double loser_sum;
+    double loser_sq_sum;
+    double margin_sum;
+    int loser_samples;
+    int llr_samples;
+    int llr_saturated;
+
+    MetricStats()
+        : winner_mean(0.0), loser_mean(0.0), loser_variance(1.0),
+          mean_peak_margin(0.0), llr_saturation_rate(0.0), samples(0),
+          winner_sum(0.0), loser_sum(0.0), loser_sq_sum(0.0),
+          margin_sum(0.0), loser_samples(0), llr_samples(0),
+          llr_saturated(0) {}
+};
+
+static void metric_stats_observe_known_symbol(MetricStats* stats,
+                                              const SymbolMetrics& m,
+                                              int expected_symbol) {
+    if (stats == nullptr || expected_symbol < 0 || expected_symbol >= ALPHABET) return;
+    double best_loser = -std::numeric_limits<double>::infinity();
+    const double winner = m.metric[size_t(expected_symbol)];
+    for (int s = 0; s < ALPHABET; ++s) {
+        if (s == expected_symbol) continue;
+        const double loser = m.metric[size_t(s)];
+        stats->loser_sum += loser;
+        stats->loser_sq_sum += loser * loser;
+        ++stats->loser_samples;
+        best_loser = std::max(best_loser, loser);
+    }
+    stats->winner_sum += winner;
+    stats->margin_sum += winner - best_loser;
+    ++stats->samples;
+    stats->winner_mean = stats->winner_sum / std::max(1, stats->samples);
+    stats->loser_mean = stats->loser_sum / std::max(1, stats->loser_samples);
+    const double loser_second_moment =
+        stats->loser_sq_sum / std::max(1, stats->loser_samples);
+    stats->loser_variance =
+        std::max(1e-6, loser_second_moment - stats->loser_mean * stats->loser_mean);
+    stats->mean_peak_margin = stats->margin_sum / std::max(1, stats->samples);
+}
+
+static void metric_stats_observe_llr(MetricStats* stats,
+                                     double llr,
+                                     const DemodConfig& cfg) {
+    if (stats == nullptr) return;
+    ++stats->llr_samples;
+    if (std::abs(llr) >= cfg.llr_clip - 1e-9) ++stats->llr_saturated;
+    stats->llr_saturation_rate =
+        double(stats->llr_saturated) / double(std::max(1, stats->llr_samples));
+}
+
+struct TimingLoopConfig {
+    double data_kp;
+    double data_ki;
+    double pilot_kp;
+    double pilot_ki;
+    double max_timing_update;
+    double max_span_step;
+    double confidence_threshold;
+    double pilot_confidence_threshold;
+
+    TimingLoopConfig()
+        : data_kp(0.18), data_ki(0.003), pilot_kp(0.24), pilot_ki(0.006),
+          max_timing_update(4.0), max_span_step(0.08),
+          confidence_threshold(0.055), pilot_confidence_threshold(0.04) {}
+};
+
+static TimingLoopConfig timing_loop_config_for_templates(bool adaptive_templates) {
+    TimingLoopConfig cfg;
+    if (!adaptive_templates) {
+        cfg.data_kp = 0.45;
+        cfg.data_ki = 0.010;
+        cfg.pilot_kp = 0.50;
+        cfg.pilot_ki = 0.016;
+        cfg.max_timing_update = 18.0;
+        cfg.confidence_threshold = 0.035;
+        cfg.pilot_confidence_threshold = 0.025;
+    }
+    return cfg;
+}
+
+static bool pilot_is_strong_for_timing(double margin,
+                                       double timing_offset,
+                                       const TimingLoopConfig& cfg) {
+    return margin > cfg.pilot_confidence_threshold &&
+           std::abs(timing_offset) <= cfg.max_timing_update;
+}
+
+struct TimingDiagnostics {
+    int pilot_count;
+    int pilot_used_for_timing;
+    int pilot_rejected_low_confidence;
+    double pilot_mean_margin;
+    double pilot_timing_offset_rms;
+    double timing_error_rms;
+    double span_estimate_mean;
+    double span_estimate_min;
+    double span_estimate_max;
+
+    double pilot_margin_sum;
+    double pilot_offset_sq_sum;
+    double timing_error_sq_sum;
+    double span_sum;
+    int timing_error_samples;
+    int span_samples;
+
+    TimingDiagnostics()
+        : pilot_count(0), pilot_used_for_timing(0),
+          pilot_rejected_low_confidence(0), pilot_mean_margin(0.0),
+          pilot_timing_offset_rms(0.0), timing_error_rms(0.0),
+          span_estimate_mean(NOMINAL_SPAN), span_estimate_min(NOMINAL_SPAN),
+          span_estimate_max(NOMINAL_SPAN), pilot_margin_sum(0.0),
+          pilot_offset_sq_sum(0.0), timing_error_sq_sum(0.0),
+          span_sum(0.0), timing_error_samples(0), span_samples(0) {}
+};
+
 struct AdaptiveTemplateBank {
     std::array<double, SYMBOL_SAMPLES> base;
     std::array<std::array<std::array<double, SYMBOL_SAMPLES>, 3>, ALPHABET> tpl;
@@ -1109,23 +1265,59 @@ static SymbolMetrics decode_symbol_metrics_at(const std::vector<int16_t>& pcm,
     return best;
 }
 
-static std::array<double, BITS_PER_SYMBOL> symbol_metrics_to_llr(const SymbolMetrics& m) {
+static double logsumexp_metric(const std::array<double, ALPHABET>& metric,
+                               const std::vector<int>& symbols,
+                               double temperature) {
+    if (symbols.empty()) return -std::numeric_limits<double>::infinity();
+    const double temp = std::max(1e-6, temperature);
+    double max_v = -std::numeric_limits<double>::infinity();
+    for (int s : symbols) max_v = std::max(max_v, metric[size_t(s)] / temp);
+    double sum = 0.0;
+    for (int s : symbols) sum += std::exp(metric[size_t(s)] / temp - max_v);
+    return temp * (max_v + std::log(std::max(1e-300, sum)));
+}
+
+static double clamp_llr(double value, double clip) {
+    if (value > clip) return clip;
+    if (value < -clip) return -clip;
+    return value;
+}
+
+static std::array<double, BITS_PER_SYMBOL> symbol_metrics_to_llr(
+    const SymbolMetrics& m,
+    const DemodConfig& cfg = DemodConfig(),
+    MetricStats* stats = nullptr) {
     std::array<double, BITS_PER_SYMBOL> llr = {};
-    const double llr_scale = 6.0;
+    const double variance =
+        cfg.use_noise_variance_llr
+            ? std::max(0.50, stats != nullptr ? stats->loser_variance : 1.0)
+            : 1.0;
 
     for (int bit = 0; bit < BITS_PER_SYMBOL; ++bit) {
         double best0 = -std::numeric_limits<double>::infinity();
         double best1 = -std::numeric_limits<double>::infinity();
+        std::vector<int> symbols0;
+        std::vector<int> symbols1;
         for (int raw = 0; raw < ALPHABET; ++raw) {
             const uint8_t binary_symbol = gray_to_binary4(uint8_t(raw));
             const int value = (binary_symbol >> (BITS_PER_SYMBOL - 1 - bit)) & 1;
-            if (value == 0) best0 = std::max(best0, m.metric[size_t(raw)]);
-            else best1 = std::max(best1, m.metric[size_t(raw)]);
+            if (value == 0) {
+                best0 = std::max(best0, m.metric[size_t(raw)]);
+                if (cfg.use_logsumexp_llr) symbols0.push_back(raw);
+            } else {
+                best1 = std::max(best1, m.metric[size_t(raw)]);
+                if (cfg.use_logsumexp_llr) symbols1.push_back(raw);
+            }
+        }
+        if (cfg.use_logsumexp_llr) {
+            best0 = logsumexp_metric(m.metric, symbols0, cfg.llr_temperature);
+            best1 = logsumexp_metric(m.metric, symbols1, cfg.llr_temperature);
         }
 
         // Positive LLR means binary bit 0 is more likely; negative means bit 1.
-        const double raw = (best0 - best1) * llr_scale;
-        llr[size_t(bit)] = std::max(-8.0, std::min(8.0, raw));
+        const double raw = cfg.llr_scale * (best0 - best1) / variance;
+        llr[size_t(bit)] = clamp_llr(raw, cfg.llr_clip);
+        metric_stats_observe_llr(stats, llr[size_t(bit)], cfg);
     }
     return llr;
 }
@@ -1376,6 +1568,27 @@ static SyncLock find_sync(const std::vector<int16_t>& pcm,
     return refined;
 }
 
+static MetricStats estimate_metric_stats_from_known_symbols(
+    const std::vector<int16_t>& pcm,
+    const SyncLock& lock,
+    const AdaptiveTemplateBank* adaptive) {
+    MetricStats stats;
+    const int sync[SYNC_SYMBOLS] = {15, 1, 14, 2, 13, 3, 12, 4};
+    for (int i = 0; i < PREAMBLE_SYMBOLS; i += 4) {
+        const SymbolMetrics m =
+            decode_symbol_metrics_at(pcm, lock.preamble_pos + i * lock.symbol_span,
+                                     lock.symbol_span, true, adaptive, 0);
+        metric_stats_observe_known_symbol(&stats, m, 0);
+    }
+    for (int i = 0; i < SYNC_SYMBOLS; ++i) {
+        const SymbolMetrics m =
+            decode_symbol_metrics_at(pcm, lock.sync_pos + i * lock.symbol_span,
+                                     lock.symbol_span, true, adaptive, sync[i]);
+        metric_stats_observe_known_symbol(&stats, m, sync[i]);
+    }
+    return stats;
+}
+
 struct TimingState {
     double pos;
     double span;
@@ -1384,27 +1597,54 @@ struct TimingState {
     TimingState(double p, double s) : pos(p), span(s), timing_error_filtered(0.0) {}
 };
 
+static void timing_diag_record_span(TimingDiagnostics* diag, double span) {
+    if (diag == nullptr) return;
+    if (diag->span_samples == 0) {
+        diag->span_estimate_min = span;
+        diag->span_estimate_max = span;
+    } else {
+        diag->span_estimate_min = std::min(diag->span_estimate_min, span);
+        diag->span_estimate_max = std::max(diag->span_estimate_max, span);
+    }
+    diag->span_sum += span;
+    ++diag->span_samples;
+    diag->span_estimate_mean = diag->span_sum / double(diag->span_samples);
+}
+
+static void timing_diag_record_error(TimingDiagnostics* diag, double error) {
+    if (diag == nullptr) return;
+    diag->timing_error_sq_sum += error * error;
+    ++diag->timing_error_samples;
+    diag->timing_error_rms =
+        std::sqrt(diag->timing_error_sq_sum / double(diag->timing_error_samples));
+}
+
+static double clamped_span_step(double step, double max_step) {
+    return std::max(-max_step, std::min(max_step, step));
+}
+
 static std::vector<double> decode_llrs_tracking(const std::vector<int16_t>& pcm,
                                                 double data_pos,
                                                 double symbol_span,
                                                 size_t max_bits = 50000 * BITS_PER_SYMBOL,
                                                 AdaptiveTemplateBank* adaptive = nullptr,
-                                                bool decision_directed_update = false) {
+                                                bool decision_directed_update = false,
+                                                const DemodConfig& demod_cfg = DemodConfig(),
+                                                MetricStats* metric_stats = nullptr,
+                                                TimingDiagnostics* timing_diag = nullptr) {
     std::vector<double> llrs;
     TimingState timing(data_pos, symbol_span);
     const double min_span = NOMINAL_SPAN * 0.85;
     const double max_span = NOMINAL_SPAN * 1.15;
     const bool adaptive_templates = adaptive != nullptr && adaptive->valid;
-    const double confidence_threshold = adaptive_templates ? 0.055 : 0.035;
-    const double timing_update_max_offset = adaptive_templates ? 4.0 : 24.0;
+    const TimingLoopConfig loop_cfg = timing_loop_config_for_templates(adaptive_templates);
     const double template_update_confidence = 0.085;
     const double template_update_best_score = 0.30;
     const double template_update_max_timing_offset = 4.0;
     const double template_learning_rate = 0.010;
-    const double kp = adaptive_templates ? 0.18 : 0.55;
-    const double ki = adaptive_templates ? 0.003 : 0.015;
     size_t data_symbols = 0;
     size_t next_pilot_after = size_t(PILOT_INTERVAL_SYMBOLS);
+    timing_diag_record_span(timing_diag, timing.span);
 
     while (timing.pos + timing.span < double(pcm.size()) && llrs.size() < max_bits) {
         if (data_symbols == next_pilot_after) {
@@ -1419,32 +1659,55 @@ static std::vector<double> decode_llrs_tracking(const std::vector<int16_t>& pcm,
             }
             const double pilot_confidence =
                 pilot.metric[size_t(PILOT_SYMBOL)] - best_other;
+            metric_stats_observe_known_symbol(metric_stats, pilot, PILOT_SYMBOL);
+            if (timing_diag != nullptr) {
+                ++timing_diag->pilot_count;
+                timing_diag->pilot_margin_sum += pilot_confidence;
+                timing_diag->pilot_mean_margin =
+                    timing_diag->pilot_margin_sum /
+                    double(std::max(1, timing_diag->pilot_count));
+                timing_diag->pilot_offset_sq_sum +=
+                    pilot.timing_offset * pilot.timing_offset;
+                timing_diag->pilot_timing_offset_rms =
+                    std::sqrt(timing_diag->pilot_offset_sq_sum /
+                              double(std::max(1, timing_diag->pilot_count)));
+            }
+            const bool strong_pilot =
+                pilot_is_strong_for_timing(pilot_confidence, pilot.timing_offset,
+                                           loop_cfg);
             if (adaptive != nullptr && adaptive->valid &&
                 pilot.metric[size_t(PILOT_SYMBOL)] > 0.20 &&
+                strong_pilot &&
                 std::abs(pilot.timing_offset) <= template_update_max_timing_offset) {
                 update_adaptive_template_bank(adaptive, pcm,
                                               timing.pos + pilot.timing_offset,
                                               timing.span, PILOT_SYMBOL,
                                               template_learning_rate * 1.8);
             }
-            if (pilot_confidence > 0.0 &&
-                std::abs(pilot.timing_offset) <= timing_update_max_offset) {
+            if (strong_pilot) {
+                if (timing_diag != nullptr) ++timing_diag->pilot_used_for_timing;
+                timing_diag_record_error(timing_diag, pilot.timing_offset);
                 timing.timing_error_filtered =
                     0.80 * timing.timing_error_filtered + 0.20 * pilot.timing_offset;
-                timing.span += 1.5 * ki * timing.timing_error_filtered;
+                timing.span += clamped_span_step(loop_cfg.pilot_ki *
+                                                 timing.timing_error_filtered,
+                                                 loop_cfg.max_span_step);
                 timing.span = std::max(min_span, std::min(max_span, timing.span));
-                timing.pos += timing.span + 0.75 * kp * pilot.timing_offset;
+                timing.pos += timing.span + loop_cfg.pilot_kp * pilot.timing_offset;
             } else {
+                if (timing_diag != nullptr) ++timing_diag->pilot_rejected_low_confidence;
                 timing.timing_error_filtered *= 0.98;
                 timing.pos += timing.span;
             }
+            timing_diag_record_span(timing_diag, timing.span);
             next_pilot_after += size_t(PILOT_INTERVAL_SYMBOLS);
             continue;
         }
 
         const SymbolMetrics m =
             decode_symbol_metrics_at(pcm, timing.pos, timing.span, true, adaptive);
-        const std::array<double, BITS_PER_SYMBOL> symbol_llr = symbol_metrics_to_llr(m);
+        const std::array<double, BITS_PER_SYMBOL> symbol_llr =
+            symbol_metrics_to_llr(m, demod_cfg, metric_stats);
         for (double v : symbol_llr) llrs.push_back(v);
         ++data_symbols;
 
@@ -1465,8 +1728,8 @@ static std::vector<double> decode_llrs_tracking(const std::vector<int16_t>& pcm,
                                           template_learning_rate);
         }
 
-        if (confidence > confidence_threshold &&
-            std::abs(m.timing_offset) <= timing_update_max_offset) {
+        if (confidence > loop_cfg.confidence_threshold &&
+            std::abs(m.timing_offset) <= loop_cfg.max_timing_update) {
             /*
               Sign convention:
               - m.timing_offset is the offset, in samples, that maximized the
@@ -1485,13 +1748,17 @@ static std::vector<double> decode_llrs_tracking(const std::vector<int16_t>& pcm,
             */
             timing.timing_error_filtered =
                 0.85 * timing.timing_error_filtered + 0.15 * m.timing_offset;
-            timing.span += ki * timing.timing_error_filtered;
+            timing_diag_record_error(timing_diag, m.timing_offset);
+            timing.span += clamped_span_step(loop_cfg.data_ki *
+                                             timing.timing_error_filtered,
+                                             loop_cfg.max_span_step);
             timing.span = std::max(min_span, std::min(max_span, timing.span));
-            timing.pos += timing.span + kp * m.timing_offset;
+            timing.pos += timing.span + loop_cfg.data_kp * m.timing_offset;
         } else {
             timing.timing_error_filtered *= 0.98;
             timing.pos += timing.span;
         }
+        timing_diag_record_span(timing_diag, timing.span);
     }
     return llrs;
 }
@@ -1696,6 +1963,7 @@ static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pc
 
     const AdaptiveTemplateBank adaptive =
         build_adaptive_template_bank(pcm, lock.preamble_pos, lock.symbol_span);
+    const DemodConfig demod_cfg = calibrated_llr_demod_config();
     progress_message(verbose, progress_clock,
                      adaptive.valid
                          ? "scanner: using preamble-adaptive channel templates"
@@ -1734,6 +2002,8 @@ static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pc
                 AdaptiveTemplateBank working_adaptive = adaptive;
                 AdaptiveTemplateBank* decode_templates =
                     (template_mode == 0 && working_adaptive.valid) ? &working_adaptive : nullptr;
+                MetricStats metric_stats =
+                    estimate_metric_stats_from_known_symbols(pcm, lock, decode_templates);
                 if (template_mode == 1) {
                     progress_message(verbose, progress_clock,
                                      "scanner: retrying candidate with ideal templates",
@@ -1742,7 +2012,8 @@ static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pc
 
                 const std::vector<double> header_llrs =
                     decode_llrs_tracking(pcm, data_pos, candidate_span,
-                                         FEC_CODEWORD_BITS, decode_templates, false);
+                                         FEC_CODEWORD_BITS, decode_templates, false,
+                                         demod_cfg, &metric_stats, nullptr);
                 if (header_llrs.size() < FEC_CODEWORD_BITS) {
                     result.status = StreamScanStatus::NeedMoreSamples;
                     result.discard_prefix_samples = clamp_discard(frame_start, pcm.size());
@@ -1793,7 +2064,8 @@ static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pc
                 const std::vector<double> frame_llrs =
                     decode_llrs_tracking(pcm, data_pos, candidate_span,
                                          required_fec_bits, decode_templates,
-                                         decode_templates != nullptr);
+                                         decode_templates != nullptr,
+                                         demod_cfg, &metric_stats, nullptr);
                 if (frame_llrs.size() < required_fec_bits) {
                     result.status = StreamScanStatus::NeedMoreSamples;
                     result.discard_prefix_samples = clamp_discard(frame_start, pcm.size());
@@ -2198,16 +2470,20 @@ struct DecodeAttemptDiagnostics {
     double estimated_symbol_span;
     double selected_candidate_span;
     std::vector<uint8_t> header_decoded_bytes;
+    MetricStats metric_stats;
+    TimingDiagnostics timing_diag;
 
     DecodeAttemptDiagnostics()
         : ok(false), cause(DecodeFailureCause::Sync), header_fec(), body_fec(),
           sync_locked(false), sync_score(0.0), estimated_symbol_span(0.0),
-          selected_candidate_span(0.0), header_decoded_bytes() {}
+          selected_candidate_span(0.0), header_decoded_bytes(),
+          metric_stats(), timing_diag() {}
 };
 
 static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
     const std::vector<int16_t>& pcm,
-    std::vector<uint8_t>* decoded_payload) {
+    std::vector<uint8_t>* decoded_payload,
+    const DemodConfig& demod_cfg = calibrated_llr_demod_config()) {
     DecodeAttemptDiagnostics diag;
     try {
         const SyncLock lock = find_sync(pcm, false, nullptr);
@@ -2246,9 +2522,13 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
                     AdaptiveTemplateBank working_adaptive = adaptive;
                     AdaptiveTemplateBank* adaptive_ptr =
                         (template_mode == 0 && working_adaptive.valid) ? &working_adaptive : nullptr;
+                    MetricStats metric_stats =
+                        estimate_metric_stats_from_known_symbols(pcm, lock, adaptive_ptr);
+                    TimingDiagnostics timing_diag;
                     std::vector<double> header_llrs =
                         decode_llrs_tracking(pcm, data_pos, candidate_span,
-                                             FEC_CODEWORD_BITS, adaptive_ptr, false);
+                                             FEC_CODEWORD_BITS, adaptive_ptr, false,
+                                             demod_cfg, &metric_stats, &timing_diag);
                     if (header_llrs.size() < FEC_CODEWORD_BITS) {
                         saw_incomplete = true;
                         continue;
@@ -2262,6 +2542,8 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
                         diag.header_fec = header_fec;
                         diag.header_decoded_bytes = header_bytes;
                         diag.selected_candidate_span = candidate_span;
+                        diag.metric_stats = metric_stats;
+                        diag.timing_diag = timing_diag;
                         saw_header_candidate = true;
                     }
 
@@ -2273,6 +2555,8 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
                     diag.header_fec = header_fec;
                     diag.header_decoded_bytes = header_bytes;
                     diag.selected_candidate_span = candidate_span;
+                    diag.metric_stats = metric_stats;
+                    diag.timing_diag = timing_diag;
 
                     const size_t required_symbols =
                         (required_fec_bits + BITS_PER_SYMBOL - 1) / BITS_PER_SYMBOL;
@@ -2291,7 +2575,8 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
                     const std::vector<double> frame_llrs =
                         decode_llrs_tracking(pcm, data_pos, candidate_span,
                                              required_fec_bits, full_adaptive_ptr,
-                                             full_adaptive_ptr != nullptr);
+                                             full_adaptive_ptr != nullptr,
+                                             demod_cfg, &metric_stats, &timing_diag);
                     if (frame_llrs.size() < required_fec_bits) {
                         saw_incomplete = true;
                         continue;
@@ -2302,6 +2587,8 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
                                                                    &payload,
                                                                    &diag.header_fec,
                                                                    &diag.body_fec);
+                    diag.metric_stats = metric_stats;
+                    diag.timing_diag = timing_diag;
                     if (ok) {
                         diag.ok = true;
                         diag.cause = DecodeFailureCause::None;
@@ -2460,34 +2747,52 @@ static void run_statistical_quality_measurement(int trials_per_point = 500) {
     }
 }
 
-static void run_pcm_quality_measurement(int trials_per_point = 2) {
+static void run_pcm_quality_measurement(int trials_per_point = 2,
+                                        const DemodConfig& demod_cfg =
+                                            calibrated_llr_demod_config(),
+                                        const char* profile_filter = nullptr,
+                                        const double* explicit_snr_points = nullptr,
+                                        size_t explicit_snr_point_count = 0,
+                                        bool print_header = true,
+                                        bool include_oracle_metrics = true) {
     if (trials_per_point <= 0) throw std::runtime_error("measure trials must be positive");
     const double smoke_snr_points[] = {24.0};
     const double full_snr_points[] = {24.0, 18.0, 12.0, 6.0, 3.0, 0.0, -3.0, -6.0};
-    const double* snr_points = trials_per_point == 1 ? smoke_snr_points : full_snr_points;
+    const double* snr_points =
+        explicit_snr_points != nullptr ? explicit_snr_points
+                                       : (trials_per_point == 1 ? smoke_snr_points
+                                                                : full_snr_points);
     const size_t snr_point_count =
-        trials_per_point == 1
-            ? sizeof(smoke_snr_points) / sizeof(smoke_snr_points[0])
-            : sizeof(full_snr_points) / sizeof(full_snr_points[0]);
+        explicit_snr_points != nullptr
+            ? explicit_snr_point_count
+            : (trials_per_point == 1
+                   ? sizeof(smoke_snr_points) / sizeof(smoke_snr_points[0])
+                   : sizeof(full_snr_points) / sizeof(full_snr_points[0]));
     const char* profiles[] = {"awgn", "radio"};
     std::mt19937 rng(0xBEEFu);
     const PhyProfile phy = current_phy_profile();
 
-    std::cout
-        << "profile,phy_version,protocol_version,snr_db,trials,"
-        << "sample_rate,symbol_samples,alphabet,bits_per_symbol,"
-        << "pilot_interval,pilot_symbol,fec_rate,legacy_compatible,"
-        << "same_bitrate_as_legacy,same_channel_as_legacy,occupied_audio_bandwidth_hz,"
-        << "required_audio_bandwidth_hz,net_payload_bitrate_bps,"
-        << "coded_bitrate_bps,frame_duration_s,overhead_ratio,"
-        << "estimated_EsN0_db,estimated_EbN0_db,processing_gain_db,"
-        << "sync_fail,header_fec_fail,body_fec_fail,crc_fail,"
-        << "false_lock,incomplete,converged_but_crc,"
-        << "rx_raw_ser,rx_raw_ber,oracle_raw_ser,oracle_raw_ber,"
-        << "per,payload_ber_accepted,header_fec_failed_blocks,"
-        << "body_fec_failed_blocks,max_fec_iterations,max_syndrome_weight,"
-        << "metric_noise_variance,llr_saturation_rate\n";
+    if (print_header) {
+        std::cout
+            << "profile,phy_version,protocol_version,snr_db,trials,"
+            << "sample_rate,symbol_samples,alphabet,bits_per_symbol,"
+            << "pilot_interval,pilot_symbol,fec_rate,legacy_compatible,"
+            << "same_bitrate_as_legacy,same_channel_as_legacy,occupied_audio_bandwidth_hz,"
+            << "required_audio_bandwidth_hz,net_payload_bitrate_bps,"
+            << "coded_bitrate_bps,frame_duration_s,overhead_ratio,"
+            << "estimated_EsN0_db,estimated_EbN0_db,processing_gain_db,"
+            << "sync_fail,header_fec_fail,body_fec_fail,crc_fail,"
+            << "false_lock,incomplete,converged_but_crc,"
+            << "rx_raw_ser,rx_raw_ber,oracle_raw_ser,oracle_raw_ber,"
+            << "per,payload_ber_accepted,header_fec_failed_blocks,"
+            << "body_fec_failed_blocks,max_fec_iterations,max_syndrome_weight,"
+            << "llr_mode,metric_noise_variance,mean_peak_margin,llr_saturation_rate,"
+            << "pilot_count,pilot_used_for_timing,pilot_rejected_low_confidence,"
+            << "pilot_mean_margin,pilot_timing_offset_rms,timing_error_rms,"
+            << "span_estimate_mean,span_estimate_min,span_estimate_max\n";
+    }
     for (const char* profile : profiles) {
+        if (profile_filter != nullptr && std::string(profile) != profile_filter) continue;
         for (size_t snr_index = 0; snr_index < snr_point_count; ++snr_index) {
             const double snr_db = snr_points[snr_index];
             size_t rx_raw_symbols = 0;
@@ -2516,6 +2821,19 @@ static void run_pcm_quality_measurement(int trials_per_point = 2) {
             size_t tx_bits_accum = 0;
             size_t payload_bits_accum = 0;
             size_t physical_symbol_accum = 0;
+            double metric_noise_variance_sum = 0.0;
+            double mean_peak_margin_sum = 0.0;
+            double llr_saturation_rate_sum = 0.0;
+            int metric_diag_count = 0;
+            int pilot_count = 0;
+            int pilot_used_for_timing = 0;
+            int pilot_rejected_low_confidence = 0;
+            double pilot_margin_sum = 0.0;
+            double pilot_offset_rms_sum = 0.0;
+            double timing_error_rms_sum = 0.0;
+            double span_mean_sum = 0.0;
+            double span_min = std::numeric_limits<double>::infinity();
+            double span_max = -std::numeric_limits<double>::infinity();
 
             for (int trial = 0; trial < trials_per_point; ++trial) {
                 std::vector<uint8_t> payload(64);
@@ -2551,9 +2869,11 @@ static void run_pcm_quality_measurement(int trials_per_point = 2) {
                 rx_raw_bits += rx_raw.bits;
                 rx_raw_bit_errors += rx_raw.bit_errors;
 
-                const RawLinkMetrics oracle_raw =
-                    measure_oracle_raw_link_metrics(impaired, tx_bits,
-                                                    expected_symbols);
+                RawLinkMetrics oracle_raw;
+                if (include_oracle_metrics) {
+                    oracle_raw = measure_oracle_raw_link_metrics(impaired, tx_bits,
+                                                                 expected_symbols);
+                }
                 oracle_raw_symbols += oracle_raw.symbols;
                 oracle_raw_symbol_errors += oracle_raw.symbol_errors;
                 oracle_raw_bits += oracle_raw.bits;
@@ -2561,7 +2881,7 @@ static void run_pcm_quality_measurement(int trials_per_point = 2) {
 
                 std::vector<uint8_t> decoded;
                 const DecodeAttemptDiagnostics diag =
-                    diagnose_pcm_decode_attempt(impaired, &decoded);
+                    diagnose_pcm_decode_attempt(impaired, &decoded, demod_cfg);
                 header_fec_failed_blocks += size_t(diag.header_fec.failed_blocks);
                 body_fec_failed_blocks += size_t(diag.body_fec.failed_blocks);
                 max_fec_iterations =
@@ -2572,6 +2892,20 @@ static void run_pcm_quality_measurement(int trials_per_point = 2) {
                     std::max(max_syndrome_weight,
                              std::max(diag.header_fec.max_syndrome_weight,
                                       diag.body_fec.max_syndrome_weight));
+                metric_noise_variance_sum += diag.metric_stats.loser_variance;
+                mean_peak_margin_sum += diag.metric_stats.mean_peak_margin;
+                llr_saturation_rate_sum += diag.metric_stats.llr_saturation_rate;
+                ++metric_diag_count;
+                pilot_count += diag.timing_diag.pilot_count;
+                pilot_used_for_timing += diag.timing_diag.pilot_used_for_timing;
+                pilot_rejected_low_confidence +=
+                    diag.timing_diag.pilot_rejected_low_confidence;
+                pilot_margin_sum += diag.timing_diag.pilot_mean_margin;
+                pilot_offset_rms_sum += diag.timing_diag.pilot_timing_offset_rms;
+                timing_error_rms_sum += diag.timing_diag.timing_error_rms;
+                span_mean_sum += diag.timing_diag.span_estimate_mean;
+                span_min = std::min(span_min, diag.timing_diag.span_estimate_min);
+                span_max = std::max(span_max, diag.timing_diag.span_estimate_max);
 
                 if (!diag.ok || decoded != payload) {
                     ++packet_errors;
@@ -2646,6 +2980,22 @@ static void run_pcm_quality_measurement(int trials_per_point = 2) {
                     ? 10.0 * std::log10(phy.occupied_audio_bandwidth_hz /
                                         coded_bitrate)
                     : 0.0;
+            const double metric_noise_variance =
+                metric_noise_variance_sum / double(std::max(1, metric_diag_count));
+            const double mean_peak_margin =
+                mean_peak_margin_sum / double(std::max(1, metric_diag_count));
+            const double llr_saturation_rate =
+                llr_saturation_rate_sum / double(std::max(1, metric_diag_count));
+            const double pilot_mean_margin =
+                pilot_margin_sum / double(std::max(1, metric_diag_count));
+            const double pilot_timing_offset_rms =
+                pilot_offset_rms_sum / double(std::max(1, metric_diag_count));
+            const double timing_error_rms =
+                timing_error_rms_sum / double(std::max(1, metric_diag_count));
+            const double span_estimate_mean =
+                span_mean_sum / double(std::max(1, metric_diag_count));
+            if (!std::isfinite(span_min)) span_min = 0.0;
+            if (!std::isfinite(span_max)) span_max = 0.0;
 
             std::cout << profile << ","
                       << phy.phy_version << ","
@@ -2688,8 +3038,19 @@ static void run_pcm_quality_measurement(int trials_per_point = 2) {
                       << body_fec_failed_blocks << ","
                       << max_fec_iterations << ","
                       << max_syndrome_weight << ","
-                      << 0.0 << ","
-                      << 0.0 << "\n";
+                      << llr_mode_name(demod_cfg) << ","
+                      << metric_noise_variance << ","
+                      << mean_peak_margin << ","
+                      << llr_saturation_rate << ","
+                      << pilot_count << ","
+                      << pilot_used_for_timing << ","
+                      << pilot_rejected_low_confidence << ","
+                      << pilot_mean_margin << ","
+                      << pilot_timing_offset_rms << ","
+                      << timing_error_rms << ","
+                      << span_estimate_mean << ","
+                      << span_min << ","
+                      << span_max << "\n";
         }
     }
 }
@@ -2776,6 +3137,23 @@ static void run_pcm_debug_measurement(const std::string& profile,
                   << diag.header_fec.max_syndrome_weight
                   << " header_fec_total_syndrome_weight="
                   << diag.header_fec.total_syndrome_weight << "\n";
+        std::cout << "llr_mode=" << llr_mode_name(calibrated_llr_demod_config())
+                  << " metric_noise_variance=" << diag.metric_stats.loser_variance
+                  << " mean_peak_margin=" << diag.metric_stats.mean_peak_margin
+                  << " llr_saturation_rate=" << diag.metric_stats.llr_saturation_rate
+                  << "\n";
+        std::cout << "pilot_count=" << diag.timing_diag.pilot_count
+                  << " pilot_used_for_timing=" << diag.timing_diag.pilot_used_for_timing
+                  << " pilot_rejected_low_confidence="
+                  << diag.timing_diag.pilot_rejected_low_confidence
+                  << " pilot_mean_margin=" << diag.timing_diag.pilot_mean_margin
+                  << " pilot_timing_offset_rms="
+                  << diag.timing_diag.pilot_timing_offset_rms
+                  << " timing_error_rms=" << diag.timing_diag.timing_error_rms
+                  << " span_estimate_mean=" << diag.timing_diag.span_estimate_mean
+                  << " span_estimate_min=" << diag.timing_diag.span_estimate_min
+                  << " span_estimate_max=" << diag.timing_diag.span_estimate_max
+                  << "\n";
         std::cout << "header_decoded_bytes_hex="
                   << bytes_to_hex_string(diag.header_decoded_bytes) << "\n";
         std::cout << "oracle_candidate_would_succeed="
@@ -2788,6 +3166,24 @@ static void run_pcm_debug_measurement(const std::string& profile,
     }
 
     std::cout << "no_failure_reproduced=1\n";
+}
+
+static void run_pcm_sweep_measurement(const std::string& profile,
+                                      int trials) {
+    const double sweep_snr_points[] = {24.0, 18.0, 15.0, 12.0, 9.0, 6.0, 3.0, 0.0, -3.0};
+    run_pcm_quality_measurement(trials, calibrated_llr_demod_config(), profile.c_str(),
+                                sweep_snr_points,
+                                sizeof(sweep_snr_points) / sizeof(sweep_snr_points[0]),
+                                true, false);
+}
+
+static void run_compare_demod_measurement(const std::string& profile,
+                                          double snr_db,
+                                          int trials) {
+    run_pcm_quality_measurement(trials, fixed_llr_demod_config(), profile.c_str(),
+                                &snr_db, 1, true, false);
+    run_pcm_quality_measurement(trials, calibrated_llr_demod_config(), profile.c_str(),
+                                &snr_db, 1, false, false);
 }
 
 static void require_true(bool ok, const std::string& name) {
@@ -2872,6 +3268,46 @@ static void run_selftest() {
         std::vector<double> soft(257);
         for (size_t i = 0; i < soft.size(); ++i) soft[i] = double(i) * 0.25 - 12.0;
         require_true(deinterleave_soft(interleave_soft(soft)) == soft, "soft interleaver roundtrip");
+    }
+    {
+        SymbolMetrics m;
+        for (double& v : m.metric) v = 0.0;
+        const uint8_t binary_symbol = 0x0A;
+        const uint8_t raw_symbol = binary_to_gray4(binary_symbol);
+        m.metric[size_t(raw_symbol)] = 1.0;
+        finalize_best_scores(&m);
+
+        const std::array<double, BITS_PER_SYMBOL> fixed =
+            symbol_metrics_to_llr(m, fixed_llr_demod_config(), nullptr);
+        for (int bit = 0; bit < BITS_PER_SYMBOL; ++bit) {
+            const int expected = (binary_symbol >> (BITS_PER_SYMBOL - 1 - bit)) & 1;
+            require_true(expected == 0 ? fixed[size_t(bit)] > 0.0
+                                       : fixed[size_t(bit)] < 0.0,
+                         "fixed LLR ideal sign");
+        }
+
+        MetricStats stats;
+        metric_stats_observe_known_symbol(&stats, m, raw_symbol);
+        require_true(stats.loser_variance > 0.0, "MetricStats positive variance");
+        DemodConfig calibrated = calibrated_llr_demod_config();
+        calibrated.llr_clip = 2.0;
+        const std::array<double, BITS_PER_SYMBOL> cal =
+            symbol_metrics_to_llr(m, calibrated, &stats);
+        for (double v : cal) {
+            require_true(std::isfinite(v), "calibrated LLR finite");
+            require_true(std::abs(v) <= calibrated.llr_clip, "calibrated LLR clamp");
+        }
+
+        TimingLoopConfig timing_cfg;
+        require_true(!pilot_is_strong_for_timing(0.0, 0.25, timing_cfg),
+                     "weak pilot rejected");
+        require_true(pilot_is_strong_for_timing(timing_cfg.pilot_confidence_threshold + 0.1,
+                                                0.25, timing_cfg),
+                     "strong pilot accepted");
+        require_true(!pilot_is_strong_for_timing(timing_cfg.pilot_confidence_threshold + 0.1,
+                                                 timing_cfg.max_timing_update + 1.0,
+                                                 timing_cfg),
+                     "pilot timing outlier rejected");
     }
     {
         require_true(LDPCCodec::has_unique_nonzero_columns(), "FEC unique nonzero columns");
@@ -3136,6 +3572,43 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+        if (argc >= 2 && std::string(argv[1]) == "measure-pcm-sweep") {
+            std::string profile = "radio";
+            int trials = 100;
+            for (int i = 2; i < argc; ++i) {
+                const std::string arg = argv[i];
+                if (arg == "--profile" && i + 1 < argc) {
+                    profile = argv[++i];
+                } else if (arg == "--trials" && i + 1 < argc) {
+                    trials = std::atoi(argv[++i]);
+                } else {
+                    throw std::runtime_error("Unknown measure-pcm-sweep argument");
+                }
+            }
+            run_pcm_sweep_measurement(profile, trials);
+            return 0;
+        }
+
+        if (argc >= 2 && std::string(argv[1]) == "compare-demod") {
+            std::string profile = "radio";
+            double snr_db = 9.0;
+            int trials = 100;
+            for (int i = 2; i < argc; ++i) {
+                const std::string arg = argv[i];
+                if (arg == "--profile" && i + 1 < argc) {
+                    profile = argv[++i];
+                } else if (arg == "--snr" && i + 1 < argc) {
+                    snr_db = std::atof(argv[++i]);
+                } else if (arg == "--trials" && i + 1 < argc) {
+                    trials = std::atoi(argv[++i]);
+                } else {
+                    throw std::runtime_error("Unknown compare-demod argument");
+                }
+            }
+            run_compare_demod_measurement(profile, snr_db, trials);
+            return 0;
+        }
+
         if (argc != 4) {
             std::cerr << "Usage:\n"
                       << "  " << argv[0] << " enc input.bin output.pcm\n"
@@ -3144,7 +3617,9 @@ int main(int argc, char** argv) {
                       << "  " << argv[0] << " measure-metric [trials-per-snr]\n"
                       << "  " << argv[0] << " measure [trials-per-snr]  # legacy alias\n"
                       << "  " << argv[0] << " measure-pcm [trials-per-snr]\n"
-                      << "  " << argv[0] << " measure-pcm-debug --profile radio --snr 24 --trials 20\n";
+                      << "  " << argv[0] << " measure-pcm-debug --profile radio --snr 24 --trials 20\n"
+                      << "  " << argv[0] << " measure-pcm-sweep --profile radio --trials 100\n"
+                      << "  " << argv[0] << " compare-demod --profile radio --snr 9 --trials 100\n";
             return 1;
         }
 
