@@ -644,6 +644,22 @@ parameters used.
 ./chirp_modem compare-demod --profile radio --snr 9 --trials 100
 ```
 
+All receiver commands also accept a global timing-search selector:
+
+```bash
+./chirp_modem --timing-search=local dec input.pcm output.bin   # default fast data path
+./chirp_modem --timing-search=full measure-pcm 1               # old wide data search
+./chirp_modem --timing-search=center measure-pcm-debug --profile awgn --snr 24 --trials 20
+```
+
+`full` checks the wide timing-offset set for every data symbol and is the
+robust/torture-test mode. `local` keeps full search for acquisition, header
+startup, pilots, and low-confidence recovery, then uses a small local data
+symbol search while the timing loop is stable. `center` checks only the
+predicted symbol center for data symbols and is mainly a clean-channel
+benchmark mode. These options do not change the waveform, frame format, FEC, or
+over-the-air compatibility.
+
 `measure-metric` generates deterministic 64-byte payloads, encodes real
 protected modem frames, simulates a CSS metric vector for each transmitted
 symbol, feeds those soft metrics through the real interleaver and BP FEC
@@ -666,7 +682,9 @@ and reports CSV with PHY accounting, coarse failure causes, receiver-selected
 raw SER/BER, oracle debug SER/BER, PER, and accepted-payload BER. Use
 `rx_raw_ser`, `rx_raw_ber`, and `per` for quality claims. The `oracle_raw_*`
 columns are only a diagnostic for "could a better candidate selection have
-helped?".
+helped?". Timing-search diagnostics report the selected profile, how many
+symbols used full/local/center search, and the average timing offsets checked
+per decoded symbol.
 
 The PCM measurement is not yet a calibrated standards-style Eb/N0 compliance
 test. It prints estimated Eb/N0 and processing gain from the configured audio

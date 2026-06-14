@@ -4,6 +4,8 @@ set -euo pipefail
 payload="$TEST_TMPDIR/payload.bin"
 encoded="$TEST_TMPDIR/encoded.pcm"
 decoded="$TEST_TMPDIR/decoded.bin"
+decoded_full="$TEST_TMPDIR/decoded_full.bin"
+decoded_center="$TEST_TMPDIR/decoded_center.bin"
 
 rlocation() {
   local path="$1"
@@ -21,4 +23,8 @@ printf 'fast clean chirp payload' > "$payload"
 "$modem" enc "$payload" "$encoded" >/dev/null 2>&1
 "$modem" dec "$encoded" "$decoded" >/dev/null 2>&1
 cmp -s "$payload" "$decoded"
+"$modem" --timing-search=full dec "$encoded" "$decoded_full" >/dev/null 2>&1
+cmp -s "$payload" "$decoded_full"
+"$modem" --timing-search=center dec "$encoded" "$decoded_center" >/dev/null 2>&1
+cmp -s "$payload" "$decoded_center"
 echo "Fast chirp clean roundtrip OK"

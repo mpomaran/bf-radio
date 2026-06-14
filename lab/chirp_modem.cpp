@@ -172,6 +172,49 @@ struct TimingLoopConfig {
           confidence_threshold(0.055), pilot_confidence_threshold(0.04) {}
 };
 
+enum class TimingSearchProfile {
+    Full,
+    Local,
+    CenterOnly
+};
+
+static TimingSearchProfile g_timing_search_profile = TimingSearchProfile::Local;
+
+static const char* timing_search_profile_name(TimingSearchProfile profile) {
+    switch (profile) {
+        case TimingSearchProfile::Full: return "full";
+        case TimingSearchProfile::Local: return "local";
+        case TimingSearchProfile::CenterOnly: return "center";
+    }
+    return "unknown";
+}
+
+static TimingSearchProfile parse_timing_search_profile(const std::string& value) {
+    if (value == "full") return TimingSearchProfile::Full;
+    if (value == "local") return TimingSearchProfile::Local;
+    if (value == "center") return TimingSearchProfile::CenterOnly;
+    throw std::runtime_error("timing search must be full, local, or center");
+}
+
+static std::vector<std::string> strip_global_timing_search_args(int argc, char** argv) {
+    std::vector<std::string> args;
+    args.reserve(size_t(std::max(0, argc - 1)));
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        const std::string prefix = "--timing-search=";
+        if (arg.compare(0, prefix.size(), prefix) == 0) {
+            g_timing_search_profile = parse_timing_search_profile(arg.substr(prefix.size()));
+        } else if (arg == "--timing-search" && i + 1 < argc) {
+            g_timing_search_profile = parse_timing_search_profile(argv[++i]);
+        } else if (arg == "--timing-search") {
+            throw std::runtime_error("--timing-search requires full, local, or center");
+        } else {
+            args.push_back(arg);
+        }
+    }
+    return args;
+}
+
 static TimingLoopConfig timing_loop_config_for_templates(bool adaptive_templates) {
     TimingLoopConfig cfg;
     if (!adaptive_templates) {
@@ -203,6 +246,10 @@ struct TimingDiagnostics {
     double span_estimate_mean;
     double span_estimate_min;
     double span_estimate_max;
+    int timing_search_full_count;
+    int timing_search_local_count;
+    int timing_search_center_count;
+    double average_offsets_per_symbol;
 
     double pilot_margin_sum;
     double pilot_offset_sq_sum;
@@ -210,15 +257,20 @@ struct TimingDiagnostics {
     double span_sum;
     int timing_error_samples;
     int span_samples;
+    int timing_search_symbols;
+    int timing_search_offsets;
 
     TimingDiagnostics()
         : pilot_count(0), pilot_used_for_timing(0),
           pilot_rejected_low_confidence(0), pilot_mean_margin(0.0),
           pilot_timing_offset_rms(0.0), timing_error_rms(0.0),
           span_estimate_mean(NOMINAL_SPAN), span_estimate_min(NOMINAL_SPAN),
-          span_estimate_max(NOMINAL_SPAN), pilot_margin_sum(0.0),
+          span_estimate_max(NOMINAL_SPAN), timing_search_full_count(0),
+          timing_search_local_count(0), timing_search_center_count(0),
+          average_offsets_per_symbol(0.0), pilot_margin_sum(0.0),
           pilot_offset_sq_sum(0.0), timing_error_sq_sum(0.0),
-          span_sum(0.0), timing_error_samples(0), span_samples(0) {}
+          span_sum(0.0), timing_error_samples(0), span_samples(0),
+          timing_search_symbols(0), timing_search_offsets(0) {}
 };
 
 struct AdaptiveTemplateBank {
@@ -469,21 +521,60 @@ static void finalize_best_scores(SymbolMetrics* m) {
     }
 }
 
+static void timing_diag_record_search(TimingDiagnostics* diag,
+                                      TimingSearchProfile profile,
+                                      int offset_count) {
+    if (diag == nullptr) return;
+    switch (profile) {
+        case TimingSearchProfile::Full:
+            ++diag->timing_search_full_count;
+            break;
+        case TimingSearchProfile::Local:
+            ++diag->timing_search_local_count;
+            break;
+        case TimingSearchProfile::CenterOnly:
+            ++diag->timing_search_center_count;
+            break;
+    }
+    ++diag->timing_search_symbols;
+    diag->timing_search_offsets += offset_count;
+    diag->average_offsets_per_symbol =
+        double(diag->timing_search_offsets) /
+        double(std::max(1, diag->timing_search_symbols));
+}
+
 static SymbolMetrics decode_symbol_metrics_at(const std::vector<int16_t>& pcm,
                                               double pos,
                                               double symbol_span,
                                               bool intermediate,
                                               const AdaptiveTemplateBank* adaptive = nullptr,
-                                              int rank_symbol = -1) {
-    static const double timing_offsets[] = {
+                                              int rank_symbol = -1,
+                                              TimingSearchProfile search_profile =
+                                                  TimingSearchProfile::Full,
+                                              TimingDiagnostics* timing_diag = nullptr) {
+    static const double full_offsets[] = {
         -24.0, -18.0, -12.0, -8.0, -4.0, -2.0, -1.0, -0.5,
         0.0,
         0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 18.0, 24.0
     };
+    static const double local_offsets[] = {-2.0, -1.0, 0.0, 1.0, 2.0};
+    static const double center_offsets[] = {0.0};
+
+    const double* timing_offsets = full_offsets;
+    int timing_offset_count = int(sizeof(full_offsets) / sizeof(full_offsets[0]));
+    if (search_profile == TimingSearchProfile::Local) {
+        timing_offsets = local_offsets;
+        timing_offset_count = int(sizeof(local_offsets) / sizeof(local_offsets[0]));
+    } else if (search_profile == TimingSearchProfile::CenterOnly) {
+        timing_offsets = center_offsets;
+        timing_offset_count = int(sizeof(center_offsets) / sizeof(center_offsets[0]));
+    }
+    timing_diag_record_search(timing_diag, search_profile, timing_offset_count);
 
     SymbolMetrics best;
     double best_rank = -1.0;
-    for (double timing_offset : timing_offsets) {
+    for (int offset_index = 0; offset_index < timing_offset_count; ++offset_index) {
+        const double timing_offset = timing_offsets[offset_index];
         SymbolMetrics current;
         current.timing_offset = timing_offset;
         bool used_fast = false;
@@ -750,7 +841,9 @@ static std::vector<double> decode_llrs_tracking(const std::vector<int16_t>& pcm,
                                                 bool decision_directed_update = false,
                                                 const DemodConfig& demod_cfg = DemodConfig(),
                                                 MetricStats* metric_stats = nullptr,
-                                                TimingDiagnostics* timing_diag = nullptr) {
+                                                TimingDiagnostics* timing_diag = nullptr,
+                                                TimingSearchProfile timing_search_profile =
+                                                    g_timing_search_profile) {
     std::vector<double> llrs;
     TimingState timing(data_pos, symbol_span);
     const double min_span = NOMINAL_SPAN * 0.85;
@@ -763,13 +856,15 @@ static std::vector<double> decode_llrs_tracking(const std::vector<int16_t>& pcm,
     const double template_learning_rate = 0.010;
     size_t data_symbols = 0;
     size_t next_pilot_after = size_t(PILOT_INTERVAL_SYMBOLS);
+    bool timing_search_stable = false;
     timing_diag_record_span(timing_diag, timing.span);
 
     while (timing.pos + timing.span < double(pcm.size()) && llrs.size() < max_bits) {
         if (data_symbols == next_pilot_after) {
             const SymbolMetrics pilot =
                 decode_symbol_metrics_at(pcm, timing.pos, timing.span, true,
-                                         adaptive, PILOT_SYMBOL);
+                                         adaptive, PILOT_SYMBOL,
+                                         TimingSearchProfile::Full, timing_diag);
             double best_other = -1.0;
             for (int s = 0; s < ALPHABET; ++s) {
                 if (s != PILOT_SYMBOL) {
@@ -804,6 +899,7 @@ static std::vector<double> decode_llrs_tracking(const std::vector<int16_t>& pcm,
                                               template_learning_rate * 1.8);
             }
             if (strong_pilot) {
+                timing_search_stable = true;
                 if (timing_diag != nullptr) ++timing_diag->pilot_used_for_timing;
                 timing_diag_record_error(timing_diag, pilot.timing_offset);
                 timing.timing_error_filtered =
@@ -814,6 +910,7 @@ static std::vector<double> decode_llrs_tracking(const std::vector<int16_t>& pcm,
                 timing.span = std::max(min_span, std::min(max_span, timing.span));
                 timing.pos += timing.span + loop_cfg.pilot_kp * pilot.timing_offset;
             } else {
+                timing_search_stable = false;
                 if (timing_diag != nullptr) ++timing_diag->pilot_rejected_low_confidence;
                 timing.timing_error_filtered *= 0.98;
                 timing.pos += timing.span;
@@ -823,14 +920,39 @@ static std::vector<double> decode_llrs_tracking(const std::vector<int16_t>& pcm,
             continue;
         }
 
-        const SymbolMetrics m =
-            decode_symbol_metrics_at(pcm, timing.pos, timing.span, true, adaptive);
+        TimingSearchProfile data_search = TimingSearchProfile::Full;
+        if (timing_search_profile == TimingSearchProfile::CenterOnly) {
+            data_search = TimingSearchProfile::CenterOnly;
+        } else if (timing_search_profile == TimingSearchProfile::Local &&
+                   timing_search_stable &&
+                   std::abs(timing.timing_error_filtered) <= 2.0) {
+            data_search = TimingSearchProfile::Local;
+        }
+
+        SymbolMetrics m =
+            decode_symbol_metrics_at(pcm, timing.pos, timing.span, true, adaptive,
+                                     -1, data_search, timing_diag);
+        double confidence = m.best_score - m.second_best_score;
+        if (timing_search_profile == TimingSearchProfile::Local &&
+            data_search == TimingSearchProfile::Local &&
+            (confidence <= loop_cfg.confidence_threshold ||
+             std::abs(m.timing_offset) > loop_cfg.max_timing_update)) {
+            /*
+              Local search is the normal fast path once timing is stable. If a
+              symbol becomes ambiguous, re-run that same symbol with the full
+              timing-offset set so low-confidence recovery keeps the old robust
+              behavior.
+            */
+            m = decode_symbol_metrics_at(pcm, timing.pos, timing.span, true,
+                                         adaptive, -1, TimingSearchProfile::Full,
+                                         timing_diag);
+            confidence = m.best_score - m.second_best_score;
+        }
         const std::array<double, BITS_PER_SYMBOL> symbol_llr =
             symbol_metrics_to_llr(m, demod_cfg, metric_stats);
         for (double v : symbol_llr) llrs.push_back(v);
         ++data_symbols;
 
-        const double confidence = m.best_score - m.second_best_score;
         if (decision_directed_update && adaptive != nullptr && adaptive->valid &&
             m.best_score > template_update_best_score &&
             confidence > template_update_confidence &&
@@ -849,6 +971,7 @@ static std::vector<double> decode_llrs_tracking(const std::vector<int16_t>& pcm,
 
         if (confidence > loop_cfg.confidence_threshold &&
             std::abs(m.timing_offset) <= loop_cfg.max_timing_update) {
+            timing_search_stable = true;
             /*
               Sign convention:
               - m.timing_offset is the offset, in samples, that maximized the
@@ -874,6 +997,7 @@ static std::vector<double> decode_llrs_tracking(const std::vector<int16_t>& pcm,
             timing.span = std::max(min_span, std::min(max_span, timing.span));
             timing.pos += timing.span + loop_cfg.data_kp * m.timing_offset;
         } else {
+            timing_search_stable = false;
             timing.timing_error_filtered *= 0.98;
             timing.pos += timing.span;
         }
@@ -1908,7 +2032,10 @@ static void run_pcm_quality_measurement(int trials_per_point = 2,
             << "llr_mode,metric_noise_variance,mean_peak_margin,llr_saturation_rate,"
             << "pilot_count,pilot_used_for_timing,pilot_rejected_low_confidence,"
             << "pilot_mean_margin,pilot_timing_offset_rms,timing_error_rms,"
-            << "span_estimate_mean,span_estimate_min,span_estimate_max\n";
+            << "span_estimate_mean,span_estimate_min,span_estimate_max,"
+            << "timing_search_profile,timing_search_full_count,"
+            << "timing_search_local_count,timing_search_center_count,"
+            << "average_offsets_per_symbol\n";
     }
     for (const char* profile : profiles) {
         if (profile_filter != nullptr && std::string(profile) != profile_filter) continue;
@@ -1953,6 +2080,10 @@ static void run_pcm_quality_measurement(int trials_per_point = 2,
             double span_mean_sum = 0.0;
             double span_min = std::numeric_limits<double>::infinity();
             double span_max = -std::numeric_limits<double>::infinity();
+            int timing_search_full_count = 0;
+            int timing_search_local_count = 0;
+            int timing_search_center_count = 0;
+            double timing_search_average_offsets_sum = 0.0;
 
             for (int trial = 0; trial < trials_per_point; ++trial) {
                 std::vector<uint8_t> payload(64);
@@ -2025,6 +2156,11 @@ static void run_pcm_quality_measurement(int trials_per_point = 2,
                 span_mean_sum += diag.timing_diag.span_estimate_mean;
                 span_min = std::min(span_min, diag.timing_diag.span_estimate_min);
                 span_max = std::max(span_max, diag.timing_diag.span_estimate_max);
+                timing_search_full_count += diag.timing_diag.timing_search_full_count;
+                timing_search_local_count += diag.timing_diag.timing_search_local_count;
+                timing_search_center_count += diag.timing_diag.timing_search_center_count;
+                timing_search_average_offsets_sum +=
+                    diag.timing_diag.average_offsets_per_symbol;
 
                 if (!diag.ok || decoded != payload) {
                     ++packet_errors;
@@ -2113,6 +2249,9 @@ static void run_pcm_quality_measurement(int trials_per_point = 2,
                 timing_error_rms_sum / double(std::max(1, metric_diag_count));
             const double span_estimate_mean =
                 span_mean_sum / double(std::max(1, metric_diag_count));
+            const double average_offsets_per_symbol =
+                timing_search_average_offsets_sum /
+                double(std::max(1, metric_diag_count));
             if (!std::isfinite(span_min)) span_min = 0.0;
             if (!std::isfinite(span_max)) span_max = 0.0;
 
@@ -2169,7 +2308,12 @@ static void run_pcm_quality_measurement(int trials_per_point = 2,
                       << timing_error_rms << ","
                       << span_estimate_mean << ","
                       << span_min << ","
-                      << span_max << "\n";
+                      << span_max << ","
+                      << timing_search_profile_name(g_timing_search_profile) << ","
+                      << timing_search_full_count << ","
+                      << timing_search_local_count << ","
+                      << timing_search_center_count << ","
+                      << average_offsets_per_symbol << "\n";
         }
     }
 }
@@ -2186,6 +2330,7 @@ static void run_pcm_debug_measurement(const std::string& profile,
     std::cout << "measure-pcm-debug profile=" << profile
               << " snr_db=" << snr_db
               << " trials=" << trials
+              << " timing_search=" << timing_search_profile_name(g_timing_search_profile)
               << " rng_seed=0xBEEF\n";
 
     for (int trial = 0; trial < trials; ++trial) {
@@ -2211,6 +2356,14 @@ static void run_pcm_debug_measurement(const std::string& profile,
             std::cout << "trial=" << trial << " status=ok"
                       << " sync_score=" << diag.sync_score
                       << " selected_candidate_span=" << diag.selected_candidate_span
+                      << " timing_search_full_count="
+                      << diag.timing_diag.timing_search_full_count
+                      << " timing_search_local_count="
+                      << diag.timing_diag.timing_search_local_count
+                      << " timing_search_center_count="
+                      << diag.timing_diag.timing_search_center_count
+                      << " average_offsets_per_symbol="
+                      << diag.timing_diag.average_offsets_per_symbol
                       << "\n";
             continue;
         }
@@ -2272,6 +2425,14 @@ static void run_pcm_debug_measurement(const std::string& profile,
                   << " span_estimate_mean=" << diag.timing_diag.span_estimate_mean
                   << " span_estimate_min=" << diag.timing_diag.span_estimate_min
                   << " span_estimate_max=" << diag.timing_diag.span_estimate_max
+                  << " timing_search_full_count="
+                  << diag.timing_diag.timing_search_full_count
+                  << " timing_search_local_count="
+                  << diag.timing_diag.timing_search_local_count
+                  << " timing_search_center_count="
+                  << diag.timing_diag.timing_search_center_count
+                  << " average_offsets_per_symbol="
+                  << diag.timing_diag.average_offsets_per_symbol
                   << "\n";
         std::cout << "header_decoded_bytes_hex="
                   << bytes_to_hex_string(diag.header_decoded_bytes) << "\n";
@@ -2642,21 +2803,23 @@ static void run_selftest() {
 
 int main(int argc, char** argv) {
     try {
-        if (argc == 2 && std::string(argv[1]) == "selftest") {
+        const std::vector<std::string> args = strip_global_timing_search_args(argc, argv);
+
+        if (args.size() == 1 && args[0] == "selftest") {
             run_selftest();
             return 0;
         }
 
-        if (argc >= 2 && std::string(argv[1]) == "measure-metric") {
-            const int trials = argc >= 3 ? std::atoi(argv[2]) : 500;
+        if (!args.empty() && args[0] == "measure-metric") {
+            const int trials = args.size() >= 2 ? std::atoi(args[1].c_str()) : 500;
             std::cerr << "NOTE: measure-metric is a synthetic metric-channel model, "
                       << "not the real PCM waveform receiver.\n";
             run_statistical_quality_measurement(trials);
             return 0;
         }
 
-        if (argc >= 2 && std::string(argv[1]) == "measure") {
-            const int trials = argc >= 3 ? std::atoi(argv[2]) : 500;
+        if (!args.empty() && args[0] == "measure") {
+            const int trials = args.size() >= 2 ? std::atoi(args[1].c_str()) : 500;
             std::cerr << "WARNING: 'measure' is a legacy alias for synthetic "
                       << "metric-channel measurement; use 'measure-pcm' for "
                       << "waveform/PCM receiver measurement.\n";
@@ -2664,25 +2827,25 @@ int main(int argc, char** argv) {
             return 0;
         }
 
-        if (argc >= 2 && std::string(argv[1]) == "measure-pcm") {
-            const int trials = argc >= 3 ? std::atoi(argv[2]) : 2;
+        if (!args.empty() && args[0] == "measure-pcm") {
+            const int trials = args.size() >= 2 ? std::atoi(args[1].c_str()) : 2;
             print_not_same_bitrate_notice();
             run_pcm_quality_measurement(trials);
             return 0;
         }
 
-        if (argc >= 2 && std::string(argv[1]) == "measure-pcm-debug") {
+        if (!args.empty() && args[0] == "measure-pcm-debug") {
             std::string profile = "radio";
             double snr_db = 24.0;
             int trials = 20;
-            for (int i = 2; i < argc; ++i) {
-                const std::string arg = argv[i];
-                if (arg == "--profile" && i + 1 < argc) {
-                    profile = argv[++i];
-                } else if (arg == "--snr" && i + 1 < argc) {
-                    snr_db = std::atof(argv[++i]);
-                } else if (arg == "--trials" && i + 1 < argc) {
-                    trials = std::atoi(argv[++i]);
+            for (size_t i = 1; i < args.size(); ++i) {
+                const std::string& arg = args[i];
+                if (arg == "--profile" && i + 1 < args.size()) {
+                    profile = args[++i];
+                } else if (arg == "--snr" && i + 1 < args.size()) {
+                    snr_db = std::atof(args[++i].c_str());
+                } else if (arg == "--trials" && i + 1 < args.size()) {
+                    trials = std::atoi(args[++i].c_str());
                 } else {
                     throw std::runtime_error("Unknown measure-pcm-debug argument");
                 }
@@ -2691,15 +2854,15 @@ int main(int argc, char** argv) {
             return 0;
         }
 
-        if (argc >= 2 && std::string(argv[1]) == "measure-pcm-sweep") {
+        if (!args.empty() && args[0] == "measure-pcm-sweep") {
             std::string profile = "radio";
             int trials = 100;
-            for (int i = 2; i < argc; ++i) {
-                const std::string arg = argv[i];
-                if (arg == "--profile" && i + 1 < argc) {
-                    profile = argv[++i];
-                } else if (arg == "--trials" && i + 1 < argc) {
-                    trials = std::atoi(argv[++i]);
+            for (size_t i = 1; i < args.size(); ++i) {
+                const std::string& arg = args[i];
+                if (arg == "--profile" && i + 1 < args.size()) {
+                    profile = args[++i];
+                } else if (arg == "--trials" && i + 1 < args.size()) {
+                    trials = std::atoi(args[++i].c_str());
                 } else {
                     throw std::runtime_error("Unknown measure-pcm-sweep argument");
                 }
@@ -2708,18 +2871,18 @@ int main(int argc, char** argv) {
             return 0;
         }
 
-        if (argc >= 2 && std::string(argv[1]) == "compare-demod") {
+        if (!args.empty() && args[0] == "compare-demod") {
             std::string profile = "radio";
             double snr_db = 9.0;
             int trials = 100;
-            for (int i = 2; i < argc; ++i) {
-                const std::string arg = argv[i];
-                if (arg == "--profile" && i + 1 < argc) {
-                    profile = argv[++i];
-                } else if (arg == "--snr" && i + 1 < argc) {
-                    snr_db = std::atof(argv[++i]);
-                } else if (arg == "--trials" && i + 1 < argc) {
-                    trials = std::atoi(argv[++i]);
+            for (size_t i = 1; i < args.size(); ++i) {
+                const std::string& arg = args[i];
+                if (arg == "--profile" && i + 1 < args.size()) {
+                    profile = args[++i];
+                } else if (arg == "--snr" && i + 1 < args.size()) {
+                    snr_db = std::atof(args[++i].c_str());
+                } else if (arg == "--trials" && i + 1 < args.size()) {
+                    trials = std::atoi(args[++i].c_str());
                 } else {
                     throw std::runtime_error("Unknown compare-demod argument");
                 }
@@ -2728,11 +2891,13 @@ int main(int argc, char** argv) {
             return 0;
         }
 
-        if (argc != 4) {
+        if (args.size() != 3) {
             std::cerr << "Usage:\n"
                       << "  " << argv[0] << " enc input.bin output.pcm\n"
                       << "  " << argv[0] << " dec input.pcm output.bin\n"
                       << "  " << argv[0] << " selftest\n"
+                      << "  " << argv[0]
+                      << " [--timing-search=full|local|center] <command> ...\n"
                       << "  " << argv[0] << " measure-metric [trials-per-snr]\n"
                       << "  " << argv[0] << " measure [trials-per-snr]  # legacy alias\n"
                       << "  " << argv[0] << " measure-pcm [trials-per-snr]\n"
@@ -2742,11 +2907,11 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        const std::string mode = argv[1];
+        const std::string& mode = args[0];
         if (mode == "enc") {
-            encode_file(argv[2], argv[3]);
+            encode_file(args[1], args[2]);
         } else if (mode == "dec") {
-            decode_file(argv[2], argv[3]);
+            decode_file(args[1], args[2]);
         } else {
             throw std::runtime_error("Mode must be enc or dec");
         }

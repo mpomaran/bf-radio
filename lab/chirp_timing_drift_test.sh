@@ -49,7 +49,7 @@ make_payload() {
 
 decode_ok() {
   decode_invocations=$((decode_invocations + 1))
-  "$modem" dec "$2" "$3" >/dev/null 2>&1 && cmp -s "$1" "$3"
+  "$modem" --timing-search=full dec "$2" "$3" >/dev/null 2>&1 && cmp -s "$1" "$3"
 }
 
 echo "=== Chirp timing drift matrix -5..+5% ==="

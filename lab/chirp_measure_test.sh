@@ -66,6 +66,7 @@ fi
 grep -q '^profile,phy_version,protocol_version,snr_db,trials,' "$pcm_out"
 grep -q 'same_bitrate_as_legacy,same_channel_as_legacy' "$pcm_out"
 grep -q 'rx_raw_ser,rx_raw_ber,oracle_raw_ser,oracle_raw_ber' "$pcm_out"
+grep -q 'timing_search_full_count,timing_search_local_count,timing_search_center_count,average_offsets_per_symbol' "$pcm_out"
 grep -q '^awgn,1,1,24,1,' "$pcm_out"
 grep -q '^radio,1,1,24,1,' "$pcm_out"
 
