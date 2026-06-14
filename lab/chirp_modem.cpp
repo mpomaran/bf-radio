@@ -26,69 +26,65 @@
 #include <string>
 #include <vector>
 
-static constexpr int SAMPLE_RATE = 8000;
-static constexpr int SYMBOL_SAMPLES = 128;
-static constexpr int ALPHABET = 16;
-static constexpr int BITS_PER_SYMBOL = 4;
-static constexpr int PREAMBLE_SYMBOLS = 48;
-static constexpr int SYNC_SYMBOLS = 8;
-static constexpr int PILOT_INTERVAL_SYMBOLS = 32;
-static constexpr int PILOT_SYMBOL = 10;
-static constexpr int FEC_INFO_BITS = 64;
-static constexpr int FEC_PARITY_BITS = 64;
-static constexpr int FEC_CODEWORD_BITS = FEC_INFO_BITS + FEC_PARITY_BITS;
-static constexpr int MAX_PAYLOAD_BYTES = 4096;
-static constexpr int PROTOCOL_HEADER_BYTES = 8;
-static constexpr int CRC_BYTES = 2;
-static constexpr int PHY_VERSION = 1;
-static constexpr uint8_t PROTOCOL_VERSION = 1;
-static constexpr double PI = 3.14159265358979323846;
-static constexpr double FREQ_LOW = 700.0;
-static constexpr double FREQ_HIGH = 2300.0;
-static constexpr double AMP = 0.55;
-static constexpr double NOMINAL_SPAN = double(SYMBOL_SAMPLES);
-static constexpr double STREAM_DECODE_SYNC_SCORE_THRESHOLD = 0.28;
-static const uint8_t PROTOCOL_MAGIC[4] = {'C', 'H', 'R', 'P'};
+#include "lab/chirp/bit_utils.h"
+#include "lab/chirp/config.h"
+#include "lab/chirp/fec_ldpc.h"
+#include "lab/chirp/fft.h"
+#include "lab/chirp/file_io.h"
+#include "lab/chirp/frame.h"
+#include "lab/chirp/interleaver.h"
+#include "lab/chirp/pcm_io.h"
 
-struct PhyProfile {
-    int phy_version;
-    int protocol_version;
-    int sample_rate;
-    int symbol_samples;
-    int alphabet;
-    int bits_per_symbol;
-    int preamble_symbols;
-    int sync_symbols;
-    int pilot_interval_symbols;
-    int pilot_symbol;
-    double fec_rate;
-    bool legacy_compatible;
-    bool same_bitrate_as_legacy;
-    bool same_channel_as_legacy;
-    double occupied_audio_bandwidth_hz;
-    double required_audio_bandwidth_hz;
-};
-
-static PhyProfile current_phy_profile() {
-    PhyProfile p;
-    p.phy_version = PHY_VERSION;
-    p.protocol_version = PROTOCOL_VERSION;
-    p.sample_rate = SAMPLE_RATE;
-    p.symbol_samples = SYMBOL_SAMPLES;
-    p.alphabet = ALPHABET;
-    p.bits_per_symbol = BITS_PER_SYMBOL;
-    p.preamble_symbols = PREAMBLE_SYMBOLS;
-    p.sync_symbols = SYNC_SYMBOLS;
-    p.pilot_interval_symbols = PILOT_INTERVAL_SYMBOLS;
-    p.pilot_symbol = PILOT_SYMBOL;
-    p.fec_rate = double(FEC_INFO_BITS) / double(FEC_CODEWORD_BITS);
-    p.legacy_compatible = true;
-    p.same_bitrate_as_legacy = true;
-    p.same_channel_as_legacy = true;
-    p.occupied_audio_bandwidth_hz = FREQ_HIGH - FREQ_LOW;
-    p.required_audio_bandwidth_hz = p.occupied_audio_bandwidth_hz + 200.0;
-    return p;
-}
+using chirp::bits::binary_to_gray4;
+using chirp::bits::bits_to_bytes;
+using chirp::bits::bits_to_symbols;
+using chirp::bits::bytes_to_bits;
+using chirp::bits::descramble_llrs;
+using chirp::bits::gray_to_binary4;
+using chirp::bits::scramble_bits;
+using chirp::config::ALPHABET;
+using chirp::config::AMP;
+using chirp::config::BITS_PER_SYMBOL;
+using chirp::config::CRC_BYTES;
+using chirp::config::FEC_CODEWORD_BITS;
+using chirp::config::FEC_INFO_BITS;
+using chirp::config::FREQ_HIGH;
+using chirp::config::FREQ_LOW;
+using chirp::config::NOMINAL_SPAN;
+using chirp::config::PHY_VERSION;
+using chirp::config::PI;
+using chirp::config::PILOT_INTERVAL_SYMBOLS;
+using chirp::config::PILOT_SYMBOL;
+using chirp::config::PREAMBLE_SYMBOLS;
+using chirp::config::PROTOCOL_HEADER_BYTES;
+using chirp::config::PROTOCOL_MAGIC;
+using chirp::config::PROTOCOL_VERSION;
+using chirp::config::SAMPLE_RATE;
+using chirp::config::STREAM_DECODE_SYNC_SCORE_THRESHOLD;
+using chirp::config::SYMBOL_SAMPLES;
+using chirp::config::SYNC_SYMBOLS;
+using chirp::config::PhyProfile;
+using chirp::config::current_phy_profile;
+using chirp::dsp::circular_chirp_correlation;
+using chirp::dsp::cyclic_corr_sample;
+using chirp::fec::FecDecodeResult;
+using chirp::fec::LDPCCodec;
+using chirp::fec::fec_decode_bits_from_llr;
+using chirp::fec::fec_decode_bits_from_llr_result;
+using chirp::fec::fec_decode_bits_hard;
+using chirp::fec::fec_encode_bits;
+using chirp::frame::build_protected_frame;
+using chirp::frame::fec_bits_for_info_bytes;
+using chirp::frame::parse_protected_frame;
+using chirp::frame::parse_protected_header;
+using chirp::interleave::deinterleave;
+using chirp::interleave::deinterleave_soft;
+using chirp::interleave::interleave;
+using chirp::interleave::interleave_soft;
+using chirp::io::read_file;
+using chirp::io::read_pcm16;
+using chirp::io::write_file;
+using chirp::io::write_pcm16;
 
 static void print_not_same_bitrate_notice() {
     const PhyProfile p = current_phy_profile();
@@ -109,120 +105,6 @@ static void progress_message(bool enabled,
     std::cerr << "[progress] " << message << "\n";
 }
 
-static uint16_t crc16_ccitt(const std::vector<uint8_t>& data) {
-    uint16_t crc = 0xFFFF;
-    for (uint8_t b : data) {
-        crc ^= uint16_t(b) << 8;
-        for (int i = 0; i < 8; ++i) {
-            crc = (crc & 0x8000) ? uint16_t((crc << 1) ^ 0x1021) : uint16_t(crc << 1);
-        }
-    }
-    return crc;
-}
-
-static std::vector<uint8_t> read_file(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("Cannot open input file");
-    return std::vector<uint8_t>(std::istreambuf_iterator<char>(f), {});
-}
-
-static void write_file(const std::string& path, const std::vector<uint8_t>& data) {
-    std::ofstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("Cannot open output file");
-    f.write(reinterpret_cast<const char*>(data.data()), std::streamsize(data.size()));
-}
-
-static std::vector<int16_t> read_pcm16(const std::string& path) {
-    auto bytes = read_file(path);
-    if (bytes.size() % 2) bytes.pop_back();
-
-    std::vector<int16_t> pcm;
-    pcm.reserve(bytes.size() / 2);
-    for (size_t i = 0; i < bytes.size(); i += 2) {
-        pcm.push_back(int16_t(uint16_t(bytes[i]) | (uint16_t(bytes[i + 1]) << 8)));
-    }
-    return pcm;
-}
-
-static void write_pcm16(const std::string& path, const std::vector<int16_t>& pcm) {
-    std::vector<uint8_t> bytes;
-    bytes.reserve(pcm.size() * 2);
-    for (int16_t s : pcm) {
-        bytes.push_back(uint8_t(uint16_t(s) & 0xFF));
-        bytes.push_back(uint8_t((uint16_t(s) >> 8) & 0xFF));
-    }
-    write_file(path, bytes);
-}
-
-static std::vector<uint8_t> bytes_to_bits(const std::vector<uint8_t>& bytes) {
-    std::vector<uint8_t> bits;
-    bits.reserve(bytes.size() * 8);
-    for (uint8_t b : bytes) {
-        for (int i = 7; i >= 0; --i) bits.push_back((b >> i) & 1);
-    }
-    return bits;
-}
-
-static std::vector<uint8_t> bits_to_bytes(const std::vector<uint8_t>& bits) {
-    std::vector<uint8_t> bytes((bits.size() + 7) / 8, 0);
-    for (size_t i = 0; i < bits.size(); ++i) {
-        bytes[i / 8] |= uint8_t(bits[i] & 1) << (7 - int(i % 8));
-    }
-    return bytes;
-}
-
-static uint8_t binary_to_gray4(uint8_t x) {
-    x &= 0x0F;
-    return uint8_t((x ^ (x >> 1)) & 0x0F);
-}
-
-static uint8_t gray_to_binary4(uint8_t g) {
-    g &= 0x0F;
-    g ^= uint8_t(g >> 1);
-    g ^= uint8_t(g >> 2);
-    return uint8_t(g & 0x0F);
-}
-
-static std::vector<uint8_t> bits_to_symbols(const std::vector<uint8_t>& bits) {
-    std::vector<uint8_t> symbols;
-    symbols.reserve((bits.size() + BITS_PER_SYMBOL - 1) / BITS_PER_SYMBOL);
-    for (size_t i = 0; i < bits.size(); i += BITS_PER_SYMBOL) {
-        uint8_t binary_symbol = 0;
-        for (int j = 0; j < BITS_PER_SYMBOL; ++j) {
-            binary_symbol <<= 1;
-            if (i + size_t(j) < bits.size()) binary_symbol |= bits[i + size_t(j)] & 1;
-        }
-        symbols.push_back(binary_to_gray4(binary_symbol));
-    }
-    return symbols;
-}
-
-static uint8_t prbs_bit(uint16_t* state) {
-    const uint8_t out = uint8_t(*state & 1U);
-    const uint16_t feedback =
-        uint16_t(((*state >> 0) ^ (*state >> 2) ^ (*state >> 3) ^ (*state >> 5)) & 1U);
-    *state = uint16_t((*state >> 1) | (feedback << 15));
-    return out;
-}
-
-static std::vector<uint8_t> scramble_bits(const std::vector<uint8_t>& bits) {
-    std::vector<uint8_t> out;
-    out.reserve(bits.size());
-    uint16_t state = 0xACE1u;
-    for (uint8_t b : bits) out.push_back(uint8_t((b ^ prbs_bit(&state)) & 1U));
-    return out;
-}
-
-static std::vector<double> descramble_llrs(const std::vector<double>& llrs) {
-    std::vector<double> out;
-    out.reserve(llrs.size());
-    uint16_t state = 0xACE1u;
-    for (double v : llrs) {
-        out.push_back(prbs_bit(&state) ? -v : v);
-    }
-    return out;
-}
-
 static size_t pilot_count_for_data_symbols(size_t data_symbols) {
     if (data_symbols == 0) return 0;
     return (data_symbols - 1) / size_t(PILOT_INTERVAL_SYMBOLS);
@@ -236,374 +118,6 @@ static std::vector<uint8_t> insert_pilot_symbols(const std::vector<uint8_t>& dat
             out.push_back(uint8_t(PILOT_SYMBOL));
         }
         out.push_back(data_symbols[i]);
-    }
-    return out;
-}
-
-/*
-  Small systematic sparse parity-check FEC.
-
-  This is intentionally documented as a compact experimental LDPC-style code,
-  not a standards-compatible LDPC. It uses:
-
-    K = 64 information bits
-    P = 64 parity bits
-    N = 128 total bits, rate 1/2
-
-  H = [A | I], where each information column in A uses up to three row taps:
-
-    rows: n, 11*n+7, 23*n+19 (mod 64)
-
-  The first row index makes all information columns unique. A few columns have
-  two distinct taps because two formulas can hit the same row; duplicate taps
-  are collapsed exactly as they are in info_mask(). Parity columns are unit
-  vectors. Encoding is systematic. Decoding uses full soft-decision sum-product
-  belief propagation in the LLR domain. Positive LLR means bit 0 is more likely;
-  negative LLR means bit 1 is more likely.
-
-  This is still a tiny local experimental code. The decoder algorithm is now a
-  real BP decoder, but the code construction is not WiFi, DVB-S2, or CCSDS LDPC.
-*/
-struct FecDecodeResult {
-    std::vector<uint8_t> bits;
-    bool all_blocks_ok;
-    int block_count;
-    int failed_blocks;
-    int max_iterations;
-    int max_syndrome_weight;
-    int total_syndrome_weight;
-
-    FecDecodeResult()
-        : bits(), all_blocks_ok(true), block_count(0), failed_blocks(0),
-          max_iterations(0), max_syndrome_weight(0), total_syndrome_weight(0) {}
-};
-
-class LDPCCodec {
-    static constexpr int K = FEC_INFO_BITS;
-    static constexpr int P = FEC_PARITY_BITS;
-    static constexpr int N = FEC_CODEWORD_BITS;
-    static constexpr int MAX_CHECK_DEGREE = 4;
-    static constexpr int MAX_ITER = 40;
-    static constexpr double MESSAGE_LIMIT = 18.0;
-    static constexpr double TANH_LIMIT = 1.0 - 1e-12;
-
-public:
-    static std::vector<uint8_t> encode(const std::vector<uint8_t>& info_bits) {
-        std::vector<uint8_t> coded;
-        coded.reserve(((info_bits.size() + K - 1) / K) * N);
-        for (size_t pos = 0; pos < info_bits.size(); pos += K) {
-            std::array<uint8_t, K> chunk = {};
-            for (int i = 0; i < K && pos + size_t(i) < info_bits.size(); ++i) {
-                chunk[size_t(i)] = info_bits[pos + size_t(i)] & 1;
-            }
-            const auto codeword = encode_chunk(chunk);
-            coded.insert(coded.end(), codeword.begin(), codeword.end());
-        }
-        return coded;
-    }
-
-    static std::vector<uint8_t> decode_from_llr(const std::vector<double>& llr_bits) {
-        return decode_from_llr_result(llr_bits).bits;
-    }
-
-    static FecDecodeResult decode_from_llr_result(const std::vector<double>& llr_bits) {
-        FecDecodeResult result;
-        std::vector<uint8_t> decoded;
-        decoded.reserve(((llr_bits.size() + N - 1) / N) * K);
-        for (size_t pos = 0; pos < llr_bits.size(); pos += N) {
-            std::array<double, N> chunk = {};
-            for (int i = 0; i < N; ++i) {
-                chunk[size_t(i)] = (pos + size_t(i) < llr_bits.size()) ? llr_bits[pos + size_t(i)] : 4.0;
-            }
-            const auto decoded_chunk = decode_chunk_from_llr(chunk);
-            decoded.insert(decoded.end(), decoded_chunk.bits.begin(), decoded_chunk.bits.end());
-            ++result.block_count;
-            result.max_iterations = std::max(result.max_iterations, decoded_chunk.iterations);
-            result.max_syndrome_weight =
-                std::max(result.max_syndrome_weight, decoded_chunk.syndrome_weight);
-            result.total_syndrome_weight += decoded_chunk.syndrome_weight;
-            if (!decoded_chunk.ok) ++result.failed_blocks;
-        }
-        result.bits = decoded;
-        result.all_blocks_ok = result.failed_blocks == 0;
-        return result;
-    }
-
-    static std::vector<uint8_t> decode_hard(const std::vector<uint8_t>& bits) {
-        std::vector<double> llr;
-        llr.reserve(bits.size());
-        for (uint8_t b : bits) llr.push_back((b & 1) ? -4.0 : 4.0);
-        return decode_from_llr(llr);
-    }
-
-    static bool has_unique_nonzero_columns() {
-        std::vector<uint64_t> columns;
-        columns.reserve(N);
-        for (int n = 0; n < K; ++n) columns.push_back(info_mask(n));
-        for (int p = 0; p < P; ++p) columns.push_back(uint64_t(1) << p);
-
-        for (size_t i = 0; i < columns.size(); ++i) {
-            if (columns[i] == 0) return false;
-            for (size_t j = i + 1; j < columns.size(); ++j) {
-                if (columns[i] == columns[j]) return false;
-            }
-        }
-        return true;
-    }
-
-private:
-    struct ChunkDecodeResult {
-        std::array<uint8_t, K> bits;
-        bool ok;
-        int iterations;
-        int syndrome_weight;
-
-        ChunkDecodeResult() : bits(), ok(false), iterations(0), syndrome_weight(0) {}
-    };
-
-    static uint64_t info_mask(int n) {
-        const int r0 = n & 63;
-        const int r1 = (11 * n + 7) & 63;
-        const int r2 = (23 * n + 19) & 63;
-        return (uint64_t(1) << r0) | (uint64_t(1) << r1) | (uint64_t(1) << r2);
-    }
-
-    static std::array<uint8_t, N> encode_chunk(const std::array<uint8_t, K>& info) {
-        std::array<uint8_t, N> codeword = {};
-        for (int i = 0; i < K; ++i) codeword[size_t(i)] = info[size_t(i)] & 1;
-
-        for (int p = 0; p < P; ++p) {
-            uint8_t parity = 0;
-            for (int n = 0; n < K; ++n) {
-                if ((info_mask(n) >> p) & 1U) parity ^= info[size_t(n)] & 1;
-            }
-            codeword[size_t(K + p)] = parity;
-        }
-        return codeword;
-    }
-
-    static int compute_syndrome(const std::array<uint8_t, N>& bits,
-                                std::array<uint8_t, P>* syndrome) {
-        int unsatisfied = 0;
-        for (int p = 0; p < P; ++p) {
-            uint8_t parity = bits[size_t(K + p)] & 1;
-            for (int n = 0; n < K; ++n) {
-                if ((info_mask(n) >> p) & 1U) parity ^= bits[size_t(n)] & 1;
-            }
-            (*syndrome)[size_t(p)] = parity;
-            unsatisfied += parity;
-        }
-        return unsatisfied;
-    }
-
-    static int positive_mod(int value, int modulus) {
-        value %= modulus;
-        return value < 0 ? value + modulus : value;
-    }
-
-    static int append_unique_var(std::array<int, MAX_CHECK_DEGREE>* vars,
-                                 int degree,
-                                 int bit) {
-        for (int i = 0; i < degree; ++i) {
-            if ((*vars)[size_t(i)] == bit) return degree;
-        }
-        (*vars)[size_t(degree)] = bit;
-        return degree + 1;
-    }
-
-    static std::array<int, MAX_CHECK_DEGREE> check_variables(int row, int* degree) {
-        /*
-          These are the inverse mappings of:
-            row = n
-            row = 11*n + 7   (mod 64), inverse(11) = 35
-            row = 23*n + 19  (mod 64), inverse(23) = 39
-          The final variable is the systematic parity bit for this row. Duplicate
-          information taps are collapsed so the graph matches info_mask().
-        */
-        std::array<int, MAX_CHECK_DEGREE> vars = {};
-        for (int& v : vars) v = -1;
-        int deg = 0;
-        deg = append_unique_var(&vars, deg, row);
-        deg = append_unique_var(&vars, deg, positive_mod(35 * (row - 7), P));
-        deg = append_unique_var(&vars, deg, positive_mod(39 * (row - 19), P));
-        deg = append_unique_var(&vars, deg, K + row);
-        *degree = deg;
-        return vars;
-    }
-
-    static double clamp_message(double value) {
-        if (value > MESSAGE_LIMIT) return MESSAGE_LIMIT;
-        if (value < -MESSAGE_LIMIT) return -MESSAGE_LIMIT;
-        return value;
-    }
-
-    static std::array<uint8_t, N> hard_decision(const std::array<double, N>& llr) {
-        std::array<uint8_t, N> bits = {};
-        for (int i = 0; i < N; ++i) bits[size_t(i)] = llr[size_t(i)] < 0.0 ? 1 : 0;
-        return bits;
-    }
-
-    static ChunkDecodeResult decode_chunk_from_llr(const std::array<double, N>& input_llr) {
-        std::array<double, N> channel_llr = {};
-        for (int i = 0; i < N; ++i) {
-            channel_llr[size_t(i)] = clamp_message(input_llr[size_t(i)]);
-        }
-
-        std::array<std::array<int, MAX_CHECK_DEGREE>, P> vars = {};
-        std::array<int, P> check_degree = {};
-        std::array<std::array<double, MAX_CHECK_DEGREE>, P> var_to_check = {};
-        std::array<std::array<double, MAX_CHECK_DEGREE>, P> check_to_var = {};
-        for (int row = 0; row < P; ++row) {
-            vars[size_t(row)] = check_variables(row, &check_degree[size_t(row)]);
-            for (int edge = 0; edge < check_degree[size_t(row)]; ++edge) {
-                var_to_check[size_t(row)][size_t(edge)] =
-                    channel_llr[size_t(vars[size_t(row)][size_t(edge)])];
-            }
-        }
-
-        std::array<double, N> posterior = channel_llr;
-        std::array<uint8_t, N> bits = hard_decision(posterior);
-        std::array<uint8_t, P> syndrome = {};
-        int syndrome_weight = compute_syndrome(bits, &syndrome);
-        if (syndrome_weight == 0) {
-            ChunkDecodeResult result;
-            result.ok = true;
-            result.iterations = 0;
-            result.syndrome_weight = 0;
-            for (int i = 0; i < K; ++i) result.bits[size_t(i)] = bits[size_t(i)] & 1;
-            return result;
-        }
-
-        for (int iter = 0; iter < MAX_ITER; ++iter) {
-            for (int row = 0; row < P; ++row) {
-                for (int edge = 0; edge < check_degree[size_t(row)]; ++edge) {
-                    double product = 1.0;
-                    for (int other = 0; other < check_degree[size_t(row)]; ++other) {
-                        if (other == edge) continue;
-                        product *= std::tanh(0.5 * var_to_check[size_t(row)][size_t(other)]);
-                    }
-                    product = std::max(-TANH_LIMIT, std::min(TANH_LIMIT, product));
-                    check_to_var[size_t(row)][size_t(edge)] =
-                        clamp_message(2.0 * std::atanh(product));
-                }
-            }
-
-            posterior = channel_llr;
-            for (int row = 0; row < P; ++row) {
-                for (int edge = 0; edge < check_degree[size_t(row)]; ++edge) {
-                    const int bit = vars[size_t(row)][size_t(edge)];
-                    posterior[size_t(bit)] =
-                        clamp_message(posterior[size_t(bit)] +
-                                      check_to_var[size_t(row)][size_t(edge)]);
-                }
-            }
-
-            bits = hard_decision(posterior);
-            syndrome_weight = compute_syndrome(bits, &syndrome);
-            if (syndrome_weight == 0) {
-                ChunkDecodeResult result;
-                result.ok = true;
-                result.iterations = iter + 1;
-                result.syndrome_weight = 0;
-                for (int i = 0; i < K; ++i) result.bits[size_t(i)] = bits[size_t(i)] & 1;
-                return result;
-            }
-
-            for (int row = 0; row < P; ++row) {
-                for (int edge = 0; edge < check_degree[size_t(row)]; ++edge) {
-                    const int bit = vars[size_t(row)][size_t(edge)];
-                    var_to_check[size_t(row)][size_t(edge)] =
-                        clamp_message(posterior[size_t(bit)] -
-                                      check_to_var[size_t(row)][size_t(edge)]);
-                }
-            }
-        }
-
-        ChunkDecodeResult result;
-        result.ok = false;
-        result.iterations = MAX_ITER;
-        result.syndrome_weight = syndrome_weight;
-        for (int i = 0; i < K; ++i) result.bits[size_t(i)] = bits[size_t(i)] & 1;
-        return result;
-    }
-};
-
-static std::vector<uint8_t> fec_encode_bits(const std::vector<uint8_t>& info_bits) {
-    return LDPCCodec::encode(info_bits);
-}
-
-static std::vector<uint8_t> fec_decode_bits_from_llr(const std::vector<double>& llr_bits) {
-    return LDPCCodec::decode_from_llr(llr_bits);
-}
-
-static FecDecodeResult fec_decode_bits_from_llr_result(const std::vector<double>& llr_bits) {
-    return LDPCCodec::decode_from_llr_result(llr_bits);
-}
-
-static std::vector<uint8_t> fec_decode_bits_hard(const std::vector<uint8_t>& bits) {
-    return LDPCCodec::decode_hard(bits);
-}
-
-static std::vector<uint8_t> interleave(const std::vector<uint8_t>& in,
-                                       int columns = FEC_CODEWORD_BITS) {
-    if (in.empty() || columns <= 1) return in;
-    const size_t cols = size_t(columns);
-    const size_t rows = (in.size() + cols - 1) / cols;
-    std::vector<uint8_t> out;
-    out.reserve(in.size());
-    for (size_t col = 0; col < cols; ++col) {
-        for (size_t row = 0; row < rows; ++row) {
-            const size_t idx = row * cols + col;
-            if (idx < in.size()) out.push_back(in[idx]);
-        }
-    }
-    return out;
-}
-
-static std::vector<uint8_t> deinterleave(const std::vector<uint8_t>& in,
-                                         int columns = FEC_CODEWORD_BITS) {
-    if (in.empty() || columns <= 1) return in;
-    const size_t cols = size_t(columns);
-    const size_t rows = (in.size() + cols - 1) / cols;
-    std::vector<uint8_t> out(in.size(), 0);
-    size_t src = 0;
-    for (size_t col = 0; col < cols; ++col) {
-        for (size_t row = 0; row < rows; ++row) {
-            const size_t dst = row * cols + col;
-            if (dst < in.size()) out[dst] = in[src++];
-        }
-    }
-    return out;
-}
-
-static std::vector<double> interleave_soft(const std::vector<double>& in,
-                                           int columns = FEC_CODEWORD_BITS) {
-    if (in.empty() || columns <= 1) return in;
-    const size_t cols = size_t(columns);
-    const size_t rows = (in.size() + cols - 1) / cols;
-    std::vector<double> out;
-    out.reserve(in.size());
-    for (size_t col = 0; col < cols; ++col) {
-        for (size_t row = 0; row < rows; ++row) {
-            const size_t idx = row * cols + col;
-            if (idx < in.size()) out.push_back(in[idx]);
-        }
-    }
-    return out;
-}
-
-static std::vector<double> deinterleave_soft(const std::vector<double>& in,
-                                             int columns = FEC_CODEWORD_BITS) {
-    if (in.empty() || columns <= 1) return in;
-    const size_t cols = size_t(columns);
-    const size_t rows = (in.size() + cols - 1) / cols;
-    std::vector<double> out(in.size(), 0.0);
-    size_t src = 0;
-    for (size_t col = 0; col < cols; ++col) {
-        for (size_t row = 0; row < rows; ++row) {
-            const size_t dst = row * cols + col;
-            if (dst < in.size()) out[dst] = in[src++];
-        }
     }
     return out;
 }
@@ -635,68 +149,6 @@ static const std::array<double, SYMBOL_SAMPLES>& ideal_base_template_array() {
         return out;
     }();
     return base;
-}
-
-static void fft128(std::array<std::complex<double>, SYMBOL_SAMPLES>* a, bool inverse) {
-    for (int i = 1, j = 0; i < SYMBOL_SAMPLES; ++i) {
-        int bit = SYMBOL_SAMPLES >> 1;
-        for (; (j & bit) != 0; bit >>= 1) j ^= bit;
-        j ^= bit;
-        if (i < j) std::swap((*a)[size_t(i)], (*a)[size_t(j)]);
-    }
-
-    for (int len = 2; len <= SYMBOL_SAMPLES; len <<= 1) {
-        const double angle = (inverse ? 2.0 : -2.0) * PI / double(len);
-        const std::complex<double> wlen(std::cos(angle), std::sin(angle));
-        for (int i = 0; i < SYMBOL_SAMPLES; i += len) {
-            std::complex<double> w(1.0, 0.0);
-            for (int j = 0; j < len / 2; ++j) {
-                const std::complex<double> u = (*a)[size_t(i + j)];
-                const std::complex<double> v = (*a)[size_t(i + j + len / 2)] * w;
-                (*a)[size_t(i + j)] = u + v;
-                (*a)[size_t(i + j + len / 2)] = u - v;
-                w *= wlen;
-            }
-        }
-    }
-
-    if (inverse) {
-        for (std::complex<double>& v : *a) v /= double(SYMBOL_SAMPLES);
-    }
-}
-
-static std::array<double, SYMBOL_SAMPLES> circular_chirp_correlation(
-    const std::array<double, SYMBOL_SAMPLES>& samples,
-    const std::array<double, SYMBOL_SAMPLES>& base) {
-    std::array<std::complex<double>, SYMBOL_SAMPLES> x = {};
-    std::array<std::complex<double>, SYMBOL_SAMPLES> y = {};
-    for (int i = 0; i < SYMBOL_SAMPLES; ++i) {
-        x[size_t(i)] = std::complex<double>(samples[size_t(i)], 0.0);
-        y[size_t(i)] = std::complex<double>(base[size_t(i)], 0.0);
-    }
-
-    fft128(&x, false);
-    fft128(&y, false);
-    for (int i = 0; i < SYMBOL_SAMPLES; ++i) {
-        x[size_t(i)] = std::conj(x[size_t(i)]) * y[size_t(i)];
-    }
-    fft128(&x, true);
-
-    std::array<double, SYMBOL_SAMPLES> corr = {};
-    for (int i = 0; i < SYMBOL_SAMPLES; ++i) {
-        corr[size_t(i)] = x[size_t(i)].real();
-    }
-    return corr;
-}
-
-static double cyclic_corr_sample(const std::array<double, SYMBOL_SAMPLES>& corr,
-                                 double idx) {
-    idx = std::fmod(idx, double(SYMBOL_SAMPLES));
-    if (idx < 0.0) idx += SYMBOL_SAMPLES;
-    const int i0 = int(std::floor(idx));
-    const int i1 = (i0 + 1) & (SYMBOL_SAMPLES - 1);
-    const double frac = idx - double(i0);
-    return corr[size_t(i0)] * (1.0 - frac) + corr[size_t(i1)] * frac;
 }
 
 static double cyclic_sample(const std::vector<double>& wave, double idx) {
@@ -1320,74 +772,6 @@ static std::array<double, BITS_PER_SYMBOL> symbol_metrics_to_llr(
         metric_stats_observe_llr(stats, llr[size_t(bit)], cfg);
     }
     return llr;
-}
-
-static size_t fec_bits_for_info_bytes(size_t info_bytes) {
-    const size_t info_bits = info_bytes * 8;
-    return ((info_bits + FEC_INFO_BITS - 1) / FEC_INFO_BITS) * FEC_CODEWORD_BITS;
-}
-
-static std::vector<uint8_t> build_protected_frame(const std::vector<uint8_t>& payload,
-                                                  const uint8_t magic[4],
-                                                  uint8_t version,
-                                                  uint8_t flags) {
-    if (payload.size() > MAX_PAYLOAD_BYTES) {
-        throw std::runtime_error("Prototype limit: input max 4096 bytes");
-    }
-
-    std::vector<uint8_t> frame;
-    frame.push_back(magic[0]);
-    frame.push_back(magic[1]);
-    frame.push_back(magic[2]);
-    frame.push_back(magic[3]);
-    frame.push_back(version);
-    frame.push_back(uint8_t(payload.size() & 0xFF));
-    frame.push_back(uint8_t((payload.size() >> 8) & 0xFF));
-    frame.push_back(flags);
-
-    std::vector<uint8_t> crc_input = frame;
-    crc_input.insert(crc_input.end(), payload.begin(), payload.end());
-    frame.insert(frame.end(), payload.begin(), payload.end());
-
-    const uint16_t crc = crc16_ccitt(crc_input);
-    frame.push_back(uint8_t(crc & 0xFF));
-    frame.push_back(uint8_t((crc >> 8) & 0xFF));
-    return frame;
-}
-
-static bool parse_protected_header(const std::vector<uint8_t>& bytes,
-                                   uint16_t* payload_len,
-                                   size_t* required_fec_bits) {
-    if (bytes.size() < PROTOCOL_HEADER_BYTES) return false;
-    for (int i = 0; i < 4; ++i) {
-        if (bytes[size_t(i)] != PROTOCOL_MAGIC[i]) return false;
-    }
-    if (bytes[4] != PROTOCOL_VERSION) return false;
-    const uint16_t len = uint16_t(bytes[5]) | (uint16_t(bytes[6]) << 8);
-    if (len > MAX_PAYLOAD_BYTES) return false;
-    if (bytes[7] != 0) return false;
-
-    if (payload_len) *payload_len = len;
-    if (required_fec_bits) {
-        *required_fec_bits = FEC_CODEWORD_BITS + fec_bits_for_info_bytes(size_t(len) + CRC_BYTES);
-    }
-    return true;
-}
-
-static bool parse_protected_frame(const std::vector<uint8_t>& bytes,
-                                  std::vector<uint8_t>* payload) {
-    uint16_t len = 0;
-    if (!parse_protected_header(bytes, &len, nullptr)) return false;
-
-    const size_t frame_len = PROTOCOL_HEADER_BYTES + size_t(len) + CRC_BYTES;
-    if (bytes.size() < frame_len) return false;
-    std::vector<uint8_t> frame(bytes.begin(), bytes.begin() + std::ptrdiff_t(PROTOCOL_HEADER_BYTES + len));
-    const uint16_t got_crc = uint16_t(bytes[frame_len - 2]) |
-                             (uint16_t(bytes[frame_len - 1]) << 8);
-    if (got_crc != crc16_ccitt(frame)) return false;
-    payload->assign(bytes.begin() + PROTOCOL_HEADER_BYTES,
-                    bytes.begin() + std::ptrdiff_t(PROTOCOL_HEADER_BYTES + len));
-    return true;
 }
 
 static std::vector<uint8_t> build_frame_tx_bits(const std::vector<uint8_t>& frame) {
