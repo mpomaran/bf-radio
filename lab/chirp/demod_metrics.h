@@ -31,6 +31,11 @@ struct DemodConfig {
     double llr_temperature;
     bool use_logsumexp_llr;
     bool use_noise_variance_llr;
+    bool use_adaptive_llr;
+    double adaptive_llr_scale;
+    double known_symbol_margin_median;
+    double known_symbol_margin_p05;
+    int known_symbol_count;
 
     DemodConfig();
 };

@@ -18,7 +18,10 @@ SymbolMetrics::SymbolMetrics()
 
 DemodConfig::DemodConfig()
     : llr_scale(6.0), llr_clip(8.0), llr_temperature(1.0),
-      use_logsumexp_llr(false), use_noise_variance_llr(true) {}
+      use_logsumexp_llr(false), use_noise_variance_llr(true),
+      use_adaptive_llr(false), adaptive_llr_scale(1.0),
+      known_symbol_margin_median(0.0), known_symbol_margin_p05(0.0),
+      known_symbol_count(0) {}
 
 DemodConfig fixed_llr_demod_config() {
     DemodConfig cfg;
@@ -148,7 +151,9 @@ std::array<double, config::BITS_PER_SYMBOL> symbol_metrics_to_llr(
         }
 
         // Positive LLR means binary bit 0 is more likely; negative means bit 1.
-        const double raw = cfg.llr_scale * (best0 - best1) / variance;
+        const double effective_scale =
+            cfg.llr_scale * (cfg.use_adaptive_llr ? cfg.adaptive_llr_scale : 1.0);
+        const double raw = effective_scale * (best0 - best1) / variance;
         llr[size_t(bit)] = clamp_llr(raw, cfg.llr_clip);
         metric_stats_observe_llr(stats, llr[size_t(bit)], cfg);
     }

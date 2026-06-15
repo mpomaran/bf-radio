@@ -660,6 +660,19 @@ predicted symbol center for data symbols and is mainly a clean-channel
 benchmark mode. These options do not change the waveform, frame format, FEC, or
 over-the-air compatibility.
 
+The receiver also has an opt-in frame-local LLR calibration mode:
+
+```bash
+./chirp_modem --adaptive-llr dec input.pcm output.bin
+./chirp_modem --adaptive-llr --llr-scale 0.5 --rx-diagnostics dec input.pcm output.bin
+```
+
+`--adaptive-llr` estimates a robust confidence multiplier from known
+preamble/sync/pilot symbols in the received frame. The configured `llr_scale`
+remains the base multiplier, so `--llr-scale` can still be used as a manual
+base scale. This changes only receiver-side soft metrics; it does not change
+the waveform, bitrate, frame format, symbol alphabet, or FEC parameters.
+
 `measure-metric` generates deterministic 64-byte payloads, encodes real
 protected modem frames, simulates a CSS metric vector for each transmitted
 symbol, feeds those soft metrics through the real interleaver and BP FEC

@@ -180,6 +180,9 @@ enum class TimingSearchProfile {
 
 static TimingSearchProfile g_timing_search_profile = TimingSearchProfile::Local;
 static bool g_rx_diagnostics_enabled = false;
+static bool g_adaptive_llr_enabled = false;
+static bool g_manual_llr_scale_set = false;
+static double g_manual_llr_scale = 0.0;
 
 static const char* timing_search_profile_name(TimingSearchProfile profile) {
     switch (profile) {
@@ -197,12 +200,27 @@ static TimingSearchProfile parse_timing_search_profile(const std::string& value)
     throw std::runtime_error("timing search must be full, local, or center");
 }
 
+static double parse_cli_double(const std::string& value, const std::string& name) {
+    size_t parsed = 0;
+    double result = 0.0;
+    try {
+        result = std::stod(value, &parsed);
+    } catch (...) {
+        throw std::runtime_error("Invalid number for " + name + ": " + value);
+    }
+    if (parsed != value.size()) {
+        throw std::runtime_error("Invalid number for " + name + ": " + value);
+    }
+    return result;
+}
+
 static std::vector<std::string> strip_global_receiver_args(int argc, char** argv) {
     std::vector<std::string> args;
     args.reserve(size_t(std::max(0, argc - 1)));
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         const std::string prefix = "--timing-search=";
+        const std::string llr_scale_prefix = "--llr-scale=";
         if (arg.compare(0, prefix.size(), prefix) == 0) {
             g_timing_search_profile = parse_timing_search_profile(arg.substr(prefix.size()));
         } else if (arg == "--timing-search" && i + 1 < argc) {
@@ -211,11 +229,37 @@ static std::vector<std::string> strip_global_receiver_args(int argc, char** argv
             throw std::runtime_error("--timing-search requires full, local, or center");
         } else if (arg == "--rx-diagnostics" || arg == "--diagnostics") {
             g_rx_diagnostics_enabled = true;
+        } else if (arg == "--adaptive-llr") {
+            g_adaptive_llr_enabled = true;
+        } else if (arg == "--no-adaptive-llr") {
+            g_adaptive_llr_enabled = false;
+        } else if (arg.compare(0, llr_scale_prefix.size(), llr_scale_prefix) == 0) {
+            g_manual_llr_scale = parse_cli_double(arg.substr(llr_scale_prefix.size()),
+                                                  "--llr-scale");
+            if (g_manual_llr_scale <= 0.0) {
+                throw std::runtime_error("--llr-scale must be positive");
+            }
+            g_manual_llr_scale_set = true;
+        } else if (arg == "--llr-scale" && i + 1 < argc) {
+            g_manual_llr_scale = parse_cli_double(argv[++i], "--llr-scale");
+            if (g_manual_llr_scale <= 0.0) {
+                throw std::runtime_error("--llr-scale must be positive");
+            }
+            g_manual_llr_scale_set = true;
+        } else if (arg == "--llr-scale") {
+            throw std::runtime_error("--llr-scale requires a positive number");
         } else {
             args.push_back(arg);
         }
     }
     return args;
+}
+
+static DemodConfig receiver_demod_config() {
+    DemodConfig cfg = calibrated_llr_demod_config();
+    if (g_manual_llr_scale_set) cfg.llr_scale = g_manual_llr_scale;
+    cfg.use_adaptive_llr = g_adaptive_llr_enabled;
+    return cfg;
 }
 
 static TimingLoopConfig timing_loop_config_for_templates(bool adaptive_templates) {
@@ -857,6 +901,43 @@ static void timing_diag_record_error(TimingDiagnostics* diag, double error) {
         std::sqrt(diag->timing_error_sq_sum / double(diag->timing_error_samples));
 }
 
+static double percentile_from_samples(std::vector<double> samples, double percentile) {
+    if (samples.empty()) return 0.0;
+    std::sort(samples.begin(), samples.end());
+    const double clamped = std::max(0.0, std::min(100.0, percentile));
+    const size_t index = size_t(std::floor((clamped / 100.0) * double(samples.size() - 1)));
+    return samples[index];
+}
+
+static DemodConfig calibrate_llr_from_known_symbols(const DemodConfig& base,
+                                                    const MetricStats& stats) {
+    DemodConfig cfg = base;
+    cfg.known_symbol_count = stats.samples;
+    cfg.known_symbol_margin_median =
+        percentile_from_samples(stats.margin_samples, 50.0);
+    cfg.known_symbol_margin_p05 =
+        percentile_from_samples(stats.margin_samples, 5.0);
+
+    if (!base.use_adaptive_llr || stats.samples < 4) {
+        cfg.adaptive_llr_scale = 1.0;
+        return cfg;
+    }
+
+    /*
+      The existing llr_scale stays the base/manual multiplier. This frame-local
+      factor gently raises confidence when known-symbol margins are healthy and
+      lowers it when clipping, fading, multipath, or false locks make known
+      symbols ambiguous.
+    */
+    const double robust_margin =
+        std::max(0.0, 0.80 * cfg.known_symbol_margin_median +
+                          0.20 * cfg.known_symbol_margin_p05);
+    const double reference_margin = 8.0;
+    const double raw_scale = robust_margin / reference_margin;
+    cfg.adaptive_llr_scale = std::max(0.25, std::min(4.0, raw_scale));
+    return cfg;
+}
+
 static double clamped_span_step(double step, double max_step) {
     return std::max(-max_step, std::min(max_step, step));
 }
@@ -871,8 +952,14 @@ static std::vector<double> decode_llrs_tracking(const std::vector<int16_t>& pcm,
                                                 MetricStats* metric_stats = nullptr,
                                                 TimingDiagnostics* timing_diag = nullptr,
                                                 TimingSearchProfile timing_search_profile =
-                                                    g_timing_search_profile) {
+                                                    g_timing_search_profile,
+                                                DemodConfig* effective_demod_cfg = nullptr) {
     std::vector<double> llrs;
+    DemodConfig active_demod_cfg =
+        calibrate_llr_from_known_symbols(demod_cfg,
+                                         metric_stats != nullptr ? *metric_stats
+                                                                 : MetricStats());
+    if (effective_demod_cfg != nullptr) *effective_demod_cfg = active_demod_cfg;
     TimingState timing(data_pos, symbol_span);
     const double min_span = NOMINAL_SPAN * 0.85;
     const double max_span = NOMINAL_SPAN * 1.15;
@@ -902,6 +989,11 @@ static std::vector<double> decode_llrs_tracking(const std::vector<int16_t>& pcm,
             const double pilot_confidence =
                 pilot.metric[size_t(PILOT_SYMBOL)] - best_other;
             metric_stats_observe_known_symbol(metric_stats, pilot, PILOT_SYMBOL);
+            active_demod_cfg =
+                calibrate_llr_from_known_symbols(active_demod_cfg,
+                                                 metric_stats != nullptr ? *metric_stats
+                                                                         : MetricStats());
+            if (effective_demod_cfg != nullptr) *effective_demod_cfg = active_demod_cfg;
             if (timing_diag != nullptr) {
                 ++timing_diag->pilot_count;
                 timing_diag->pilot_margin_sum += pilot_confidence;
@@ -977,7 +1069,7 @@ static std::vector<double> decode_llrs_tracking(const std::vector<int16_t>& pcm,
             confidence = m.best_score - m.second_best_score;
         }
         const std::array<double, BITS_PER_SYMBOL> symbol_llr =
-            symbol_metrics_to_llr(m, demod_cfg, metric_stats);
+            symbol_metrics_to_llr(m, active_demod_cfg, metric_stats);
         for (double v : symbol_llr) llrs.push_back(v);
         ++data_symbols;
 
@@ -1145,7 +1237,9 @@ static bool decode_exact_payload_from_llrs(const std::vector<double>& llrs,
 */
 static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pcm,
                                                   bool verbose = false,
-                                                  std::clock_t* progress_clock = nullptr) {
+                                                  std::clock_t* progress_clock = nullptr,
+                                                  const DemodConfig& demod_cfg =
+                                                      calibrated_llr_demod_config()) {
     StreamScanResult result;
     result.status = StreamScanStatus::NoFrameWindowConsumed;
 
@@ -1234,7 +1328,6 @@ static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pc
 
     const AdaptiveTemplateBank adaptive =
         build_adaptive_template_bank(pcm, lock.preamble_pos, lock.symbol_span);
-    const DemodConfig demod_cfg = calibrated_llr_demod_config();
     progress_message(verbose, progress_clock,
                      adaptive.valid
                          ? "scanner: using preamble-adaptive channel templates"
@@ -1379,7 +1472,9 @@ static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pc
 
 static bool decode_payload_from_pcm(const std::vector<int16_t>& pcm,
                                     std::vector<uint8_t>* payload,
-                                    bool verbose = false) {
+                                    bool verbose = false,
+                                    const DemodConfig& demod_cfg =
+                                        calibrated_llr_demod_config()) {
     std::vector<int16_t> buffer = pcm;
     std::clock_t progress_clock = std::clock();
     progress_message(verbose, &progress_clock,
@@ -1391,7 +1486,8 @@ static bool decode_payload_from_pcm(const std::vector<int16_t>& pcm,
                          "decoder: scan iteration " + std::to_string(iter + 1) +
                              ", buffer " + std::to_string(buffer.size()) + " samples",
                          true);
-        const StreamScanResult scan = scan_pcm_window_for_frame(buffer, verbose, &progress_clock);
+        const StreamScanResult scan =
+            scan_pcm_window_for_frame(buffer, verbose, &progress_clock, demod_cfg);
         progress_message(verbose, &progress_clock,
                          "decoder: scanner returned " +
                              std::string(stream_scan_status_name(scan.status)) +
@@ -1424,7 +1520,8 @@ static void decode_file(const std::string& in_pcm_path,
                         bool rx_diagnostics = false) {
     const std::vector<int16_t> pcm = read_pcm16(in_pcm_path);
     std::vector<uint8_t> payload;
-    const bool ok = decode_payload_from_pcm(pcm, &payload, true);
+    const DemodConfig demod_cfg = receiver_demod_config();
+    const bool ok = decode_payload_from_pcm(pcm, &payload, true, demod_cfg);
     if (rx_diagnostics) {
         print_receiver_diagnostics_for_pcm(pcm, ok, payload);
     }
@@ -1759,6 +1856,7 @@ struct DecodeAttemptDiagnostics {
     std::vector<uint8_t> header_decoded_bytes;
     MetricStats metric_stats;
     TimingDiagnostics timing_diag;
+    DemodConfig demod_cfg_used;
 
     DecodeAttemptDiagnostics()
         : ok(false), cause(DecodeFailureCause::Sync), header_fec(), body_fec(),
@@ -1766,7 +1864,7 @@ struct DecodeAttemptDiagnostics {
           detected_start_sample(0), estimated_symbol_span(0.0),
           selected_candidate_span(0.0), number_of_symbols(0), payload_bytes(0),
           required_fec_bits(0), crc_ok(false), header_decoded_bytes(),
-          metric_stats(), timing_diag() {}
+          metric_stats(), timing_diag(), demod_cfg_used() {}
 };
 
 struct ReceiverDiagnostics {
@@ -1784,14 +1882,6 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
     const std::vector<int16_t>& pcm,
     std::vector<uint8_t>* decoded_payload,
     const DemodConfig& demod_cfg);
-
-static double percentile_from_samples(std::vector<double> samples, double percentile) {
-    if (samples.empty()) return 0.0;
-    std::sort(samples.begin(), samples.end());
-    const double clamped = std::max(0.0, std::min(100.0, percentile));
-    const size_t index = size_t(std::floor((clamped / 100.0) * double(samples.size() - 1)));
-    return samples[index];
-}
 
 static double finite_or_zero(double value) {
     return std::isfinite(value) ? value : 0.0;
@@ -1815,6 +1905,11 @@ static void print_receiver_diagnostics_json(const ReceiverDiagnostics& rx) {
         d.header_fec.total_syndrome_weight + d.body_fec.total_syndrome_weight;
     const double margin_min =
         std::isfinite(m.margin_min) ? m.margin_min : 0.0;
+    const DemodConfig& used_cfg =
+        d.demod_cfg_used.known_symbol_count > 0 ? d.demod_cfg_used : rx.demod_cfg;
+    const double llr_scale_used =
+        used_cfg.llr_scale *
+        (used_cfg.use_adaptive_llr ? used_cfg.adaptive_llr_scale : 1.0);
 
     std::cerr
         << "rx_diagnostics={"
@@ -1845,8 +1940,16 @@ static void print_receiver_diagnostics_json(const ReceiverDiagnostics& rx) {
         << "\"llr_max_abs\":" << finite_or_zero(m.llr_max_abs) << ","
         << "\"llr_saturation_count\":" << m.llr_saturated << ","
         << "\"llr_saturation_rate\":" << finite_or_zero(m.llr_saturation_rate) << ","
-        << "\"llr_clip_value\":" << rx.demod_cfg.llr_clip << ","
-        << "\"llr_scale_used\":" << rx.demod_cfg.llr_scale << ","
+        << "\"llr_clip_value\":" << used_cfg.llr_clip << ","
+        << "\"llr_scale_used\":" << finite_or_zero(llr_scale_used) << ","
+        << "\"adaptive_llr_enabled\":"
+        << (used_cfg.use_adaptive_llr ? "true" : "false") << ","
+        << "\"adaptive_llr_scale\":" << finite_or_zero(used_cfg.adaptive_llr_scale) << ","
+        << "\"known_symbol_margin_median\":"
+        << finite_or_zero(used_cfg.known_symbol_margin_median) << ","
+        << "\"known_symbol_margin_p05\":"
+        << finite_or_zero(used_cfg.known_symbol_margin_p05) << ","
+        << "\"known_symbol_count\":" << used_cfg.known_symbol_count << ","
         << "\"ldpc_iterations_used\":" << ldpc_iterations << ","
         << "\"ldpc_decode_success\":" << (ldpc_success ? "true" : "false") << ","
         << "\"fec_failed_blocks\":" << fec_failed_blocks << ","
@@ -1862,7 +1965,7 @@ static void print_receiver_diagnostics_for_pcm(const std::vector<int16_t>& pcm,
                                                const std::vector<uint8_t>& payload) {
     ReceiverDiagnostics rx_diag;
     std::vector<uint8_t> diagnostic_payload;
-    rx_diag.demod_cfg = calibrated_llr_demod_config();
+    rx_diag.demod_cfg = receiver_demod_config();
     rx_diag.decode = diagnose_pcm_decode_attempt(pcm, &diagnostic_payload,
                                                  rx_diag.demod_cfg);
     if (decode_ok && rx_diag.decode.ok && diagnostic_payload.size() != payload.size()) {
@@ -1919,10 +2022,12 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
                     MetricStats metric_stats =
                         estimate_metric_stats_from_known_symbols(pcm, lock, adaptive_ptr);
                     TimingDiagnostics timing_diag;
+                    DemodConfig header_demod_cfg;
                     std::vector<double> header_llrs =
                         decode_llrs_tracking(pcm, data_pos, candidate_span,
                                              FEC_CODEWORD_BITS, adaptive_ptr, false,
-                                             demod_cfg, &metric_stats, &timing_diag);
+                                             demod_cfg, &metric_stats, &timing_diag,
+                                             g_timing_search_profile, &header_demod_cfg);
                     if (header_llrs.size() < FEC_CODEWORD_BITS) {
                         saw_incomplete = true;
                         continue;
@@ -1938,6 +2043,7 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
                         diag.selected_candidate_span = candidate_span;
                         diag.metric_stats = metric_stats;
                         diag.timing_diag = timing_diag;
+                        diag.demod_cfg_used = header_demod_cfg;
                         saw_header_candidate = true;
                     }
 
@@ -1952,6 +2058,7 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
                     diag.required_fec_bits = required_fec_bits;
                     diag.metric_stats = metric_stats;
                     diag.timing_diag = timing_diag;
+                    diag.demod_cfg_used = header_demod_cfg;
 
                     const size_t required_symbols =
                         (required_fec_bits + BITS_PER_SYMBOL - 1) / BITS_PER_SYMBOL;
@@ -1968,11 +2075,13 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
                     AdaptiveTemplateBank full_adaptive = adaptive;
                     AdaptiveTemplateBank* full_adaptive_ptr =
                         (template_mode == 0 && full_adaptive.valid) ? &full_adaptive : nullptr;
+                    DemodConfig full_demod_cfg;
                     const std::vector<double> frame_llrs =
                         decode_llrs_tracking(pcm, data_pos, candidate_span,
                                              required_fec_bits, full_adaptive_ptr,
                                              full_adaptive_ptr != nullptr,
-                                             demod_cfg, &metric_stats, &timing_diag);
+                                             demod_cfg, &metric_stats, &timing_diag,
+                                             g_timing_search_profile, &full_demod_cfg);
                     if (frame_llrs.size() < required_fec_bits) {
                         saw_incomplete = true;
                         continue;
@@ -1985,6 +2094,7 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
                                                                    &diag.body_fec);
                     diag.metric_stats = metric_stats;
                     diag.timing_diag = timing_diag;
+                    diag.demod_cfg_used = full_demod_cfg;
                     if (ok) {
                         diag.ok = true;
                         diag.cause = DecodeFailureCause::None;
@@ -2191,7 +2301,9 @@ static void run_pcm_quality_measurement(int trials_per_point = 2,
             << "span_estimate_mean,span_estimate_min,span_estimate_max,"
             << "timing_search_profile,timing_search_full_count,"
             << "timing_search_local_count,timing_search_center_count,"
-            << "average_offsets_per_symbol\n";
+            << "average_offsets_per_symbol,adaptive_llr_enabled,"
+            << "adaptive_llr_scale,known_symbol_margin_median,"
+            << "known_symbol_margin_p05,known_symbol_count\n";
     }
     for (const char* profile : profiles) {
         if (profile_filter != nullptr && std::string(profile) != profile_filter) continue;
@@ -2240,6 +2352,10 @@ static void run_pcm_quality_measurement(int trials_per_point = 2,
             int timing_search_local_count = 0;
             int timing_search_center_count = 0;
             double timing_search_average_offsets_sum = 0.0;
+            double adaptive_llr_scale_sum = 0.0;
+            double known_symbol_margin_median_sum = 0.0;
+            double known_symbol_margin_p05_sum = 0.0;
+            int known_symbol_count_sum = 0;
 
             for (int trial = 0; trial < trials_per_point; ++trial) {
                 std::vector<uint8_t> payload(64);
@@ -2317,6 +2433,11 @@ static void run_pcm_quality_measurement(int trials_per_point = 2,
                 timing_search_center_count += diag.timing_diag.timing_search_center_count;
                 timing_search_average_offsets_sum +=
                     diag.timing_diag.average_offsets_per_symbol;
+                adaptive_llr_scale_sum += diag.demod_cfg_used.adaptive_llr_scale;
+                known_symbol_margin_median_sum +=
+                    diag.demod_cfg_used.known_symbol_margin_median;
+                known_symbol_margin_p05_sum += diag.demod_cfg_used.known_symbol_margin_p05;
+                known_symbol_count_sum += diag.demod_cfg_used.known_symbol_count;
 
                 if (!diag.ok || decoded != payload) {
                     ++packet_errors;
@@ -2408,6 +2529,12 @@ static void run_pcm_quality_measurement(int trials_per_point = 2,
             const double average_offsets_per_symbol =
                 timing_search_average_offsets_sum /
                 double(std::max(1, metric_diag_count));
+            const double adaptive_llr_scale =
+                adaptive_llr_scale_sum / double(std::max(1, metric_diag_count));
+            const double known_symbol_margin_median =
+                known_symbol_margin_median_sum / double(std::max(1, metric_diag_count));
+            const double known_symbol_margin_p05 =
+                known_symbol_margin_p05_sum / double(std::max(1, metric_diag_count));
             if (!std::isfinite(span_min)) span_min = 0.0;
             if (!std::isfinite(span_max)) span_max = 0.0;
 
@@ -2469,7 +2596,12 @@ static void run_pcm_quality_measurement(int trials_per_point = 2,
                       << timing_search_full_count << ","
                       << timing_search_local_count << ","
                       << timing_search_center_count << ","
-                      << average_offsets_per_symbol << "\n";
+                      << average_offsets_per_symbol << ","
+                      << (demod_cfg.use_adaptive_llr ? 1 : 0) << ","
+                      << adaptive_llr_scale << ","
+                      << known_symbol_margin_median << ","
+                      << known_symbol_margin_p05 << ","
+                      << known_symbol_count_sum << "\n";
         }
     }
 }
@@ -2483,10 +2615,12 @@ static void run_pcm_debug_measurement(const std::string& profile,
     if (trials <= 0) throw std::runtime_error("measure-pcm-debug trials must be positive");
 
     std::mt19937 rng(0xBEEFu);
+    const DemodConfig demod_cfg = receiver_demod_config();
     std::cout << "measure-pcm-debug profile=" << profile
               << " snr_db=" << snr_db
               << " trials=" << trials
               << " timing_search=" << timing_search_profile_name(g_timing_search_profile)
+              << " adaptive_llr=" << (demod_cfg.use_adaptive_llr ? 1 : 0)
               << " rng_seed=0xBEEF\n";
 
     for (int trial = 0; trial < trials; ++trial) {
@@ -2506,7 +2640,7 @@ static void run_pcm_debug_measurement(const std::string& profile,
 
         std::vector<uint8_t> decoded;
         const DecodeAttemptDiagnostics diag =
-            diagnose_pcm_decode_attempt(impaired, &decoded);
+            diagnose_pcm_decode_attempt(impaired, &decoded, demod_cfg);
         const bool payload_ok = diag.ok && decoded == payload;
         if (payload_ok) {
             std::cout << "trial=" << trial << " status=ok"
@@ -2520,6 +2654,12 @@ static void run_pcm_debug_measurement(const std::string& profile,
                       << diag.timing_diag.timing_search_center_count
                       << " average_offsets_per_symbol="
                       << diag.timing_diag.average_offsets_per_symbol
+                      << " adaptive_llr_scale="
+                      << diag.demod_cfg_used.adaptive_llr_scale
+                      << " known_symbol_margin_median="
+                      << diag.demod_cfg_used.known_symbol_margin_median
+                      << " known_symbol_count="
+                      << diag.demod_cfg_used.known_symbol_count
                       << "\n";
             continue;
         }
@@ -2565,10 +2705,14 @@ static void run_pcm_debug_measurement(const std::string& profile,
                   << diag.header_fec.max_syndrome_weight
                   << " header_fec_total_syndrome_weight="
                   << diag.header_fec.total_syndrome_weight << "\n";
-        std::cout << "llr_mode=" << llr_mode_name(calibrated_llr_demod_config())
+        std::cout << "llr_mode=" << llr_mode_name(demod_cfg)
                   << " metric_noise_variance=" << diag.metric_stats.loser_variance
                   << " mean_peak_margin=" << diag.metric_stats.mean_peak_margin
                   << " llr_saturation_rate=" << diag.metric_stats.llr_saturation_rate
+                  << " adaptive_llr_scale=" << diag.demod_cfg_used.adaptive_llr_scale
+                  << " known_symbol_margin_median="
+                  << diag.demod_cfg_used.known_symbol_margin_median
+                  << " known_symbol_count=" << diag.demod_cfg_used.known_symbol_count
                   << "\n";
         std::cout << "pilot_count=" << diag.timing_diag.pilot_count
                   << " pilot_used_for_timing=" << diag.timing_diag.pilot_used_for_timing
@@ -2607,7 +2751,7 @@ static void run_pcm_debug_measurement(const std::string& profile,
 static void run_pcm_sweep_measurement(const std::string& profile,
                                       int trials) {
     const double sweep_snr_points[] = {24.0, 18.0, 15.0, 12.0, 9.0, 6.0, 3.0, 0.0, -3.0};
-    run_pcm_quality_measurement(trials, calibrated_llr_demod_config(), profile.c_str(),
+    run_pcm_quality_measurement(trials, receiver_demod_config(), profile.c_str(),
                                 sweep_snr_points,
                                 sizeof(sweep_snr_points) / sizeof(sweep_snr_points[0]),
                                 true, false);
@@ -2986,7 +3130,7 @@ int main(int argc, char** argv) {
         if (!args.empty() && args[0] == "measure-pcm") {
             const int trials = args.size() >= 2 ? std::atoi(args[1].c_str()) : 2;
             print_not_same_bitrate_notice();
-            run_pcm_quality_measurement(trials);
+            run_pcm_quality_measurement(trials, receiver_demod_config());
             return 0;
         }
 
@@ -3054,6 +3198,8 @@ int main(int argc, char** argv) {
                       << "  " << argv[0] << " selftest\n"
                       << "  " << argv[0]
                       << " [--timing-search=full|local|center] <command> ...\n"
+                      << "  " << argv[0]
+                      << " [--adaptive-llr] [--llr-scale X] <command> ...\n"
                       << "  " << argv[0] << " [--rx-diagnostics] dec input.pcm output.bin\n"
                       << "  " << argv[0] << " measure-metric [trials-per-snr]\n"
                       << "  " << argv[0] << " measure [trials-per-snr]  # legacy alias\n"
