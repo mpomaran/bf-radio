@@ -182,6 +182,7 @@ static TimingSearchProfile g_timing_search_profile = TimingSearchProfile::Local;
 static bool g_rx_diagnostics_enabled = false;
 static bool g_adaptive_llr_enabled = false;
 static bool g_adaptive_clock_tracking_enabled = false;
+static bool g_adaptive_channel_templates_enabled = false;
 static bool g_manual_llr_scale_set = false;
 static double g_manual_llr_scale = 0.0;
 
@@ -236,6 +237,10 @@ static std::vector<std::string> strip_global_receiver_args(int argc, char** argv
             g_adaptive_clock_tracking_enabled = true;
         } else if (arg == "--no-adaptive-clock-tracking") {
             g_adaptive_clock_tracking_enabled = false;
+        } else if (arg == "--adaptive-channel-templates") {
+            g_adaptive_channel_templates_enabled = true;
+        } else if (arg == "--no-adaptive-channel-templates") {
+            g_adaptive_channel_templates_enabled = false;
         } else if (arg == "--no-adaptive-llr") {
             g_adaptive_llr_enabled = false;
         } else if (arg.compare(0, llr_scale_prefix.size(), llr_scale_prefix) == 0) {
@@ -356,8 +361,12 @@ struct AdaptiveTemplateBank {
     PrecomputedChirpTemplate base_fft;
     std::array<std::array<std::array<double, SYMBOL_SAMPLES>, 3>, ALPHABET> tpl;
     bool valid;
+    int known_symbols;
+    double template_energy;
 
-    AdaptiveTemplateBank() : base(), base_fft(), tpl(), valid(false) {}
+    AdaptiveTemplateBank()
+        : base(), base_fft(), tpl(), valid(false), known_symbols(0),
+          template_energy(0.0) {}
 };
 
 static const PrecomputedChirpTemplate& ideal_base_precomputed_template() {
@@ -424,6 +433,8 @@ static double cyclic_array_sample(const std::array<double, SYMBOL_SAMPLES>& samp
 }
 
 static void rebuild_adaptive_templates(AdaptiveTemplateBank* bank) {
+    bank->template_energy = 0.0;
+    for (double v : bank->base) bank->template_energy += v * v;
     bank->base_fft = make_precomputed_chirp_template(bank->base);
     const double fractional_offsets[3] = {-0.35, 0.0, 0.35};
     for (int symbol = 0; symbol < ALPHABET; ++symbol) {
@@ -478,6 +489,7 @@ static AdaptiveTemplateBank build_adaptive_template_bank(const std::vector<int16
     if (used < PREAMBLE_SYMBOLS / 2) return bank;
     normalize_template(&base);
     bank.base = base;
+    bank.known_symbols = used;
     rebuild_adaptive_templates(&bank);
     bank.valid = true;
 
@@ -490,6 +502,7 @@ static AdaptiveTemplateBank build_adaptive_template_bank(const std::vector<int16
         update_adaptive_template_bank(&bank, pcm,
                                       preamble_pos + (PREAMBLE_SYMBOLS + i) * symbol_span,
                                       symbol_span, sync[i], 0.04);
+        ++bank.known_symbols;
     }
     return bank;
 }
@@ -736,6 +749,39 @@ struct SyncLock {
     SyncLock()
         : preamble_pos(0.0), sync_pos(0.0), symbol_span(NOMINAL_SPAN), score(-1.0) {}
 };
+
+static double known_symbol_template_score(const std::vector<int16_t>& pcm,
+                                          const SyncLock& lock,
+                                          const AdaptiveTemplateBank* adaptive) {
+    const int sync[SYNC_SYMBOLS] = {15, 1, 14, 2, 13, 3, 12, 4};
+    double total = 0.0;
+    int samples = 0;
+    for (int i = 0; i < PREAMBLE_SYMBOLS; i += 6) {
+        const SymbolMetrics m =
+            decode_symbol_metrics_at(pcm, lock.preamble_pos + i * lock.symbol_span,
+                                     lock.symbol_span, true, adaptive, 0);
+        total += m.metric[0];
+        ++samples;
+    }
+    for (int i = 0; i < SYNC_SYMBOLS; ++i) {
+        const SymbolMetrics m =
+            decode_symbol_metrics_at(pcm, lock.sync_pos + i * lock.symbol_span,
+                                     lock.symbol_span, true, adaptive, sync[i]);
+        total += m.metric[size_t(sync[i])];
+        ++samples;
+    }
+    return samples > 0 ? total / double(samples) : 0.0;
+}
+
+static double ideal_vs_adaptive_template_score_delta(
+    const std::vector<int16_t>& pcm,
+    const SyncLock& lock,
+    const AdaptiveTemplateBank& adaptive) {
+    if (!adaptive.valid) return 0.0;
+    const double adaptive_score = known_symbol_template_score(pcm, lock, &adaptive);
+    const double ideal_score = known_symbol_template_score(pcm, lock, nullptr);
+    return adaptive_score - ideal_score;
+}
 
 static double sync_score_at(const std::vector<int16_t>& pcm,
                             double preamble_pos,
@@ -1475,11 +1521,13 @@ static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pc
     }
 
     const AdaptiveTemplateBank adaptive =
-        build_adaptive_template_bank(pcm, lock.preamble_pos, lock.symbol_span);
+        g_adaptive_channel_templates_enabled
+            ? build_adaptive_template_bank(pcm, lock.preamble_pos, lock.symbol_span)
+            : AdaptiveTemplateBank();
     progress_message(verbose, progress_clock,
                      adaptive.valid
                          ? "scanner: using preamble-adaptive channel templates"
-                         : "scanner: adaptive templates unavailable, using ideal templates",
+                         : "scanner: using ideal channel templates",
                      true);
 
     const double data_pos = lock.sync_pos + SYNC_SYMBOLS * lock.symbol_span;
@@ -1509,7 +1557,8 @@ static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pc
                 return result;
             }
 
-            const int template_modes = adaptive.valid ? 2 : 1;
+            const int template_modes =
+                (g_adaptive_channel_templates_enabled && adaptive.valid) ? 2 : 1;
             for (int template_mode = 0; template_mode < template_modes; ++template_mode) {
                 AdaptiveTemplateBank working_adaptive = adaptive;
                 AdaptiveTemplateBank* decode_templates =
@@ -2005,6 +2054,11 @@ struct DecodeAttemptDiagnostics {
     MetricStats metric_stats;
     TimingDiagnostics timing_diag;
     DemodConfig demod_cfg_used;
+    bool adaptive_channel_templates_enabled;
+    int channel_template_known_symbols;
+    double channel_template_energy;
+    bool channel_template_fallback_used;
+    double ideal_vs_adaptive_sync_score;
 
     DecodeAttemptDiagnostics()
         : ok(false), cause(DecodeFailureCause::Sync), header_fec(), body_fec(),
@@ -2012,7 +2066,11 @@ struct DecodeAttemptDiagnostics {
           detected_start_sample(0), estimated_symbol_span(0.0),
           selected_candidate_span(0.0), number_of_symbols(0), payload_bytes(0),
           required_fec_bits(0), crc_ok(false), header_decoded_bytes(),
-          metric_stats(), timing_diag(), demod_cfg_used() {}
+          metric_stats(), timing_diag(), demod_cfg_used(),
+          adaptive_channel_templates_enabled(false),
+          channel_template_known_symbols(0), channel_template_energy(0.0),
+          channel_template_fallback_used(false),
+          ideal_vs_adaptive_sync_score(0.0) {}
 };
 
 struct ReceiverDiagnostics {
@@ -2068,6 +2126,16 @@ static void print_receiver_diagnostics_json(const ReceiverDiagnostics& rx) {
         << finite_or_zero(t.estimated_clock_ppm) << ","
         << "\"adaptive_clock_tracking_enabled\":"
         << (g_adaptive_clock_tracking_enabled ? "true" : "false") << ","
+        << "\"adaptive_channel_templates_enabled\":"
+        << (d.adaptive_channel_templates_enabled ? "true" : "false") << ","
+        << "\"channel_template_known_symbols\":"
+        << d.channel_template_known_symbols << ","
+        << "\"channel_template_energy\":"
+        << finite_or_zero(d.channel_template_energy) << ","
+        << "\"channel_template_fallback_used\":"
+        << (d.channel_template_fallback_used ? "true" : "false") << ","
+        << "\"ideal_vs_adaptive_sync_score\":"
+        << finite_or_zero(d.ideal_vs_adaptive_sync_score) << ","
         << "\"clock_scale\":" << finite_or_zero(t.clock_scale) << ","
         << "\"clock_fit_error_rms_samples\":"
         << finite_or_zero(t.clock_fit_error_rms_samples) << ","
@@ -2142,13 +2210,22 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
         diag.detected_start_sample =
             size_t(std::max(0.0, std::floor(lock.preamble_pos + 0.5)));
         diag.estimated_symbol_span = lock.symbol_span;
+        diag.adaptive_channel_templates_enabled = g_adaptive_channel_templates_enabled;
         if (lock.score < STREAM_DECODE_SYNC_SCORE_THRESHOLD) {
             diag.cause = DecodeFailureCause::FalseLock;
             return diag;
         }
 
         const AdaptiveTemplateBank adaptive =
-            build_adaptive_template_bank(pcm, lock.preamble_pos, lock.symbol_span);
+            g_adaptive_channel_templates_enabled
+                ? build_adaptive_template_bank(pcm, lock.preamble_pos, lock.symbol_span)
+                : AdaptiveTemplateBank();
+        diag.channel_template_known_symbols = adaptive.known_symbols;
+        diag.channel_template_energy = adaptive.template_energy;
+        diag.channel_template_fallback_used =
+            !g_adaptive_channel_templates_enabled || !adaptive.valid;
+        diag.ideal_vs_adaptive_sync_score =
+            ideal_vs_adaptive_template_score_delta(pcm, lock, adaptive);
         const double data_pos = lock.sync_pos + SYNC_SYMBOLS * lock.symbol_span;
         const size_t header_symbols = FEC_CODEWORD_BITS / BITS_PER_SYMBOL;
         bool saw_incomplete = false;
@@ -2169,7 +2246,8 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
                     continue;
                 }
 
-                const int template_modes = adaptive.valid ? 2 : 1;
+                const int template_modes =
+                    (g_adaptive_channel_templates_enabled && adaptive.valid) ? 2 : 1;
                 for (int template_mode = 0; template_mode < template_modes; ++template_mode) {
                     AdaptiveTemplateBank working_adaptive = adaptive;
                     AdaptiveTemplateBank* adaptive_ptr =
@@ -2202,6 +2280,7 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
                         diag.metric_stats = metric_stats;
                         diag.timing_diag = timing_diag;
                         diag.demod_cfg_used = header_demod_cfg;
+                        diag.channel_template_fallback_used = adaptive_ptr == nullptr;
                         saw_header_candidate = true;
                     }
 
@@ -2217,6 +2296,7 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
                     diag.metric_stats = metric_stats;
                     diag.timing_diag = timing_diag;
                     diag.demod_cfg_used = header_demod_cfg;
+                    diag.channel_template_fallback_used = adaptive_ptr == nullptr;
 
                     const size_t required_symbols =
                         (required_fec_bits + BITS_PER_SYMBOL - 1) / BITS_PER_SYMBOL;
@@ -2255,6 +2335,7 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
                     diag.metric_stats = metric_stats;
                     diag.timing_diag = timing_diag;
                     diag.demod_cfg_used = full_demod_cfg;
+                    diag.channel_template_fallback_used = full_adaptive_ptr == nullptr;
                     if (ok) {
                         diag.ok = true;
                         diag.cause = DecodeFailureCause::None;
@@ -3384,6 +3465,9 @@ int main(int argc, char** argv) {
                       << " [--adaptive-llr] [--llr-scale X] <command> ...\n"
                       << "  " << argv[0]
                       << " [--adaptive-clock-tracking] <command> ...\n"
+                      << "  " << argv[0]
+                      << " [--adaptive-channel-templates|--no-adaptive-channel-templates]"
+                      << " <command> ...\n"
                       << "  " << argv[0] << " [--rx-diagnostics] dec input.pcm output.bin\n"
                       << "  " << argv[0] << " measure-metric [trials-per-snr]\n"
                       << "  " << argv[0] << " measure [trials-per-snr]  # legacy alias\n"

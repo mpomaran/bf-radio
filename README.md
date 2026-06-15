@@ -381,6 +381,11 @@ uses cyclic shifts of that learned template for data demodulation. It then
 refines the template with the known sync symbols before any payload decisions
 are trusted.
 
+This channel-template path is controlled by `--adaptive-channel-templates` and
+`--no-adaptive-channel-templates`. It is disabled by default for conservative
+A/B testing; enabling it uses known preamble/sync/pilot symbols to estimate
+channel-shaped templates for the current frame.
+
 During full-frame demodulation the receiver also performs decision-directed
 template tracking. Only symbols with a high best-vs-second-best correlation
 margin and a small timing offset are allowed to update the learned base chirp.
@@ -608,7 +613,13 @@ tool for modem robustness, not a calibrated acoustic model.
 The chirp decoder now learns a channel-adapted chirp template from the repeated
 preamble symbols. It tries that preamble-adapted template first, then falls back
 to the ideal synthetic template for clean time-scaling cases where adaptation is
-less helpful.
+less helpful when `--adaptive-channel-templates` is enabled.
+
+Receiver diagnostics include `adaptive_channel_templates_enabled`,
+`channel_template_known_symbols`, `channel_template_energy`,
+`channel_template_fallback_used`, and `ideal_vs_adaptive_sync_score` so scripts
+can compare ideal and channel-shaped templates without changing the transmitted
+waveform.
 
 ### Synthetic Radio Channel Test
 
