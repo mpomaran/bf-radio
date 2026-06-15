@@ -673,6 +673,19 @@ remains the base multiplier, so `--llr-scale` can still be used as a manual
 base scale. This changes only receiver-side soft metrics; it does not change
 the waveform, bitrate, frame format, symbol alphabet, or FEC parameters.
 
+Clock tracking has a separate opt-in mode:
+
+```bash
+./chirp_modem --adaptive-clock-tracking dec input.pcm output.bin
+./chirp_modem --adaptive-clock-tracking --rx-diagnostics dec input.pcm output.bin
+```
+
+`--adaptive-clock-tracking` uses the receiver-visible linear clock fit from
+preamble/sync/pilot positions to predict data-symbol sample positions as
+`offset + scale * nominal_position`. The existing pilot/timing loop remains the
+default path and is still present; this option only changes receiver-side sample
+extraction positions and does not change the over-the-air frame.
+
 `measure-metric` generates deterministic 64-byte payloads, encodes real
 protected modem frames, simulates a CSS metric vector for each transmitted
 symbol, feeds those soft metrics through the real interleaver and BP FEC

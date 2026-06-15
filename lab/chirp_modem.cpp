@@ -181,6 +181,7 @@ enum class TimingSearchProfile {
 static TimingSearchProfile g_timing_search_profile = TimingSearchProfile::Local;
 static bool g_rx_diagnostics_enabled = false;
 static bool g_adaptive_llr_enabled = false;
+static bool g_adaptive_clock_tracking_enabled = false;
 static bool g_manual_llr_scale_set = false;
 static double g_manual_llr_scale = 0.0;
 
@@ -231,6 +232,10 @@ static std::vector<std::string> strip_global_receiver_args(int argc, char** argv
             g_rx_diagnostics_enabled = true;
         } else if (arg == "--adaptive-llr") {
             g_adaptive_llr_enabled = true;
+        } else if (arg == "--adaptive-clock-tracking") {
+            g_adaptive_clock_tracking_enabled = true;
+        } else if (arg == "--no-adaptive-clock-tracking") {
+            g_adaptive_clock_tracking_enabled = false;
         } else if (arg == "--no-adaptive-llr") {
             g_adaptive_llr_enabled = false;
         } else if (arg.compare(0, llr_scale_prefix.size(), llr_scale_prefix) == 0) {
@@ -301,8 +306,12 @@ struct TimingDiagnostics {
     double timing_offset_final_samples;
     int timing_corrections_applied;
     double estimated_clock_ppm;
+    double clock_scale;
+    double clock_offset_samples;
     double clock_fit_error_rms_samples;
     int clock_fit_points;
+    double timing_error_before_rms;
+    double timing_error_after_rms;
 
     double pilot_margin_sum;
     double pilot_offset_sq_sum;
@@ -313,7 +322,10 @@ struct TimingDiagnostics {
     double clock_fit_sum_expected_sq;
     double clock_fit_sum_observed_sq;
     double clock_fit_sum_expected_observed;
+    double timing_error_before_sq_sum;
+    double timing_error_after_sq_sum;
     int timing_error_samples;
+    int timing_error_compare_samples;
     int span_samples;
     int timing_search_symbols;
     int timing_search_offsets;
@@ -327,12 +339,15 @@ struct TimingDiagnostics {
           timing_search_local_count(0), timing_search_center_count(0),
           average_offsets_per_symbol(0.0), timing_offset_initial_samples(0.0),
           timing_offset_final_samples(0.0), timing_corrections_applied(0),
-          estimated_clock_ppm(0.0), clock_fit_error_rms_samples(0.0),
-          clock_fit_points(0), pilot_margin_sum(0.0), pilot_offset_sq_sum(0.0),
+          estimated_clock_ppm(0.0), clock_scale(1.0), clock_offset_samples(0.0),
+          clock_fit_error_rms_samples(0.0), clock_fit_points(0),
+          timing_error_before_rms(0.0), timing_error_after_rms(0.0),
+          pilot_margin_sum(0.0), pilot_offset_sq_sum(0.0),
           timing_error_sq_sum(0.0), span_sum(0.0), clock_fit_sum_expected(0.0),
           clock_fit_sum_observed(0.0), clock_fit_sum_expected_sq(0.0),
           clock_fit_sum_observed_sq(0.0), clock_fit_sum_expected_observed(0.0),
-          timing_error_samples(0), span_samples(0),
+          timing_error_before_sq_sum(0.0), timing_error_after_sq_sum(0.0),
+          timing_error_samples(0), timing_error_compare_samples(0), span_samples(0),
           timing_search_symbols(0), timing_search_offsets(0) {}
 };
 
@@ -954,9 +969,55 @@ static void timing_diag_record_clock_point(TimingDiagnostics* diag,
     const double sse =
         syy + n * offset * offset + scale * scale * sxx +
         2.0 * offset * scale * sx - 2.0 * offset * sy - 2.0 * scale * sxy;
+    diag->clock_scale = scale;
+    diag->clock_offset_samples = offset;
     diag->estimated_clock_ppm = (scale - 1.0) * 1000000.0;
     diag->clock_fit_error_rms_samples =
         std::sqrt(std::max(0.0, sse / n));
+}
+
+static bool timing_diag_has_clock_model(const TimingDiagnostics* diag) {
+    return diag != nullptr && diag->clock_fit_points >= 2 &&
+           std::isfinite(diag->clock_scale) &&
+           std::isfinite(diag->clock_offset_samples);
+}
+
+static bool timing_diag_has_tracking_clock_model(const TimingDiagnostics* diag) {
+    return timing_diag_has_clock_model(diag) && diag->clock_fit_points >= 4;
+}
+
+static bool timing_diag_clock_tracking_is_safe(const TimingDiagnostics* diag) {
+    if (!timing_diag_has_tracking_clock_model(diag)) return false;
+
+    /*
+      The fitted clock model is used only when the known-symbol observations are
+      internally consistent. In multipath or timing-wander cases a linear fit can
+      be worse than the local decision-directed timing loop, so pilot residuals
+      gate the optional adaptive clock path.
+    */
+    if (diag->clock_fit_error_rms_samples > 2.0) return false;
+    if (diag->timing_error_compare_samples >= 2 &&
+        diag->timing_error_after_rms > diag->timing_error_before_rms * 1.05) {
+        return false;
+    }
+    return true;
+}
+
+static double timing_diag_predict_clock_sample(const TimingDiagnostics* diag,
+                                               double expected_sample) {
+    return diag->clock_offset_samples + diag->clock_scale * expected_sample;
+}
+
+static void timing_diag_record_clock_tracking_error(TimingDiagnostics* diag,
+                                                    double before_error,
+                                                    double after_error) {
+    if (diag == nullptr) return;
+    diag->timing_error_before_sq_sum += before_error * before_error;
+    diag->timing_error_after_sq_sum += after_error * after_error;
+    ++diag->timing_error_compare_samples;
+    const double n = double(diag->timing_error_compare_samples);
+    diag->timing_error_before_rms = std::sqrt(diag->timing_error_before_sq_sum / n);
+    diag->timing_error_after_rms = std::sqrt(diag->timing_error_after_sq_sum / n);
 }
 
 static double percentile_from_samples(std::vector<double> samples, double percentile) {
@@ -1035,6 +1096,18 @@ static std::vector<double> decode_llrs_tracking(const std::vector<int16_t>& pcm,
     timing_diag_record_span(timing_diag, timing.span);
 
     while (timing.pos + timing.span < double(pcm.size()) && llrs.size() < max_bits) {
+        const double loop_predicted_pos = timing.pos;
+        const double nominal_expected_sample =
+            clock_fit_base_expected_sample +
+            double(physical_symbols_since_data_start) * NOMINAL_SPAN;
+        if (g_adaptive_clock_tracking_enabled &&
+            timing_diag_clock_tracking_is_safe(timing_diag)) {
+            timing.pos =
+                timing_diag_predict_clock_sample(timing_diag, nominal_expected_sample);
+            timing.span =
+                std::max(min_span, std::min(max_span, timing_diag->clock_scale * NOMINAL_SPAN));
+        }
+
         if (data_symbols == next_pilot_after) {
             const SymbolMetrics pilot =
                 decode_symbol_metrics_at(pcm, timing.pos, timing.span, true,
@@ -1048,11 +1121,19 @@ static std::vector<double> decode_llrs_tracking(const std::vector<int16_t>& pcm,
             }
             const double pilot_confidence =
                 pilot.metric[size_t(PILOT_SYMBOL)] - best_other;
+            const double observed_pilot_sample = timing.pos + pilot.timing_offset;
+            const double clock_predicted_sample =
+                timing_diag_has_clock_model(timing_diag)
+                    ? timing_diag_predict_clock_sample(timing_diag, nominal_expected_sample)
+                    : timing.pos;
+            timing_diag_record_clock_tracking_error(
+                timing_diag,
+                observed_pilot_sample - loop_predicted_pos,
+                observed_pilot_sample - clock_predicted_sample);
             timing_diag_record_clock_point(
                 timing_diag,
-                clock_fit_base_expected_sample +
-                    double(physical_symbols_since_data_start) * NOMINAL_SPAN,
-                timing.pos + pilot.timing_offset);
+                nominal_expected_sample,
+                observed_pilot_sample);
             metric_stats_observe_known_symbol(metric_stats, pilot, PILOT_SYMBOL);
             active_demod_cfg =
                 calibrate_llr_from_known_symbols(active_demod_cfg,
@@ -1985,9 +2066,16 @@ static void print_receiver_diagnostics_json(const ReceiverDiagnostics& rx) {
         << "\"fec_mode\":\"" << rx.fec_mode << "\","
         << "\"estimated_clock_ppm\":"
         << finite_or_zero(t.estimated_clock_ppm) << ","
+        << "\"adaptive_clock_tracking_enabled\":"
+        << (g_adaptive_clock_tracking_enabled ? "true" : "false") << ","
+        << "\"clock_scale\":" << finite_or_zero(t.clock_scale) << ","
         << "\"clock_fit_error_rms_samples\":"
         << finite_or_zero(t.clock_fit_error_rms_samples) << ","
         << "\"clock_fit_points\":" << t.clock_fit_points << ","
+        << "\"timing_error_before_rms\":"
+        << finite_or_zero(t.timing_error_before_rms) << ","
+        << "\"timing_error_after_rms\":"
+        << finite_or_zero(t.timing_error_after_rms) << ","
         << "\"timing_offset_initial_samples\":"
         << finite_or_zero(t.timing_offset_initial_samples) << ","
         << "\"timing_offset_final_samples\":"
@@ -2693,6 +2781,8 @@ static void run_pcm_debug_measurement(const std::string& profile,
               << " trials=" << trials
               << " timing_search=" << timing_search_profile_name(g_timing_search_profile)
               << " adaptive_llr=" << (demod_cfg.use_adaptive_llr ? 1 : 0)
+              << " adaptive_clock_tracking="
+              << (g_adaptive_clock_tracking_enabled ? 1 : 0)
               << " rng_seed=0xBEEF\n";
 
     for (int trial = 0; trial < trials; ++trial) {
@@ -2734,10 +2824,15 @@ static void run_pcm_debug_measurement(const std::string& profile,
                       << diag.demod_cfg_used.known_symbol_count
                       << " estimated_clock_ppm="
                       << diag.timing_diag.estimated_clock_ppm
+                      << " clock_scale=" << diag.timing_diag.clock_scale
                       << " clock_fit_error_rms_samples="
                       << diag.timing_diag.clock_fit_error_rms_samples
                       << " clock_fit_points="
                       << diag.timing_diag.clock_fit_points
+                      << " timing_error_before_rms="
+                      << diag.timing_diag.timing_error_before_rms
+                      << " timing_error_after_rms="
+                      << diag.timing_diag.timing_error_after_rms
                       << "\n";
             continue;
         }
@@ -2812,9 +2907,14 @@ static void run_pcm_debug_measurement(const std::string& profile,
                   << " average_offsets_per_symbol="
                   << diag.timing_diag.average_offsets_per_symbol
                   << " estimated_clock_ppm=" << diag.timing_diag.estimated_clock_ppm
+                  << " clock_scale=" << diag.timing_diag.clock_scale
                   << " clock_fit_error_rms_samples="
                   << diag.timing_diag.clock_fit_error_rms_samples
                   << " clock_fit_points=" << diag.timing_diag.clock_fit_points
+                  << " timing_error_before_rms="
+                  << diag.timing_diag.timing_error_before_rms
+                  << " timing_error_after_rms="
+                  << diag.timing_diag.timing_error_after_rms
                   << "\n";
         std::cout << "header_decoded_bytes_hex="
                   << bytes_to_hex_string(diag.header_decoded_bytes) << "\n";
@@ -3282,6 +3382,8 @@ int main(int argc, char** argv) {
                       << " [--timing-search=full|local|center] <command> ...\n"
                       << "  " << argv[0]
                       << " [--adaptive-llr] [--llr-scale X] <command> ...\n"
+                      << "  " << argv[0]
+                      << " [--adaptive-clock-tracking] <command> ...\n"
                       << "  " << argv[0] << " [--rx-diagnostics] dec input.pcm output.bin\n"
                       << "  " << argv[0] << " measure-metric [trials-per-snr]\n"
                       << "  " << argv[0] << " measure [trials-per-snr]  # legacy alias\n"

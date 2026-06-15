@@ -333,6 +333,14 @@ sh_test(
 )
 
 sh_test(
+    name = "chirp_adaptive_clock_tracking_test",
+    srcs = ["chirp_adaptive_clock_tracking_test.sh"],
+    data = [":chirp_modem", ":pcm_impair", ":pcm_radio_channel_impair"],
+    size = "medium",
+    tags = ["manual", "slow"],
+)
+
+sh_test(
     name = "chirp_corruption_test",
     srcs = ["chirp_corruption_test.sh"],
     data = [":chirp_modem"],
@@ -401,6 +409,7 @@ test_suite(
         ":chirp_selftest_test",
         ":chirp_measure_test",
         ":chirp_adaptive_llr_compare_test",
+        ":chirp_adaptive_clock_tracking_test",
         ":chirp_clock_ppm_estimation_test",
         ":chirp_corruption_test",
         ":chirp_fec_limits_test",
