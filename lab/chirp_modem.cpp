@@ -183,6 +183,7 @@ static bool g_rx_diagnostics_enabled = false;
 static bool g_adaptive_llr_enabled = false;
 static bool g_adaptive_clock_tracking_enabled = false;
 static bool g_adaptive_channel_templates_enabled = false;
+static bool g_weighted_correlation_enabled = false;
 static bool g_manual_llr_scale_set = false;
 static double g_manual_llr_scale = 0.0;
 
@@ -241,6 +242,10 @@ static std::vector<std::string> strip_global_receiver_args(int argc, char** argv
             g_adaptive_channel_templates_enabled = true;
         } else if (arg == "--no-adaptive-channel-templates") {
             g_adaptive_channel_templates_enabled = false;
+        } else if (arg == "--weighted-correlation") {
+            g_weighted_correlation_enabled = true;
+        } else if (arg == "--no-weighted-correlation") {
+            g_weighted_correlation_enabled = false;
         } else if (arg == "--no-adaptive-llr") {
             g_adaptive_llr_enabled = false;
         } else if (arg.compare(0, llr_scale_prefix.size(), llr_scale_prefix) == 0) {
@@ -367,6 +372,21 @@ struct AdaptiveTemplateBank {
     AdaptiveTemplateBank()
         : base(), base_fft(), tpl(), valid(false), known_symbols(0),
           template_energy(0.0) {}
+};
+
+struct WeightedCorrelationModel {
+    std::array<double, SYMBOL_SAMPLES> weights;
+    bool valid;
+    int known_symbols;
+    double weight_min;
+    double weight_max;
+    double weight_mean;
+
+    WeightedCorrelationModel()
+        : weights(), valid(false), known_symbols(0), weight_min(1.0),
+          weight_max(1.0), weight_mean(1.0) {
+        weights.fill(1.0);
+    }
 };
 
 static const PrecomputedChirpTemplate& ideal_base_precomputed_template() {
@@ -568,6 +588,59 @@ static double corr_score_adaptive(const std::vector<int16_t>& pcm,
     return std::abs(dot) / std::sqrt(e1 * e2);
 }
 
+static double corr_score_weighted(const std::vector<int16_t>& pcm,
+                                  double pos,
+                                  double symbol_span,
+                                  const std::vector<double>& tpl,
+                                  const WeightedCorrelationModel* weights) {
+    if (weights == nullptr || !weights->valid) return corr_score(pcm, pos, symbol_span, tpl);
+    if (pos < 0.0 || pos + symbol_span >= double(pcm.size())) return 0.0;
+
+    const std::array<double, SYMBOL_SAMPLES> samples =
+        normalized_symbol_samples(pcm, pos, symbol_span);
+    double dot = 0.0;
+    double e1 = 0.0;
+    double e2 = 0.0;
+    for (int i = 0; i < SYMBOL_SAMPLES; ++i) {
+        const double w = weights->weights[size_t(i)];
+        const double a = samples[size_t(i)];
+        const double b = tpl[size_t(i)];
+        dot += w * a * b;
+        e1 += w * a * a;
+        e2 += w * b * b;
+    }
+    if (e1 <= 1e-9 || e2 <= 1e-9) return 0.0;
+    return std::abs(dot) / std::sqrt(e1 * e2);
+}
+
+static double corr_score_adaptive_weighted(
+    const std::vector<int16_t>& pcm,
+    double pos,
+    double symbol_span,
+    const std::array<double, SYMBOL_SAMPLES>& tpl,
+    const WeightedCorrelationModel* weights) {
+    if (weights == nullptr || !weights->valid) {
+        return corr_score_adaptive(pcm, pos, symbol_span, tpl);
+    }
+    if (pos < 0.0 || pos + symbol_span >= double(pcm.size())) return 0.0;
+
+    const std::array<double, SYMBOL_SAMPLES> samples =
+        normalized_symbol_samples(pcm, pos, symbol_span);
+    double dot = 0.0;
+    double e1 = 0.0;
+    double e2 = 0.0;
+    for (int i = 0; i < SYMBOL_SAMPLES; ++i) {
+        const double w = weights->weights[size_t(i)];
+        const double a = samples[size_t(i)];
+        const double b = tpl[size_t(i)];
+        dot += w * a * b;
+        e1 += w * a * a;
+        e2 += w * b * b;
+    }
+    if (e1 <= 1e-9 || e2 <= 1e-9) return 0.0;
+    return std::abs(dot) / std::sqrt(e1 * e2);
+}
+
 static bool fast_symbol_metrics_from_base(const std::vector<int16_t>& pcm,
                                           double pos,
                                           double symbol_span,
@@ -639,6 +712,7 @@ static SymbolMetrics decode_symbol_metrics_at(const std::vector<int16_t>& pcm,
                                               double symbol_span,
                                               bool intermediate,
                                               const AdaptiveTemplateBank* adaptive = nullptr,
+                                              const WeightedCorrelationModel* weights = nullptr,
                                               int rank_symbol = -1,
                                               TimingSearchProfile search_profile =
                                                   TimingSearchProfile::Full,
@@ -669,14 +743,15 @@ static SymbolMetrics decode_symbol_metrics_at(const std::vector<int16_t>& pcm,
         SymbolMetrics current;
         current.timing_offset = timing_offset;
         bool used_fast = false;
-        if (adaptive != nullptr && adaptive->valid) {
+        const bool use_weighted = weights != nullptr && weights->valid;
+        if (!use_weighted && adaptive != nullptr && adaptive->valid) {
             const double adaptive_offsets[3] = {-0.35, 0.0, 0.35};
             const double centered_offset[1] = {0.0};
             used_fast = fast_symbol_metrics_from_base(
                 pcm, pos + timing_offset, symbol_span, adaptive->base_fft,
                 intermediate ? adaptive_offsets : centered_offset,
                 intermediate ? 3 : 1, &current);
-        } else {
+        } else if (!use_weighted) {
             const double ideal_offsets[3] = {-2.0, 0.0, 2.0};
             const double centered_offset[1] = {0.0};
             used_fast = fast_symbol_metrics_from_base(
@@ -693,22 +768,28 @@ static SymbolMetrics decode_symbol_metrics_at(const std::vector<int16_t>& pcm,
                         if (adaptive != nullptr && adaptive->valid) {
                             score = std::max(
                                 score,
-                                corr_score_adaptive(
+                                corr_score_adaptive_weighted(
                                     pcm, pos + timing_offset, symbol_span,
-                                    adaptive->tpl[size_t(s)][size_t(offset_index)]));
+                                    adaptive->tpl[size_t(s)][size_t(offset_index)],
+                                    weights));
                         } else {
-                            score = std::max(score, corr_score(pcm, pos + timing_offset,
-                                                               symbol_span,
-                                                               symbol_template(s, offset_index)));
+                            score = std::max(
+                                score,
+                                corr_score_weighted(pcm, pos + timing_offset,
+                                                    symbol_span,
+                                                    symbol_template(s, offset_index),
+                                                    weights));
                         }
                     }
                 } else {
                     if (adaptive != nullptr && adaptive->valid) {
-                        score = corr_score_adaptive(pcm, pos + timing_offset, symbol_span,
-                                                    adaptive->tpl[size_t(s)][1]);
+                        score = corr_score_adaptive_weighted(
+                            pcm, pos + timing_offset, symbol_span,
+                            adaptive->tpl[size_t(s)][1], weights);
                     } else {
-                        score = corr_score(pcm, pos + timing_offset, symbol_span,
-                                           symbol_template(s, 1));
+                        score = corr_score_weighted(pcm, pos + timing_offset,
+                                                    symbol_span,
+                                                    symbol_template(s, 1), weights);
                     }
                 }
                 current.metric[size_t(s)] = score;
@@ -759,14 +840,14 @@ static double known_symbol_template_score(const std::vector<int16_t>& pcm,
     for (int i = 0; i < PREAMBLE_SYMBOLS; i += 6) {
         const SymbolMetrics m =
             decode_symbol_metrics_at(pcm, lock.preamble_pos + i * lock.symbol_span,
-                                     lock.symbol_span, true, adaptive, 0);
+                                     lock.symbol_span, true, adaptive, nullptr, 0);
         total += m.metric[0];
         ++samples;
     }
     for (int i = 0; i < SYNC_SYMBOLS; ++i) {
         const SymbolMetrics m =
             decode_symbol_metrics_at(pcm, lock.sync_pos + i * lock.symbol_span,
-                                     lock.symbol_span, true, adaptive, sync[i]);
+                                     lock.symbol_span, true, adaptive, nullptr, sync[i]);
         total += m.metric[size_t(sync[i])];
         ++samples;
     }
@@ -781,6 +862,106 @@ static double ideal_vs_adaptive_template_score_delta(
     const double adaptive_score = known_symbol_template_score(pcm, lock, &adaptive);
     const double ideal_score = known_symbol_template_score(pcm, lock, nullptr);
     return adaptive_score - ideal_score;
+}
+
+static void weighted_model_accumulate_known_symbol(
+    const std::vector<int16_t>& pcm,
+    double pos,
+    double symbol_span,
+    int raw_symbol,
+    const std::array<double, SYMBOL_SAMPLES>& reference_base,
+    std::array<double, SYMBOL_SAMPLES>* residual_sum,
+    int* used) {
+    const std::array<double, SYMBOL_SAMPLES> observed =
+        normalized_symbol_samples(pcm, pos, symbol_span);
+    double observed_energy = 0.0;
+    for (double v : observed) observed_energy += v * v;
+    if (observed_energy <= 1e-9) return;
+
+    const int shift = raw_symbol * SYMBOL_SAMPLES / ALPHABET;
+    std::array<double, SYMBOL_SAMPLES> candidate = {};
+    for (int n = 0; n < SYMBOL_SAMPLES; ++n) {
+        candidate[size_t(n)] = cyclic_array_sample(observed, double(n - shift));
+    }
+    normalize_template(&candidate);
+
+    double dot = 0.0;
+    for (int n = 0; n < SYMBOL_SAMPLES; ++n) {
+        dot += candidate[size_t(n)] * reference_base[size_t(n)];
+    }
+    if (dot < 0.0) {
+        for (double& v : candidate) v = -v;
+    }
+
+    for (int n = 0; n < SYMBOL_SAMPLES; ++n) {
+        const double r = candidate[size_t(n)] - reference_base[size_t(n)];
+        (*residual_sum)[size_t(n)] += r * r;
+    }
+    ++(*used);
+}
+
+static WeightedCorrelationModel build_weighted_correlation_model(
+    const std::vector<int16_t>& pcm,
+    const SyncLock& lock,
+    const AdaptiveTemplateBank* adaptive) {
+    WeightedCorrelationModel model;
+    if (!g_weighted_correlation_enabled) return model;
+
+    std::array<double, SYMBOL_SAMPLES> reference_base =
+        adaptive != nullptr && adaptive->valid ? adaptive->base
+                                               : ideal_base_template_array();
+    normalize_template(&reference_base);
+
+    std::array<double, SYMBOL_SAMPLES> residual_sum = {};
+    int used = 0;
+    const int sync[SYNC_SYMBOLS] = {15, 1, 14, 2, 13, 3, 12, 4};
+    for (int i = 0; i < PREAMBLE_SYMBOLS; i += 3) {
+        weighted_model_accumulate_known_symbol(
+            pcm, lock.preamble_pos + i * lock.symbol_span, lock.symbol_span,
+            0, reference_base, &residual_sum, &used);
+    }
+    for (int i = 0; i < SYNC_SYMBOLS; ++i) {
+        weighted_model_accumulate_known_symbol(
+            pcm, lock.sync_pos + i * lock.symbol_span, lock.symbol_span,
+            sync[i], reference_base, &residual_sum, &used);
+    }
+
+    if (used < 6) return model;
+
+    std::vector<double> residuals;
+    residuals.reserve(SYMBOL_SAMPLES);
+    for (int i = 0; i < SYMBOL_SAMPLES; ++i) {
+        residuals.push_back(residual_sum[size_t(i)] / double(used));
+    }
+    std::sort(residuals.begin(), residuals.end());
+    const double median_residual = residuals[SYMBOL_SAMPLES / 2];
+    const double floor_residual = std::max(1e-4, median_residual * 0.35);
+
+    double sum = 0.0;
+    for (int i = 0; i < SYMBOL_SAMPLES; ++i) {
+        const double residual = residual_sum[size_t(i)] / double(used);
+        const double raw_weight = (median_residual + floor_residual) /
+                                  (residual + floor_residual);
+        const double clamped = std::max(0.35, std::min(2.50, raw_weight));
+        model.weights[size_t(i)] = clamped;
+        sum += clamped;
+    }
+    if (sum <= 1e-9) return model;
+
+    const double mean = sum / SYMBOL_SAMPLES;
+    model.weight_min = std::numeric_limits<double>::infinity();
+    model.weight_max = 0.0;
+    model.weight_mean = 0.0;
+    for (double& w : model.weights) {
+        w /= mean;
+        model.weight_min = std::min(model.weight_min, w);
+        model.weight_max = std::max(model.weight_max, w);
+        model.weight_mean += w;
+    }
+    model.weight_mean /= SYMBOL_SAMPLES;
+    model.known_symbols = used;
+    model.valid = true;
+    return model;
 }
 
 static double sync_score_at(const std::vector<int16_t>& pcm,
@@ -937,19 +1118,20 @@ static void timing_diag_record_sync_clock_points(TimingDiagnostics* diag,
 static MetricStats estimate_metric_stats_from_known_symbols(
     const std::vector<int16_t>& pcm,
     const SyncLock& lock,
-    const AdaptiveTemplateBank* adaptive) {
+    const AdaptiveTemplateBank* adaptive,
+    const WeightedCorrelationModel* weights = nullptr) {
     MetricStats stats;
     const int sync[SYNC_SYMBOLS] = {15, 1, 14, 2, 13, 3, 12, 4};
     for (int i = 0; i < PREAMBLE_SYMBOLS; i += 4) {
         const SymbolMetrics m =
             decode_symbol_metrics_at(pcm, lock.preamble_pos + i * lock.symbol_span,
-                                     lock.symbol_span, true, adaptive, 0);
+                                     lock.symbol_span, true, adaptive, weights, 0);
         metric_stats_observe_known_symbol(&stats, m, 0);
     }
     for (int i = 0; i < SYNC_SYMBOLS; ++i) {
         const SymbolMetrics m =
             decode_symbol_metrics_at(pcm, lock.sync_pos + i * lock.symbol_span,
-                                     lock.symbol_span, true, adaptive, sync[i]);
+                                     lock.symbol_span, true, adaptive, weights, sync[i]);
         metric_stats_observe_known_symbol(&stats, m, sync[i]);
     }
     return stats;
@@ -1116,6 +1298,7 @@ static std::vector<double> decode_llrs_tracking(const std::vector<int16_t>& pcm,
                                                 const DemodConfig& demod_cfg = DemodConfig(),
                                                 MetricStats* metric_stats = nullptr,
                                                 TimingDiagnostics* timing_diag = nullptr,
+                                                const WeightedCorrelationModel* weights = nullptr,
                                                 TimingSearchProfile timing_search_profile =
                                                     g_timing_search_profile,
                                                 DemodConfig* effective_demod_cfg = nullptr,
@@ -1157,7 +1340,7 @@ static std::vector<double> decode_llrs_tracking(const std::vector<int16_t>& pcm,
         if (data_symbols == next_pilot_after) {
             const SymbolMetrics pilot =
                 decode_symbol_metrics_at(pcm, timing.pos, timing.span, true,
-                                         adaptive, PILOT_SYMBOL,
+                                         adaptive, weights, PILOT_SYMBOL,
                                          TimingSearchProfile::Full, timing_diag);
             double best_other = -1.0;
             for (int s = 0; s < ALPHABET; ++s) {
@@ -1244,7 +1427,7 @@ static std::vector<double> decode_llrs_tracking(const std::vector<int16_t>& pcm,
 
         SymbolMetrics m =
             decode_symbol_metrics_at(pcm, timing.pos, timing.span, true, adaptive,
-                                     -1, data_search, timing_diag);
+                                     weights, -1, data_search, timing_diag);
         double confidence = m.best_score - m.second_best_score;
         if (timing_search_profile == TimingSearchProfile::Local &&
             data_search == TimingSearchProfile::Local &&
@@ -1257,8 +1440,8 @@ static std::vector<double> decode_llrs_tracking(const std::vector<int16_t>& pcm,
               behavior.
             */
             m = decode_symbol_metrics_at(pcm, timing.pos, timing.span, true,
-                                         adaptive, -1, TimingSearchProfile::Full,
-                                         timing_diag);
+                                         adaptive, weights, -1,
+                                         TimingSearchProfile::Full, timing_diag);
             confidence = m.best_score - m.second_best_score;
         }
         const std::array<double, BITS_PER_SYMBOL> symbol_llr =
@@ -1563,8 +1746,13 @@ static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pc
                 AdaptiveTemplateBank working_adaptive = adaptive;
                 AdaptiveTemplateBank* decode_templates =
                     (template_mode == 0 && working_adaptive.valid) ? &working_adaptive : nullptr;
+                const WeightedCorrelationModel weighted_model =
+                    build_weighted_correlation_model(pcm, lock, decode_templates);
+                const WeightedCorrelationModel* weights =
+                    weighted_model.valid ? &weighted_model : nullptr;
                 MetricStats metric_stats =
-                    estimate_metric_stats_from_known_symbols(pcm, lock, decode_templates);
+                    estimate_metric_stats_from_known_symbols(pcm, lock, decode_templates,
+                                                             weights);
                 if (template_mode == 1) {
                     progress_message(verbose, progress_clock,
                                      "scanner: retrying candidate with ideal templates",
@@ -1574,7 +1762,7 @@ static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pc
                 const std::vector<double> header_llrs =
                     decode_llrs_tracking(pcm, data_pos, candidate_span,
                                          FEC_CODEWORD_BITS, decode_templates, false,
-                                         demod_cfg, &metric_stats, nullptr);
+                                         demod_cfg, &metric_stats, nullptr, weights);
                 if (header_llrs.size() < FEC_CODEWORD_BITS) {
                     result.status = StreamScanStatus::NeedMoreSamples;
                     result.discard_prefix_samples = clamp_discard(frame_start, pcm.size());
@@ -1626,7 +1814,7 @@ static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pc
                     decode_llrs_tracking(pcm, data_pos, candidate_span,
                                          required_fec_bits, decode_templates,
                                          decode_templates != nullptr,
-                                         demod_cfg, &metric_stats, nullptr);
+                                         demod_cfg, &metric_stats, nullptr, weights);
                 if (frame_llrs.size() < required_fec_bits) {
                     result.status = StreamScanStatus::NeedMoreSamples;
                     result.discard_prefix_samples = clamp_discard(frame_start, pcm.size());
@@ -1909,7 +2097,7 @@ static RawLinkMetrics measure_raw_link_metrics_core(const std::vector<int16_t>& 
                 if (i > 0 && (i % size_t(PILOT_INTERVAL_SYMBOLS)) == 0) {
                     const SymbolMetrics pilot =
                         decode_symbol_metrics_at(pcm, timing.pos, timing.span, true,
-                                                 adaptive_ptr, PILOT_SYMBOL);
+                                                 adaptive_ptr, nullptr, PILOT_SYMBOL);
                     if (std::abs(pilot.timing_offset) <= timing_update_max_offset) {
                         timing.timing_error_filtered =
                             0.80 * timing.timing_error_filtered + 0.20 * pilot.timing_offset;
@@ -1927,7 +2115,8 @@ static RawLinkMetrics measure_raw_link_metrics_core(const std::vector<int16_t>& 
                 }
 
                 const SymbolMetrics m =
-                    decode_symbol_metrics_at(pcm, timing.pos, timing.span, true, adaptive_ptr);
+                    decode_symbol_metrics_at(pcm, timing.pos, timing.span, true,
+                                             adaptive_ptr);
                 if (uint8_t(m.best_symbol) != expected_symbols[i]) ++candidate.symbol_errors;
 
                 const uint8_t binary_symbol = gray_to_binary4(uint8_t(m.best_symbol));
@@ -2059,6 +2248,11 @@ struct DecodeAttemptDiagnostics {
     double channel_template_energy;
     bool channel_template_fallback_used;
     double ideal_vs_adaptive_sync_score;
+    bool weighted_correlation_enabled;
+    double weight_min;
+    double weight_max;
+    double weight_mean;
+    bool weight_fallback_used;
 
     DecodeAttemptDiagnostics()
         : ok(false), cause(DecodeFailureCause::Sync), header_fec(), body_fec(),
@@ -2070,7 +2264,9 @@ struct DecodeAttemptDiagnostics {
           adaptive_channel_templates_enabled(false),
           channel_template_known_symbols(0), channel_template_energy(0.0),
           channel_template_fallback_used(false),
-          ideal_vs_adaptive_sync_score(0.0) {}
+          ideal_vs_adaptive_sync_score(0.0),
+          weighted_correlation_enabled(false), weight_min(1.0),
+          weight_max(1.0), weight_mean(1.0), weight_fallback_used(true) {}
 };
 
 struct ReceiverDiagnostics {
@@ -2136,6 +2332,13 @@ static void print_receiver_diagnostics_json(const ReceiverDiagnostics& rx) {
         << (d.channel_template_fallback_used ? "true" : "false") << ","
         << "\"ideal_vs_adaptive_sync_score\":"
         << finite_or_zero(d.ideal_vs_adaptive_sync_score) << ","
+        << "\"weighted_correlation_enabled\":"
+        << (d.weighted_correlation_enabled ? "true" : "false") << ","
+        << "\"weight_min\":" << finite_or_zero(d.weight_min) << ","
+        << "\"weight_max\":" << finite_or_zero(d.weight_max) << ","
+        << "\"weight_mean\":" << finite_or_zero(d.weight_mean) << ","
+        << "\"weight_fallback_used\":"
+        << (d.weight_fallback_used ? "true" : "false") << ","
         << "\"clock_scale\":" << finite_or_zero(t.clock_scale) << ","
         << "\"clock_fit_error_rms_samples\":"
         << finite_or_zero(t.clock_fit_error_rms_samples) << ","
@@ -2211,6 +2414,7 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
             size_t(std::max(0.0, std::floor(lock.preamble_pos + 0.5)));
         diag.estimated_symbol_span = lock.symbol_span;
         diag.adaptive_channel_templates_enabled = g_adaptive_channel_templates_enabled;
+        diag.weighted_correlation_enabled = g_weighted_correlation_enabled;
         if (lock.score < STREAM_DECODE_SYNC_SCORE_THRESHOLD) {
             diag.cause = DecodeFailureCause::FalseLock;
             return diag;
@@ -2252,8 +2456,13 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
                     AdaptiveTemplateBank working_adaptive = adaptive;
                     AdaptiveTemplateBank* adaptive_ptr =
                         (template_mode == 0 && working_adaptive.valid) ? &working_adaptive : nullptr;
+                    const WeightedCorrelationModel weighted_model =
+                        build_weighted_correlation_model(pcm, lock, adaptive_ptr);
+                    const WeightedCorrelationModel* weights =
+                        weighted_model.valid ? &weighted_model : nullptr;
                     MetricStats metric_stats =
-                        estimate_metric_stats_from_known_symbols(pcm, lock, adaptive_ptr);
+                        estimate_metric_stats_from_known_symbols(pcm, lock, adaptive_ptr,
+                                                                 weights);
                     TimingDiagnostics timing_diag;
                     timing_diag_record_sync_clock_points(&timing_diag, lock);
                     DemodConfig header_demod_cfg;
@@ -2261,6 +2470,7 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
                         decode_llrs_tracking(pcm, data_pos, candidate_span,
                                              FEC_CODEWORD_BITS, adaptive_ptr, false,
                                              demod_cfg, &metric_stats, &timing_diag,
+                                             weights,
                                              g_timing_search_profile, &header_demod_cfg,
                                              double(PREAMBLE_SYMBOLS + SYNC_SYMBOLS) *
                                                  NOMINAL_SPAN);
@@ -2281,6 +2491,11 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
                         diag.timing_diag = timing_diag;
                         diag.demod_cfg_used = header_demod_cfg;
                         diag.channel_template_fallback_used = adaptive_ptr == nullptr;
+                        diag.weight_min = weighted_model.weight_min;
+                        diag.weight_max = weighted_model.weight_max;
+                        diag.weight_mean = weighted_model.weight_mean;
+                        diag.weight_fallback_used =
+                            g_weighted_correlation_enabled && !weighted_model.valid;
                         saw_header_candidate = true;
                     }
 
@@ -2297,6 +2512,11 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
                     diag.timing_diag = timing_diag;
                     diag.demod_cfg_used = header_demod_cfg;
                     diag.channel_template_fallback_used = adaptive_ptr == nullptr;
+                    diag.weight_min = weighted_model.weight_min;
+                    diag.weight_max = weighted_model.weight_max;
+                    diag.weight_mean = weighted_model.weight_mean;
+                    diag.weight_fallback_used =
+                        g_weighted_correlation_enabled && !weighted_model.valid;
 
                     const size_t required_symbols =
                         (required_fec_bits + BITS_PER_SYMBOL - 1) / BITS_PER_SYMBOL;
@@ -2319,6 +2539,7 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
                                              required_fec_bits, full_adaptive_ptr,
                                              full_adaptive_ptr != nullptr,
                                              demod_cfg, &metric_stats, &timing_diag,
+                                             weights,
                                              g_timing_search_profile, &full_demod_cfg,
                                              double(PREAMBLE_SYMBOLS + SYNC_SYMBOLS) *
                                                  NOMINAL_SPAN);
@@ -2336,6 +2557,11 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
                     diag.timing_diag = timing_diag;
                     diag.demod_cfg_used = full_demod_cfg;
                     diag.channel_template_fallback_used = full_adaptive_ptr == nullptr;
+                    diag.weight_min = weighted_model.weight_min;
+                    diag.weight_max = weighted_model.weight_max;
+                    diag.weight_mean = weighted_model.weight_mean;
+                    diag.weight_fallback_used =
+                        g_weighted_correlation_enabled && !weighted_model.valid;
                     if (ok) {
                         diag.ok = true;
                         diag.cause = DecodeFailureCause::None;
@@ -3467,6 +3693,9 @@ int main(int argc, char** argv) {
                       << " [--adaptive-clock-tracking] <command> ...\n"
                       << "  " << argv[0]
                       << " [--adaptive-channel-templates|--no-adaptive-channel-templates]"
+                      << " <command> ...\n"
+                      << "  " << argv[0]
+                      << " [--weighted-correlation|--no-weighted-correlation]"
                       << " <command> ...\n"
                       << "  " << argv[0] << " [--rx-diagnostics] dec input.pcm output.bin\n"
                       << "  " << argv[0] << " measure-metric [trials-per-snr]\n"

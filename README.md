@@ -386,6 +386,13 @@ This channel-template path is controlled by `--adaptive-channel-templates` and
 A/B testing; enabling it uses known preamble/sync/pilot symbols to estimate
 channel-shaped templates for the current frame.
 
+`--weighted-correlation` adds another opt-in metric path. It estimates per-sample
+reliability weights from residuals on known preamble/sync symbols, clamps and
+normalizes those weights, then uses time-domain weighted correlation for symbol
+decisions in that frame. This is intentionally conservative: without the flag
+the receiver keeps the normal FFT correlation path, and if too few known symbols
+are usable the weighted path falls back to unweighted scoring.
+
 During full-frame demodulation the receiver also performs decision-directed
 template tracking. Only symbols with a high best-vs-second-best correlation
 margin and a small timing offset are allowed to update the learned base chirp.
@@ -620,6 +627,14 @@ Receiver diagnostics include `adaptive_channel_templates_enabled`,
 `channel_template_fallback_used`, and `ideal_vs_adaptive_sync_score` so scripts
 can compare ideal and channel-shaped templates without changing the transmitted
 waveform.
+
+When `--weighted-correlation` is enabled, diagnostics also include
+`weighted_correlation_enabled`, `weight_min`, `weight_max`, `weight_mean`, and
+`weight_fallback_used`. The comparison regression is:
+
+```bash
+bazel test -c opt //lab:chirp_weighted_correlation_compare_test --test_output=all
+```
 
 ### Synthetic Radio Channel Test
 
