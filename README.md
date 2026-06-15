@@ -697,7 +697,10 @@ raw SER/BER, oracle debug SER/BER, PER, and accepted-payload BER. Use
 columns are only a diagnostic for "could a better candidate selection have
 helped?". Timing-search diagnostics report the selected profile, how many
 symbols used full/local/center search, and the average timing offsets checked
-per decoded symbol.
+per decoded symbol. Receiver diagnostics also report a linear clock fit from
+known preamble/sync/pilot positions as `estimated_clock_ppm`,
+`clock_fit_error_rms_samples`, and `clock_fit_points`; this is currently
+observability only and does not change timing correction behavior.
 
 The PCM measurement is not yet a calibrated standards-style Eb/N0 compliance
 test. It prints estimated Eb/N0 and processing gain from the configured audio

@@ -300,11 +300,19 @@ struct TimingDiagnostics {
     double timing_offset_initial_samples;
     double timing_offset_final_samples;
     int timing_corrections_applied;
+    double estimated_clock_ppm;
+    double clock_fit_error_rms_samples;
+    int clock_fit_points;
 
     double pilot_margin_sum;
     double pilot_offset_sq_sum;
     double timing_error_sq_sum;
     double span_sum;
+    double clock_fit_sum_expected;
+    double clock_fit_sum_observed;
+    double clock_fit_sum_expected_sq;
+    double clock_fit_sum_observed_sq;
+    double clock_fit_sum_expected_observed;
     int timing_error_samples;
     int span_samples;
     int timing_search_symbols;
@@ -319,8 +327,12 @@ struct TimingDiagnostics {
           timing_search_local_count(0), timing_search_center_count(0),
           average_offsets_per_symbol(0.0), timing_offset_initial_samples(0.0),
           timing_offset_final_samples(0.0), timing_corrections_applied(0),
-          pilot_margin_sum(0.0), pilot_offset_sq_sum(0.0), timing_error_sq_sum(0.0),
-          span_sum(0.0), timing_error_samples(0), span_samples(0),
+          estimated_clock_ppm(0.0), clock_fit_error_rms_samples(0.0),
+          clock_fit_points(0), pilot_margin_sum(0.0), pilot_offset_sq_sum(0.0),
+          timing_error_sq_sum(0.0), span_sum(0.0), clock_fit_sum_expected(0.0),
+          clock_fit_sum_observed(0.0), clock_fit_sum_expected_sq(0.0),
+          clock_fit_sum_observed_sq(0.0), clock_fit_sum_expected_observed(0.0),
+          timing_error_samples(0), span_samples(0),
           timing_search_symbols(0), timing_search_offsets(0) {}
 };
 
@@ -845,6 +857,22 @@ static SyncLock find_sync(const std::vector<int16_t>& pcm,
     return refined;
 }
 
+static void timing_diag_record_clock_point(TimingDiagnostics* diag,
+                                           double expected_sample,
+                                           double observed_sample);
+
+static void timing_diag_record_sync_clock_points(TimingDiagnostics* diag,
+                                                 const SyncLock& lock) {
+    timing_diag_record_clock_point(diag, 0.0, lock.preamble_pos);
+    timing_diag_record_clock_point(diag,
+                                   double(PREAMBLE_SYMBOLS) * NOMINAL_SPAN,
+                                   lock.sync_pos);
+    timing_diag_record_clock_point(
+        diag,
+        double(PREAMBLE_SYMBOLS + SYNC_SYMBOLS) * NOMINAL_SPAN,
+        lock.sync_pos + double(SYNC_SYMBOLS) * lock.symbol_span);
+}
+
 static MetricStats estimate_metric_stats_from_known_symbols(
     const std::vector<int16_t>& pcm,
     const SyncLock& lock,
@@ -901,6 +929,36 @@ static void timing_diag_record_error(TimingDiagnostics* diag, double error) {
         std::sqrt(diag->timing_error_sq_sum / double(diag->timing_error_samples));
 }
 
+static void timing_diag_record_clock_point(TimingDiagnostics* diag,
+                                           double expected_sample,
+                                           double observed_sample) {
+    if (diag == nullptr) return;
+    ++diag->clock_fit_points;
+    diag->clock_fit_sum_expected += expected_sample;
+    diag->clock_fit_sum_observed += observed_sample;
+    diag->clock_fit_sum_expected_sq += expected_sample * expected_sample;
+    diag->clock_fit_sum_observed_sq += observed_sample * observed_sample;
+    diag->clock_fit_sum_expected_observed += expected_sample * observed_sample;
+
+    const double n = double(diag->clock_fit_points);
+    const double sx = diag->clock_fit_sum_expected;
+    const double sy = diag->clock_fit_sum_observed;
+    const double sxx = diag->clock_fit_sum_expected_sq;
+    const double syy = diag->clock_fit_sum_observed_sq;
+    const double sxy = diag->clock_fit_sum_expected_observed;
+    const double denom = n * sxx - sx * sx;
+    if (diag->clock_fit_points < 2 || std::abs(denom) < 1e-9) return;
+
+    const double scale = (n * sxy - sx * sy) / denom;
+    const double offset = (sy - scale * sx) / n;
+    const double sse =
+        syy + n * offset * offset + scale * scale * sxx +
+        2.0 * offset * scale * sx - 2.0 * offset * sy - 2.0 * scale * sxy;
+    diag->estimated_clock_ppm = (scale - 1.0) * 1000000.0;
+    diag->clock_fit_error_rms_samples =
+        std::sqrt(std::max(0.0, sse / n));
+}
+
 static double percentile_from_samples(std::vector<double> samples, double percentile) {
     if (samples.empty()) return 0.0;
     std::sort(samples.begin(), samples.end());
@@ -953,7 +1011,8 @@ static std::vector<double> decode_llrs_tracking(const std::vector<int16_t>& pcm,
                                                 TimingDiagnostics* timing_diag = nullptr,
                                                 TimingSearchProfile timing_search_profile =
                                                     g_timing_search_profile,
-                                                DemodConfig* effective_demod_cfg = nullptr) {
+                                                DemodConfig* effective_demod_cfg = nullptr,
+                                                double clock_fit_base_expected_sample = 0.0) {
     std::vector<double> llrs;
     DemodConfig active_demod_cfg =
         calibrate_llr_from_known_symbols(demod_cfg,
@@ -970,6 +1029,7 @@ static std::vector<double> decode_llrs_tracking(const std::vector<int16_t>& pcm,
     const double template_update_max_timing_offset = 4.0;
     const double template_learning_rate = 0.010;
     size_t data_symbols = 0;
+    size_t physical_symbols_since_data_start = 0;
     size_t next_pilot_after = size_t(PILOT_INTERVAL_SYMBOLS);
     bool timing_search_stable = false;
     timing_diag_record_span(timing_diag, timing.span);
@@ -988,6 +1048,11 @@ static std::vector<double> decode_llrs_tracking(const std::vector<int16_t>& pcm,
             }
             const double pilot_confidence =
                 pilot.metric[size_t(PILOT_SYMBOL)] - best_other;
+            timing_diag_record_clock_point(
+                timing_diag,
+                clock_fit_base_expected_sample +
+                    double(physical_symbols_since_data_start) * NOMINAL_SPAN,
+                timing.pos + pilot.timing_offset);
             metric_stats_observe_known_symbol(metric_stats, pilot, PILOT_SYMBOL);
             active_demod_cfg =
                 calibrate_llr_from_known_symbols(active_demod_cfg,
@@ -1037,6 +1102,7 @@ static std::vector<double> decode_llrs_tracking(const std::vector<int16_t>& pcm,
             }
             timing_diag_record_span(timing_diag, timing.span);
             next_pilot_after += size_t(PILOT_INTERVAL_SYMBOLS);
+            ++physical_symbols_since_data_start;
             continue;
         }
 
@@ -1072,6 +1138,7 @@ static std::vector<double> decode_llrs_tracking(const std::vector<int16_t>& pcm,
             symbol_metrics_to_llr(m, active_demod_cfg, metric_stats);
         for (double v : symbol_llr) llrs.push_back(v);
         ++data_symbols;
+        ++physical_symbols_since_data_start;
 
         if (decision_directed_update && adaptive != nullptr && adaptive->valid &&
             m.best_score > template_update_best_score &&
@@ -1891,10 +1958,6 @@ static void print_receiver_diagnostics_json(const ReceiverDiagnostics& rx) {
     const DecodeAttemptDiagnostics& d = rx.decode;
     const MetricStats& m = d.metric_stats;
     const TimingDiagnostics& t = d.timing_diag;
-    const double selected_span =
-        d.selected_candidate_span > 0.0 ? d.selected_candidate_span : d.estimated_symbol_span;
-    const double estimated_clock_ppm =
-        selected_span > 0.0 ? (selected_span / NOMINAL_SPAN - 1.0) * 1000000.0 : 0.0;
     const int ldpc_iterations =
         std::max(d.header_fec.max_iterations, d.body_fec.max_iterations);
     const bool ldpc_success =
@@ -1920,7 +1983,11 @@ static void print_receiver_diagnostics_json(const ReceiverDiagnostics& rx) {
         << "\"payload_bytes\":" << d.payload_bytes << ","
         << "\"fec_enabled\":" << (rx.fec_enabled ? "true" : "false") << ","
         << "\"fec_mode\":\"" << rx.fec_mode << "\","
-        << "\"estimated_clock_ppm\":" << finite_or_zero(estimated_clock_ppm) << ","
+        << "\"estimated_clock_ppm\":"
+        << finite_or_zero(t.estimated_clock_ppm) << ","
+        << "\"clock_fit_error_rms_samples\":"
+        << finite_or_zero(t.clock_fit_error_rms_samples) << ","
+        << "\"clock_fit_points\":" << t.clock_fit_points << ","
         << "\"timing_offset_initial_samples\":"
         << finite_or_zero(t.timing_offset_initial_samples) << ","
         << "\"timing_offset_final_samples\":"
@@ -2022,12 +2089,15 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
                     MetricStats metric_stats =
                         estimate_metric_stats_from_known_symbols(pcm, lock, adaptive_ptr);
                     TimingDiagnostics timing_diag;
+                    timing_diag_record_sync_clock_points(&timing_diag, lock);
                     DemodConfig header_demod_cfg;
                     std::vector<double> header_llrs =
                         decode_llrs_tracking(pcm, data_pos, candidate_span,
                                              FEC_CODEWORD_BITS, adaptive_ptr, false,
                                              demod_cfg, &metric_stats, &timing_diag,
-                                             g_timing_search_profile, &header_demod_cfg);
+                                             g_timing_search_profile, &header_demod_cfg,
+                                             double(PREAMBLE_SYMBOLS + SYNC_SYMBOLS) *
+                                                 NOMINAL_SPAN);
                     if (header_llrs.size() < FEC_CODEWORD_BITS) {
                         saw_incomplete = true;
                         continue;
@@ -2081,7 +2151,9 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
                                              required_fec_bits, full_adaptive_ptr,
                                              full_adaptive_ptr != nullptr,
                                              demod_cfg, &metric_stats, &timing_diag,
-                                             g_timing_search_profile, &full_demod_cfg);
+                                             g_timing_search_profile, &full_demod_cfg,
+                                             double(PREAMBLE_SYMBOLS + SYNC_SYMBOLS) *
+                                                 NOMINAL_SPAN);
                     if (frame_llrs.size() < required_fec_bits) {
                         saw_incomplete = true;
                         continue;
@@ -2660,6 +2732,12 @@ static void run_pcm_debug_measurement(const std::string& profile,
                       << diag.demod_cfg_used.known_symbol_margin_median
                       << " known_symbol_count="
                       << diag.demod_cfg_used.known_symbol_count
+                      << " estimated_clock_ppm="
+                      << diag.timing_diag.estimated_clock_ppm
+                      << " clock_fit_error_rms_samples="
+                      << diag.timing_diag.clock_fit_error_rms_samples
+                      << " clock_fit_points="
+                      << diag.timing_diag.clock_fit_points
                       << "\n";
             continue;
         }
@@ -2733,6 +2811,10 @@ static void run_pcm_debug_measurement(const std::string& profile,
                   << diag.timing_diag.timing_search_center_count
                   << " average_offsets_per_symbol="
                   << diag.timing_diag.average_offsets_per_symbol
+                  << " estimated_clock_ppm=" << diag.timing_diag.estimated_clock_ppm
+                  << " clock_fit_error_rms_samples="
+                  << diag.timing_diag.clock_fit_error_rms_samples
+                  << " clock_fit_points=" << diag.timing_diag.clock_fit_points
                   << "\n";
         std::cout << "header_decoded_bytes_hex="
                   << bytes_to_hex_string(diag.header_decoded_bytes) << "\n";
