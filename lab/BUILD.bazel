@@ -282,6 +282,7 @@ sh_test(
     srcs = ["wav_to_pcm_test.sh"],
     data = [":pcm_to_wav", ":wav_to_pcm"],
     size = "small",
+    timeout = "moderate",
     tags = ["manual", "slow"],
 )
 

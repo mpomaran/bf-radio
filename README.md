@@ -224,6 +224,13 @@ Slow shell tests print `TIMING` summary lines with wall-clock seconds and the
 number of shell-level encode/decode invocations per section. This is for test
 cost accounting only and does not affect modem behavior.
 
+Current validation note, 2026-06-16: `bazel test -c opt //lab:slow_tests
+--test_output=errors` and `bazel test -c opt //lab:performance_torture_tests
+--test_output=errors` pass in this workspace. `//lab:wav_to_pcm_test` is tagged
+with a `moderate` timeout because it normally takes about 36-40 seconds on the
+Windows/Bazel setup used for this run and can exceed Bazel's default small-test
+timeout under parallel load.
+
 `//lab:chirp_modem_test` is kept as an explicit manual diagnostic target for
 the older broad 95..105% drift loop. It is tagged `known_failing` because that
 case was already failing before this test-suite split. Use the focused fast
@@ -369,20 +376,14 @@ bazel-bin/lab/chirp_modem.exe --rx-profile=robust measure-pcm-debug --profile ra
 bazel-bin/lab/chirp_modem.exe compare-demod --profile radio --snr 9 --trials 100
 ```
 
-Validation status from the same run:
+Validation status from the 2026-06-16 run:
 
-- `//lab:slow_tests`: 17 of 20 targets passed. Failing targets were
-  `//lab:chirp_recorded_wav_test`, `//lab:chirp_recorded_wav_long_test`, and
-  `//lab:wav_to_pcm_test`. The recorded WAV logs ended after the WAV-to-PCM
-  timing line; `wav_to_pcm_test` timed out at 60 seconds on this Windows run.
-  These three targets are not tagged `known_failing` in `lab/BUILD.bazel`.
-- `//lab:performance_torture_tests`: 4 of 5 targets passed. The failing target
-  was `//lab:chirp_recorded_wav_long_test`, which failed to build because these
-  testdata files were absent from the workspace/runfiles:
-  `testdata/encoded_2.txt`, `testdata/original_encoded.pcm`,
-  `testdata/original_2_encoded.pcm`, `testdata/received2.wav`,
-  `testdata/transmitted.txt`, and `testdata/transmitted.wav`. This target is
-  not tagged `known_failing` in `lab/BUILD.bazel`.
+- `//lab:slow_tests`: passed with `--test_output=errors`.
+- `//lab:performance_torture_tests`: passed with `--test_output=errors`.
+- `//lab:wav_to_pcm_test`: passed standalone in about 40 seconds and inside
+  `//lab:slow_tests` in about 36 seconds after its Bazel timeout was changed to
+  `moderate`. The timeout change is test accounting only; it does not change
+  modem, WAV, PCM, or receiver behavior.
 
 These measurements are regression evidence, not a production qualification.
 They are not calibrated RF SNR measurements, not standards BER curves, and not
@@ -690,6 +691,59 @@ bazel-bin/lab/chirp_modem measure-pcm 10
 bazel-bin/lab/chirp_modem measure-pcm-debug --profile radio --snr 24 --trials 20
 bazel-bin/lab/chirp_modem --adaptive-llr --weighted-correlation measure-pcm-debug --profile awgn --snr 18 --trials 20
 ```
+
+### Current PCM SNR Sweep
+
+Current deterministic end-to-end PCM measurements, 2026-06-16, robust receiver
+defaults, 20 packets per SNR point:
+
+```bash
+bazel-bin/lab/chirp_modem.exe measure-pcm-sweep --profile awgn --trials 20
+bazel-bin/lab/chirp_modem.exe measure-pcm-sweep --profile radio --trials 20
+```
+
+| Profile | SNR dB | PER | rx_raw_ser | rx_raw_ber | mean_peak_margin |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| awgn | 3 | 0.00 | 0.119531 | 0.0426953 | 0.628307 |
+| awgn | 0 | 0.00 | 0.170781 | 0.0598828 | 0.541372 |
+| awgn | -3 | 0.00 | 0.244062 | 0.0847656 | 0.413307 |
+| radio | 3 | 0.00 | 0.938594 | 0.353789 | 0.542896 |
+| radio | 0 | 0.00 | 0.946875 | 0.371602 | 0.453099 |
+| radio | -3 | 0.00 | 0.942969 | 0.436641 | 0.342762 |
+
+Lower-SNR spot checks with `compare-demod` calibrated rows:
+
+```bash
+bazel-bin/lab/chirp_modem.exe compare-demod --profile awgn --snr -6 --trials 20
+bazel-bin/lab/chirp_modem.exe compare-demod --profile radio --snr -6 --trials 20
+bazel-bin/lab/chirp_modem.exe compare-demod --profile awgn --snr -9 --trials 20
+bazel-bin/lab/chirp_modem.exe compare-demod --profile radio --snr -9 --trials 20
+```
+
+| Profile | SNR dB | PER | Dominant failure observation |
+| --- | ---: | ---: | --- |
+| awgn | -6 | 0.65 | body FEC failures dominate; sync/header usually still lock |
+| awgn | -9 | 1.00 | mixed header/body/sync/false-lock failures |
+| radio | -6 | 1.00 | false-lock/body-FEC failures; first debug failure was `false_lock` |
+| radio | -9 | 1.00 | false-lock failures dominate |
+
+Interpretation for this synthetic model: both AWGN and radio pass at `-3 dB` in
+the 20-packet sweep, while the radio profile collapses by `-6 dB`. AWGN degrades
+more gradually at `-6 dB` and fully collapses by `-9 dB` in the spot check. That
+puts the current radio-model penalty at roughly 0-3 dB at packet-failure onset
+and about 3 dB at full collapse, for this coarse grid only.
+
+Debug excerpts at `-6 dB`:
+
+```text
+awgn:  trial=0 status=fail cause=body_fec sync_score=0.460641 header_raw_symbol_errors=7 header_raw_bit_errors=9 known_symbol_count=29 timing_error_rms=1.01322
+radio: trial=0 status=fail cause=false_lock sync_score=0.272070 header_raw_symbol_errors=31 header_raw_bit_errors=54 known_symbol_count=0 timing_search_local_count=0
+```
+
+The radio-profile `rx_raw_ser`/`rx_raw_ber` columns are currently poor absolute
+quality indicators under this impairment: they can look very high even when
+packet PER is zero. Use packet PER, failure class, sync score, margin, and debug
+diagnostics when judging the radio profile.
 
 ### Clock Drift Assumptions
 
