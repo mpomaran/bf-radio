@@ -325,10 +325,9 @@ sh_test(
     data = [
         ":chirp_modem",
         ":pcm_audio_channel_impair",
-        "//:phone_recording_testdata",
     ],
     size = "small",
-    tags = ["manual", "slow", "testdata"],
+    tags = ["manual", "slow"],
 )
 
 sh_test(
@@ -369,10 +368,9 @@ sh_test(
     data = [
         ":chirp_modem",
         ":pcm_radio_channel_impair",
-        "//:phone_recording_testdata",
     ],
     size = "medium",
-    tags = ["manual", "slow", "testdata"],
+    tags = ["manual", "slow"],
 )
 
 sh_test(

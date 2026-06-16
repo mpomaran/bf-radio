@@ -23,7 +23,8 @@ find_runfile() {
 
 chirp_modem="$(find_runfile lab/chirp_modem)"
 impair="$(find_runfile lab/pcm_radio_channel_impair)"
-expected="$(rlocation testdata/transmitted.txt)"
+expected="$TEST_TMPDIR/expected.txt"
+printf 'Synthetic radio channel regression payload.\n' >"$expected"
 
 original="$TEST_TMPDIR/original_encoded.pcm"
 impaired="$TEST_TMPDIR/radio_channel.pcm"

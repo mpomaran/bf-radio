@@ -859,9 +859,39 @@ through a microphone:
 pcm_audio_channel_impair input.pcm output.pcm
 ```
 
-The model adds leading/trailing silence, gain envelope, DC blocking, simple
-low-pass filtering, a short echo, and deterministic noise. It is a regression
-tool for modem robustness, not a calibrated acoustic model.
+The default model is loosely fitted to the checked-in local `testdata`
+sent/received captures. Those captures show received RMS around 14-20% of the
+generated PCM RMS, received peaks around 10-11k, and extra leading/trailing
+samples from the recording path. The tool is still deterministic and synthetic;
+it is not a calibrated acoustic or RF model.
+
+The model can combine:
+
+- audio level presets: `--audio-level quiet|normal|loud|overdrive`
+- AWGN relative to the current impaired signal: `--snr-db N`
+- speech-like band limiting, enabled by default: `--bandpass-low-hz 300
+  --bandpass-high-hz 3000`
+- random squelch/fade drops: `--drop-count N --drop-min-ms N --drop-max-ms N
+  --drop-depth X`
+- sample-rate offset: `--time-scale-ppm PPM`
+- clipping: `--clip-level X` or percentile clipping with `--clip-percent P`
+- impulsive noise: `--impulse-probability P --impulse-amplitude X`
+- echo and envelope controls: `--echo-delay`, `--echo-gain`, `--fade`
+
+Examples:
+
+```bash
+pcm_audio_channel_impair input.pcm quiet.pcm --audio-level quiet --snr-db 30
+pcm_audio_channel_impair input.pcm voiceband.pcm --bandpass-low-hz 300 --bandpass-high-hz 3000
+pcm_audio_channel_impair input.pcm clipped.pcm --audio-level overdrive --clip-percent 6
+pcm_audio_channel_impair input.pcm clock.pcm --time-scale-ppm 1000
+pcm_audio_channel_impair input.pcm drops.pcm --drop-count 1 --drop-min-ms 20 --drop-max-ms 200 --drop-depth 0.35
+pcm_audio_channel_impair input.pcm impulses.pcm --impulse-probability 0.0003 --impulse-amplitude 2200
+```
+
+`//lab:chirp_audio_channel_impair_test` runs a deterministic matrix covering
+quiet/normal/loud/overdrive levels, 300-3000 Hz band limiting, a 1000 ppm clock
+offset, a short squelch drop, percentile clipping, AWGN, and impulsive noise.
 
 With `--adaptive-channel-templates`, the chirp decoder learns a
 channel-adapted chirp template from the repeated preamble symbols. It tries that
