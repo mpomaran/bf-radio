@@ -27,6 +27,7 @@
 #include "lab/chirp/bit_utils.h"
 #include "lab/chirp/adaptive_templates.h"
 #include "lab/chirp/config.h"
+#include "lab/chirp/demodulator.h"
 #include "lab/chirp/demod_metrics.h"
 #include "lab/chirp/fec_ldpc.h"
 #include "lab/chirp/fft.h"
@@ -73,11 +74,7 @@ using chirp::config::SYMBOL_SAMPLES;
 using chirp::config::SYNC_SYMBOLS;
 using chirp::config::PhyProfile;
 using chirp::config::current_phy_profile;
-using chirp::dsp::CircularCorrelationScratch;
-using chirp::dsp::PrecomputedChirpTemplate;
 using chirp::dsp::circular_chirp_correlation_diagnostics;
-using chirp::dsp::circular_chirp_correlation_precomputed_into;
-using chirp::dsp::cyclic_corr_sample;
 using chirp::dsp::FftCorrelationDiagnostics;
 using chirp::dsp::reset_circular_chirp_correlation_diagnostics;
 using chirp::demod::DemodConfig;
@@ -88,6 +85,10 @@ using chirp::demod::fixed_llr_demod_config;
 using chirp::demod::llr_mode_name;
 using chirp::demod::metric_stats_observe_known_symbol;
 using chirp::demod::symbol_metrics_to_llr;
+using chirp::demodulator::decode_symbol_metrics_at;
+using chirp::demodulator::estimate_metric_stats_from_known_symbols;
+using chirp::demodulator::finalize_best_scores;
+using chirp::demodulator::ideal_vs_adaptive_template_score_delta;
 using chirp::fec::FecDecodeResult;
 using chirp::fec::LDPCCodec;
 using chirp::fec::fec_decode_bits_from_llr;
@@ -122,7 +123,6 @@ using chirp::receiver::receiver_profile_name;
 using chirp::receiver::TimingDiagnostics;
 using chirp::receiver::TimingSearchProfile;
 using chirp::receiver::timing_search_profile_name;
-using chirp::sample::normalized_symbol_samples;
 using chirp::sample::sample_at;
 using chirp::sync::find_sync;
 using chirp::sync::preamble_score_at;
@@ -140,10 +140,7 @@ using chirp::timing::timing_diag_record_span;
 using chirp::timing::timing_diag_record_sync_clock_points;
 using chirp::timing::timing_loop_config_for_templates;
 using chirp::waveform::append_symbol_pcm;
-using chirp::waveform::symbol_template;
 using chirp::weighted::build_weighted_correlation_model;
-using chirp::weighted::corr_score_adaptive_weighted;
-using chirp::weighted::corr_score_weighted;
 using chirp::weighted::WeightedCorrelationModel;
 
 static void print_not_same_bitrate_notice() {
@@ -171,180 +168,6 @@ static DemodConfig receiver_demod_config() {
     return receiver_demod_config(g_receiver_options);
 }
 
-static bool fast_symbol_metrics_from_base(const std::vector<int16_t>& pcm,
-                                          double pos,
-                                          double symbol_span,
-                                          const PrecomputedChirpTemplate& base_fft,
-                                          const double* fractional_offsets,
-                                          int fractional_offset_count,
-                                          CircularCorrelationScratch* scratch,
-                                          std::array<double, SYMBOL_SAMPLES>* corr,
-                                          SymbolMetrics* m) {
-    if (pos < 0.0 || pos + symbol_span >= double(pcm.size())) return false;
-    const std::array<double, SYMBOL_SAMPLES> samples =
-        normalized_symbol_samples(pcm, pos, symbol_span);
-    double energy = 0.0;
-    for (double v : samples) energy += v * v;
-    if (energy <= 1e-9) return false;
-
-    circular_chirp_correlation_precomputed_into(samples, base_fft, scratch, corr);
-    for (int s = 0; s < ALPHABET; ++s) {
-        const double shift = double(s * SYMBOL_SAMPLES / ALPHABET);
-        double score = -1.0;
-        for (int i = 0; i < fractional_offset_count; ++i) {
-            score = std::max(
-                score,
-                std::abs(cyclic_corr_sample(*corr, shift + fractional_offsets[i])));
-        }
-        m->metric[size_t(s)] = score;
-    }
-    return true;
-}
-
-static void finalize_best_scores(SymbolMetrics* m) {
-    m->best_score = -1.0;
-    m->second_best_score = -1.0;
-    m->best_symbol = 0;
-    for (int s = 0; s < ALPHABET; ++s) {
-        const double score = m->metric[size_t(s)];
-        if (score > m->best_score) {
-            m->second_best_score = m->best_score;
-            m->best_score = score;
-            m->best_symbol = s;
-        } else if (score > m->second_best_score) {
-            m->second_best_score = score;
-        }
-    }
-}
-
-static void timing_diag_record_search(TimingDiagnostics* diag,
-                                      TimingSearchProfile profile,
-                                      int offset_count) {
-    if (diag == nullptr) return;
-    switch (profile) {
-        case TimingSearchProfile::Full:
-            ++diag->timing_search_full_count;
-            break;
-        case TimingSearchProfile::Local:
-            ++diag->timing_search_local_count;
-            break;
-        case TimingSearchProfile::CenterOnly:
-            ++diag->timing_search_center_count;
-            break;
-    }
-    ++diag->timing_search_symbols;
-    diag->timing_search_offsets += offset_count;
-    diag->average_offsets_per_symbol =
-        double(diag->timing_search_offsets) /
-        double(std::max(1, diag->timing_search_symbols));
-}
-
-static SymbolMetrics decode_symbol_metrics_at(const std::vector<int16_t>& pcm,
-                                              double pos,
-                                              double symbol_span,
-                                              bool intermediate,
-                                              const AdaptiveTemplateBank* adaptive = nullptr,
-                                              const WeightedCorrelationModel* weights = nullptr,
-                                              int rank_symbol = -1,
-                                              TimingSearchProfile search_profile =
-                                                  TimingSearchProfile::Full,
-                                              TimingDiagnostics* timing_diag = nullptr) {
-    static const double full_offsets[] = {
-        -24.0, -18.0, -12.0, -8.0, -4.0, -2.0, -1.0, -0.5,
-        0.0,
-        0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 18.0, 24.0
-    };
-    static const double local_offsets[] = {-2.0, -1.0, 0.0, 1.0, 2.0};
-    static const double center_offsets[] = {0.0};
-
-    const double* timing_offsets = full_offsets;
-    int timing_offset_count = int(sizeof(full_offsets) / sizeof(full_offsets[0]));
-    if (search_profile == TimingSearchProfile::Local) {
-        timing_offsets = local_offsets;
-        timing_offset_count = int(sizeof(local_offsets) / sizeof(local_offsets[0]));
-    } else if (search_profile == TimingSearchProfile::CenterOnly) {
-        timing_offsets = center_offsets;
-        timing_offset_count = int(sizeof(center_offsets) / sizeof(center_offsets[0]));
-    }
-    timing_diag_record_search(timing_diag, search_profile, timing_offset_count);
-
-    SymbolMetrics best;
-    double best_rank = -1.0;
-    CircularCorrelationScratch corr_scratch;
-    std::array<double, SYMBOL_SAMPLES> corr = {};
-    for (int offset_index = 0; offset_index < timing_offset_count; ++offset_index) {
-        const double timing_offset = timing_offsets[offset_index];
-        SymbolMetrics current;
-        current.timing_offset = timing_offset;
-        bool used_fast = false;
-        const bool use_weighted = weights != nullptr && weights->valid;
-        if (!use_weighted && adaptive != nullptr && adaptive->valid) {
-            const double adaptive_offsets[3] = {-0.35, 0.0, 0.35};
-            const double centered_offset[1] = {0.0};
-            used_fast = fast_symbol_metrics_from_base(
-                pcm, pos + timing_offset, symbol_span, adaptive->base_fft,
-                intermediate ? adaptive_offsets : centered_offset,
-                intermediate ? 3 : 1, &corr_scratch, &corr, &current);
-        } else if (!use_weighted) {
-            const double ideal_offsets[3] = {-2.0, 0.0, 2.0};
-            const double centered_offset[1] = {0.0};
-            used_fast = fast_symbol_metrics_from_base(
-                pcm, pos + timing_offset, symbol_span, ideal_base_precomputed_template(),
-                intermediate ? ideal_offsets : centered_offset,
-                intermediate ? 3 : 1, &corr_scratch, &corr, &current);
-        }
-
-        if (!used_fast) {
-            for (int s = 0; s < ALPHABET; ++s) {
-                double score = -1.0;
-                if (intermediate) {
-                    for (int offset_index = 0; offset_index < 3; ++offset_index) {
-                        if (adaptive != nullptr && adaptive->valid) {
-                            score = std::max(
-                                score,
-                                corr_score_adaptive_weighted(
-                                    pcm, pos + timing_offset, symbol_span,
-                                    adaptive->tpl[size_t(s)][size_t(offset_index)],
-                                    weights));
-                        } else {
-                            score = std::max(
-                                score,
-                                corr_score_weighted(pcm, pos + timing_offset,
-                                                    symbol_span,
-                                                    symbol_template(s, offset_index),
-                                                    weights));
-                        }
-                    }
-                } else {
-                    if (adaptive != nullptr && adaptive->valid) {
-                        score = corr_score_adaptive_weighted(
-                            pcm, pos + timing_offset, symbol_span,
-                            adaptive->tpl[size_t(s)][1], weights);
-                    } else {
-                        score = corr_score_weighted(pcm, pos + timing_offset,
-                                                    symbol_span,
-                                                    symbol_template(s, 1), weights);
-                    }
-                }
-                current.metric[size_t(s)] = score;
-            }
-        }
-        finalize_best_scores(&current);
-
-        const double timing_penalty = (adaptive != nullptr && adaptive->valid) ? 0.012 : 0.003;
-        const double rank_score =
-            (rank_symbol >= 0 && rank_symbol < ALPHABET)
-                ? current.metric[size_t(rank_symbol)]
-                : current.best_score;
-        const double rank = rank_score - timing_penalty * std::abs(timing_offset);
-        if (rank > best_rank) {
-            best = current;
-            best_rank = rank;
-        }
-    }
-    return best;
-}
-
 static void encode_file(const std::string& in_path, const std::string& out_pcm_path) {
     const std::vector<uint8_t> payload = read_file(in_path);
     const std::vector<int16_t> pcm = encode_payload_to_pcm(payload);
@@ -353,61 +176,6 @@ static void encode_file(const std::string& in_path, const std::string& out_pcm_p
     std::cerr << "Encoded " << payload.size() << " bytes into "
               << pcm.size() << " PCM samples, duration "
               << double(pcm.size()) / SAMPLE_RATE << " s\n";
-}
-
-static double known_symbol_template_score(const std::vector<int16_t>& pcm,
-                                          const SyncLock& lock,
-                                          const AdaptiveTemplateBank* adaptive) {
-    const int sync[SYNC_SYMBOLS] = {15, 1, 14, 2, 13, 3, 12, 4};
-    double total = 0.0;
-    int samples = 0;
-    for (int i = 0; i < PREAMBLE_SYMBOLS; i += 6) {
-        const SymbolMetrics m =
-            decode_symbol_metrics_at(pcm, lock.preamble_pos + i * lock.symbol_span,
-                                     lock.symbol_span, true, adaptive, nullptr, 0);
-        total += m.metric[0];
-        ++samples;
-    }
-    for (int i = 0; i < SYNC_SYMBOLS; ++i) {
-        const SymbolMetrics m =
-            decode_symbol_metrics_at(pcm, lock.sync_pos + i * lock.symbol_span,
-                                     lock.symbol_span, true, adaptive, nullptr, sync[i]);
-        total += m.metric[size_t(sync[i])];
-        ++samples;
-    }
-    return samples > 0 ? total / double(samples) : 0.0;
-}
-
-static double ideal_vs_adaptive_template_score_delta(
-    const std::vector<int16_t>& pcm,
-    const SyncLock& lock,
-    const AdaptiveTemplateBank& adaptive) {
-    if (!adaptive.valid) return 0.0;
-    const double adaptive_score = known_symbol_template_score(pcm, lock, &adaptive);
-    const double ideal_score = known_symbol_template_score(pcm, lock, nullptr);
-    return adaptive_score - ideal_score;
-}
-
-static MetricStats estimate_metric_stats_from_known_symbols(
-    const std::vector<int16_t>& pcm,
-    const SyncLock& lock,
-    const AdaptiveTemplateBank* adaptive,
-    const WeightedCorrelationModel* weights = nullptr) {
-    MetricStats stats;
-    const int sync[SYNC_SYMBOLS] = {15, 1, 14, 2, 13, 3, 12, 4};
-    for (int i = 0; i < PREAMBLE_SYMBOLS; i += 4) {
-        const SymbolMetrics m =
-            decode_symbol_metrics_at(pcm, lock.preamble_pos + i * lock.symbol_span,
-                                     lock.symbol_span, true, adaptive, weights, 0);
-        metric_stats_observe_known_symbol(&stats, m, 0);
-    }
-    for (int i = 0; i < SYNC_SYMBOLS; ++i) {
-        const SymbolMetrics m =
-            decode_symbol_metrics_at(pcm, lock.sync_pos + i * lock.symbol_span,
-                                     lock.symbol_span, true, adaptive, weights, sync[i]);
-        metric_stats_observe_known_symbol(&stats, m, sync[i]);
-    }
-    return stats;
 }
 
 static double percentile_from_samples(std::vector<double> samples, double percentile) {

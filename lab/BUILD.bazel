@@ -72,6 +72,7 @@ cc_library(
         "chirp/adaptive_templates.cpp",
         "chirp/bit_utils.cpp",
         "chirp/crc16.cpp",
+        "chirp/demodulator.cpp",
         "chirp/demod_metrics.cpp",
         "chirp/fec_ldpc.cpp",
         "chirp/fft.cpp",
@@ -94,6 +95,7 @@ cc_library(
         "chirp/bit_utils.h",
         "chirp/config.h",
         "chirp/crc16.h",
+        "chirp/demodulator.h",
         "chirp/demod_metrics.h",
         "chirp/fec_ldpc.h",
         "chirp/fft.h",
@@ -140,6 +142,13 @@ cc_test(
 cc_test(
     name = "demod_metrics_test",
     srcs = ["chirp/demod_metrics_test.cpp"],
+    copts = CPP17_COPTS,
+    deps = [":chirp_modem_lib"],
+)
+
+cc_test(
+    name = "demodulator_test",
+    srcs = ["chirp/demodulator_test.cpp"],
     copts = CPP17_COPTS,
     deps = [":chirp_modem_lib"],
 )
@@ -503,6 +512,7 @@ test_suite(
         ":bit_utils_test",
         ":crc16_test",
         ":demod_metrics_test",
+        ":demodulator_test",
         ":fec_ldpc_test",
         ":fft_test",
         ":frame_test",
