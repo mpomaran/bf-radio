@@ -12,8 +12,8 @@ experiments:
   comparison point and earlier waveform design.
 
 The tests demonstrate repeatable packet recovery under specific synthetic PCM
-impairments. They are not full RF-channel measurements and do not currently
-provide BER/SER vs SNR curves.
+impairments. They are not full RF-channel measurements and should not be read as
+statistically complete BER/SER/PER-vs-SNR certification curves.
 
 ## Status
 
@@ -45,13 +45,15 @@ Current implementation facts:
 - `ALPHABET = 16`, so one CSS symbol carries 4 raw bits before protocol/FEC
   overhead.
 - `SYMBOL_SAMPLES = 128`, so one symbol is 128 samples = 16 ms = 256 PCM bytes.
+- Nominal symbol rate: 62.5 symbols/s. Nominal raw uncoded bit rate:
+  250 bit/s before FEC, pilots, preamble/sync, protected headers, CRC, and
+  trailing silence.
 - Preamble: 48 symbols of raw CSS symbol 0.
 - Sync sequence: `15, 1, 14, 2, 13, 3, 12, 4`.
 - PHY profile version: `1`. The measurement/accounting diagnostics do not by
   themselves change the over-the-air waveform, frame, FEC, or symbol layout.
 - Pilot symbol: raw CSS symbol `10` inserted every 32 protected data symbols.
-  This deliberately changes bitrate/latency/overhead in exchange for more
-  robust timing and template tracking.
+  Pilot overhead is part of the current legacy-compatible PHY profile.
 - Protected frame header: magic `CHRP`, version `1`, payload length, flags.
 - Maximum payload size: 4096 bytes.
 - TX scrambles protected FEC bits with a deterministic PRBS before Gray/CSS
@@ -59,10 +61,12 @@ Current implementation facts:
 - TX maps 4-bit groups through Gray coding before CSS symbol selection.
 - RX computes metrics for all 16 raw CSS symbols using a 128-point FFT circular
   correlation against the ideal or learned base chirp.
-- RX can learn an adaptive chirp template from the repeated preamble symbols,
-  which helps with speaker/recorder/microphone paths that reshape the waveform.
-- If the adaptive template does not validate a frame, RX retries the candidate
-  with the ideal synthetic template so clean time-scaling cases still work.
+- With `--adaptive-channel-templates`, RX can learn a chirp template from known
+  preamble/sync symbols, then use channel-shaped templates for the frame.
+- With `--weighted-correlation`, RX can estimate conservative per-sample
+  reliability weights from known-symbol residuals and use weighted time-domain
+  correlation. The default demodulator still uses the normal FFT correlation
+  path.
 - RX derives bit LLRs using a max-log style best-0 vs best-1 comparison.
 - Positive LLR means bit 0 is more likely; negative LLR means bit 1 is more
   likely.
@@ -81,12 +85,22 @@ Current implementation facts:
   candidate, tries candidate symbol spans, and locally refines the best lock.
 - Timing tracking uses a decision-directed loop with confidence gating and
   clamped symbol span updates.
+- With `--adaptive-clock-tracking`, RX may use a receiver-estimated linear
+  sample-clock model to choose data-symbol extraction positions. The default
+  timing loop remains available and unchanged.
 - A streaming scan API can classify rolling PCM windows as no frame, incomplete
   candidate, decoded frame, or rejected frame-like candidate.
 - The default PHY reports `same_bitrate_as_legacy=true` and
-  `same_channel_as_legacy=true`. A future non-legacy robustness profile that
-  changes bitrate, latency, overhead, symbol count, pilot overhead, FEC rate, or
-  frame duration must print:
+  `same_channel_as_legacy=true`. The current receiver-only flags
+  `--adaptive-llr`, `--adaptive-clock-tracking`,
+  `--adaptive-channel-templates`, `--weighted-correlation`, and
+  `--timing-search=...` do not change the transmitted waveform, channel
+  occupancy, frame format, symbol count, pilot spacing, or FEC rate.
+- A future non-legacy robustness profile that changes symbol length, alphabet
+  size, sample rate, bitrate, latency, overhead, symbol count, pilot overhead,
+  FEC rate, occupied channel, or frame duration must be clearly marked as
+  `same_bitrate_as_legacy=false` and/or `same_channel_as_legacy=false` and must
+  print:
   `NOT SAME BITRATE: this mode trades bitrate/latency/overhead for robustness.`
 
 High-level transmit path:
@@ -111,6 +125,8 @@ raw 8 kHz PCM16
 -> streaming preamble/sync acquisition
 -> optional preamble-adaptive channel template
 -> FFT circular-correlation symbol metrics
+-> optional weighted time-domain symbol metrics
+-> optional adaptive clock sample-position prediction
 -> pilot-aided timing/template updates
 -> bit LLRs
 -> PRBS LLR descrambler
@@ -375,11 +391,10 @@ kept only as a fallback for invalid windows.
 For clean synthetic PCM, the receiver can use the same ideal chirp templates as
 the transmitter. For real audio paths, such as a laptop speaker recorded by a
 phone and then replayed into a computer microphone, the waveform is no longer a
-perfect copy of the generated chirp. The current receiver therefore averages the
-known repeated preamble symbols into a local channel-adapted chirp template and
-uses cyclic shifts of that learned template for data demodulation. It then
-refines the template with the known sync symbols before any payload decisions
-are trusted.
+perfect copy of the generated chirp. With `--adaptive-channel-templates`, the
+receiver averages known preamble symbols into a local channel-adapted chirp
+template, refines it with the known sync symbols, and uses cyclic shifts of that
+learned template for data demodulation.
 
 This channel-template path is controlled by `--adaptive-channel-templates` and
 `--no-adaptive-channel-templates`. It is disabled by default for conservative
@@ -393,15 +408,15 @@ decisions in that frame. This is intentionally conservative: without the flag
 the receiver keeps the normal FFT correlation path, and if too few known symbols
 are usable the weighted path falls back to unweighted scoring.
 
-During full-frame demodulation the receiver also performs decision-directed
-template tracking. Only symbols with a high best-vs-second-best correlation
-margin and a small timing offset are allowed to update the learned base chirp.
-The selected raw CSS symbol is shifted back to the base orientation, polarity is
-aligned against the current template, and the base template is updated with a
-small exponential moving average. The per-symbol template bank is rebuilt from
-that base template. This lets the receiver follow slow speaker/recorder/channel
-shape changes during long frames without letting a weak symbol decision rewrite
-the demodulator.
+When adaptive channel templates are enabled, full-frame demodulation also uses
+conservative decision-directed template tracking. Only symbols with a high
+best-vs-second-best correlation margin and a small timing offset are allowed to
+update the learned base chirp. The selected raw CSS symbol is shifted back to
+the base orientation, polarity is aligned against the current template, and the
+base template is updated with a small exponential moving average. The
+per-symbol template bank is rebuilt from that base template. This can help track
+slow speaker/recorder/channel shape changes during long frames, but it is still
+an experimental receiver-side aid, not a production channel estimator.
 
 Candidate frames still must pass FEC and CRC validation; adaptive and
 decision-directed templates only improve the symbol metrics.
@@ -535,6 +550,98 @@ application payload boundary. A pass means:
 This measurement boundary hides raw symbol and bit errors because failed
 packets are rejected rather than counted as partial bit errors.
 
+### Channel and SNR Terms
+
+Use these terms consistently when interpreting modem results:
+
+- **AWGN SNR** is additive white Gaussian noise power relative to signal power in
+  a defined simulation boundary. In this repository it may refer either to a
+  synthetic metric-domain model or to noise added to generated PCM samples. It
+  is not automatically the same as RF receiver input SNR or calibrated Eb/N0.
+- **Effective decision SNR** is the quality seen by the demodulator after sync,
+  timing, filtering, correlation, LLR scaling, interleaving, and FEC. Multipath,
+  clipping, wrong timing, bad LLR scaling, or false-lock ambiguity can reduce
+  effective decision SNR even when sample-domain AWGN SNR looks high.
+- **Timing drift** means the receiver's predicted symbol boundary slowly moves
+  relative to the actual symbol boundary. In this modem it is handled by
+  confidence-gated timing updates from data symbols and pilots, and optionally
+  by `--adaptive-clock-tracking`.
+- **Time-scale distortion** means the whole waveform, or a region of it, has
+  been linearly stretched or compressed. This is how `pcm_impair` emulates
+  sample-rate mismatch. Large scale factors are stress tests, not normal
+  oscillator drift.
+- **Multipath/echo** means delayed copies of the waveform are added to the
+  direct path. Echo can create adjacent-symbol leakage, shifted correlation
+  peaks, and burst-like symbol errors even without much random noise.
+- **Clipping** limits sample amplitude and changes chirp shape. It can create
+  harmonics and correlation side lobes; it is not equivalent to Gaussian noise.
+- **AGC/fading** changes gain over time. Slow fading changes LLR scale and
+  known-symbol margins; deep fades can create erasures or burst errors.
+
+The deterministic `pcm_audio_channel_impair` and `pcm_radio_channel_impair`
+tools combine some of these effects for repeatable regression testing. They are
+not calibrated acoustic, CB, PMR, FM, or RF propagation models.
+
+### SNR Strategy
+
+Current SNR-related measurements are regression tools, not standards-grade link
+budgets:
+
+- Use `measure-metric` for fast algorithm comparisons in a synthetic
+  metric-domain AWGN-like model. It is useful for checking FEC/LLR behavior and
+  relative regressions, but it bypasses PCM sync/acquisition/timing.
+- Use `measure-pcm --profile awgn` for end-to-end waveform tests with additive
+  sample noise. This includes acquisition, timing, demodulation, FEC, and CRC,
+  but still does not represent a calibrated RF receiver.
+- Use `measure-pcm --profile radio` and the `pcm_*_channel_impair` tools for
+  deterministic impairment regressions. Treat these as named stress profiles,
+  not measured CB/PMR channel models.
+- Use `rx_raw_ser`, `rx_raw_ber`, and `per` for receiver quality. The
+  `oracle_raw_*` columns are debugging aids that answer whether a better
+  candidate choice could have helped; they are not receiver performance.
+
+Copy-pasteable examples:
+
+```bash
+bazel-bin/lab/chirp_modem measure-metric 100
+bazel-bin/lab/chirp_modem measure-pcm 10
+bazel-bin/lab/chirp_modem measure-pcm-debug --profile radio --snr 24 --trials 20
+bazel-bin/lab/chirp_modem --adaptive-llr --weighted-correlation measure-pcm-debug --profile awgn --snr 18 --trials 20
+```
+
+### Clock Drift Assumptions
+
+For independent audio clocks, realistic sample-rate drift tests should usually
+start in the tens to hundreds of ppm:
+
+```bash
+bazel test -c opt //lab:chirp_realistic_clock_drift_test --test_output=all
+```
+
+Recommended interpretation:
+
+- Typical regression range: about `-200 ppm` to `+200 ppm`, with smaller points
+  such as `-20`, `-50`, `+50`, and `+100 ppm` useful for sanity checks.
+- Wider robustness range: about `-500 ppm` to `+1000 ppm`, useful for cheap
+  sound devices, resampler mismatch, or pessimistic integration tests.
+- `±5%` (`95%` to `105%` time scale) is not normal oscillator drift. It is a
+  torture test for sample-rate mismatch, wrong conversion settings, or severe
+  resampling distortion.
+
+The ppm convention used by the impairment tool is:
+
+```text
+time_scale = 1.0 + ppm / 1e6
+```
+
+Copy-pasteable examples:
+
+```bash
+bazel-bin/lab/pcm_impair input.pcm output_200ppm.pcm --time-scale-ppm 200
+bazel-bin/lab/pcm_impair input.pcm output_minus100ppm.pcm --time-scale-ppm -100
+bazel-bin/lab/pcm_impair input.pcm output_torture_105.pcm --time-scale 1.05
+```
+
 ### BER, SER, BLER, FER/PER
 
 BER is bit errors divided by transmitted bits. It should only be used when a
@@ -591,14 +698,17 @@ Do not interpret a burst overwrite result as a BER number.
 whole PCM stream or a selected region:
 
 ```bash
-pcm_impair input.pcm output.pcm --region all --scale-percent 95
-pcm_impair input.pcm output.pcm --region middle --scale-percent 101 --region-percent 25
+bazel-bin/lab/pcm_impair input.pcm output.pcm --region all --time-scale-ppm 200
+bazel-bin/lab/pcm_impair input.pcm output.pcm --region all --time-scale 1.001
+bazel-bin/lab/pcm_impair input.pcm output.pcm --region middle --scale-percent 101 --region-percent 25
 ```
 
-`--scale-percent 95` creates an output stream with 95% of the original sample
-count for the selected region. `--scale-percent 105` creates 105% of the
-original sample count. These are synthetic sample-rate offset / sampling clock
-mismatch tests, not Doppler-channel validation and not BER tests.
+`--time-scale-ppm 200` means `time_scale = 1.000200`. `--scale-percent 95`
+creates an output stream with 95% of the original sample count for the selected
+region. `--scale-percent 105` creates 105% of the original sample count. The
+ppm mode is the appropriate one for ordinary clock-drift regression; the 95%
+and 105% cases are sample-rate mismatch/torture tests, not realistic oscillator
+drift, not Doppler-channel validation, and not BER tests.
 
 `pcm_impair` can also apply deterministic byte-level bit flips with
 `--bitflip-stride N --bitflip-mask M`.
@@ -617,10 +727,10 @@ The model adds leading/trailing silence, gain envelope, DC blocking, simple
 low-pass filtering, a short echo, and deterministic noise. It is a regression
 tool for modem robustness, not a calibrated acoustic model.
 
-The chirp decoder now learns a channel-adapted chirp template from the repeated
-preamble symbols. It tries that preamble-adapted template first, then falls back
-to the ideal synthetic template for clean time-scaling cases where adaptation is
-less helpful when `--adaptive-channel-templates` is enabled.
+With `--adaptive-channel-templates`, the chirp decoder learns a
+channel-adapted chirp template from the repeated preamble symbols. It tries that
+preamble-adapted template first, then falls back to the ideal synthetic template
+when validation does not succeed.
 
 Receiver diagnostics include `adaptive_channel_templates_enabled`,
 `channel_template_known_symbols`, `channel_template_energy`,
@@ -712,6 +822,63 @@ preamble/sync/pilot positions to predict data-symbol sample positions as
 default path and is still present; this option only changes receiver-side sample
 extraction positions and does not change the over-the-air frame.
 
+Channel-shaped templates and weighted correlation are also receiver-only,
+opt-in demodulator modes:
+
+```bash
+./chirp_modem --adaptive-channel-templates dec input.pcm output.bin
+./chirp_modem --weighted-correlation dec input.pcm output.bin
+./chirp_modem --adaptive-llr --adaptive-clock-tracking --adaptive-channel-templates --weighted-correlation dec input.pcm output.bin
+```
+
+`--adaptive-channel-templates` estimates a base chirp shape from known
+preamble/sync symbols, generates shifted templates from that shape, and may
+update the template from high-confidence pilots/data symbols. If the evidence
+is weak or a candidate fails validation, the receiver can still fall back to
+ideal templates.
+
+`--weighted-correlation` estimates conservative per-sample reliability weights
+from known-symbol residuals. It downweights sample positions whose residuals
+look unreliable, clamps the weights, and falls back to ordinary unweighted
+correlation if there are too few usable known symbols. This is not a full
+noise-whitening equalizer; it is a simple receiver-side metric experiment.
+
+All four adaptive flags above preserve the same transmitted waveform, bitrate,
+symbol length, alphabet, pilot spacing, FEC, protected frame format, and
+occupied audio channel. They should not print `NOT SAME BITRATE`.
+
+Key `--rx-diagnostics` fields:
+
+- `preamble_score`, `sync_score`, `detected_start_sample`,
+  `estimated_symbol_span`: acquisition and coarse timing lock.
+- `estimated_clock_ppm`, `clock_scale`, `clock_fit_error_rms_samples`,
+  `clock_fit_points`: linear fit of observed known-symbol positions against
+  nominal sample positions.
+- `timing_error_before_rms`, `timing_error_after_rms`: pilot-observed timing
+  error before/after the optional adaptive clock model, when enough comparison
+  points exist.
+- `timing_search_full_count`, `timing_search_local_count`,
+  `timing_search_center_count`, `average_offsets_per_symbol`: receiver search
+  cost and timing-search behavior.
+- `winner_score_mean`, `runner_up_score_mean`, `margin_mean`, `margin_p05`,
+  `margin_min`: symbol-decision separation. These are correlation metrics, not
+  calibrated dB SNR.
+- `llr_mean_abs`, `llr_max_abs`, `llr_saturation_count`,
+  `llr_saturation_rate`, `llr_clip_value`, `llr_scale_used`: soft-bit metric
+  scale and clipping behavior.
+- `adaptive_llr_enabled`, `adaptive_llr_scale`,
+  `known_symbol_margin_median`, `known_symbol_margin_p05`,
+  `known_symbol_count`: frame-local LLR calibration state.
+- `adaptive_channel_templates_enabled`, `channel_template_known_symbols`,
+  `channel_template_energy`, `channel_template_fallback_used`,
+  `ideal_vs_adaptive_sync_score`: channel-template availability and rough
+  known-symbol score delta versus ideal templates.
+- `weighted_correlation_enabled`, `weight_min`, `weight_max`, `weight_mean`,
+  `weight_fallback_used`: weighted-correlation state.
+- `ldpc_iterations_used`, `ldpc_decode_success`, `fec_failed_blocks`,
+  `fec_syndrome_weight`, `crc_ok`, `decode_success`, `failure_cause`: FEC and
+  final packet validation.
+
 `measure-metric` generates deterministic 64-byte payloads, encodes real
 protected modem frames, simulates a CSS metric vector for each transmitted
 symbol, feeds those soft metrics through the real interleaver and BP FEC
@@ -738,8 +905,10 @@ helped?". Timing-search diagnostics report the selected profile, how many
 symbols used full/local/center search, and the average timing offsets checked
 per decoded symbol. Receiver diagnostics also report a linear clock fit from
 known preamble/sync/pilot positions as `estimated_clock_ppm`,
-`clock_fit_error_rms_samples`, and `clock_fit_points`; this is currently
-observability only and does not change timing correction behavior.
+`clock_fit_error_rms_samples`, and `clock_fit_points`. By default this is
+observability; with `--adaptive-clock-tracking` the same fitted model may be
+used to choose data-symbol extraction positions when the fit is internally
+consistent.
 
 The PCM measurement is not yet a calibrated standards-style Eb/N0 compliance
 test. It prints estimated Eb/N0 and processing gain from the configured audio
@@ -782,18 +951,20 @@ Historical local metric-model run, `./chirp_modem measure-metric 500`, on
 
 Interpretation:
 
-- The idealized metric model is solid at 6 dB and starts to fail around 3 dB.
-- The radio metric model starts to fail around 9 dB and is essentially broken
-  by 6 dB, a roughly 6 dB implementation/channel penalty.
+- In this historical metric-only run, the idealized metric model passed at
+  6 dB and began failing around 3 dB.
+- In the same historical run, the radio-metric profile began failing around
+  9 dB and was mostly failing by 6 dB. Treat that as a regression target and
+  model artifact, not as a calibrated RF-channel SNR threshold.
 - These SNR values are metric-SNR regression points, not calibrated Eb/N0 curves.
-- The penalty is intentionally modeled as receiver/channel imperfection, so it
-  should be treated as a design target to reduce rather than as a property of
-  the BP decoder alone.
+- The apparent gap includes receiver/channel imperfections modeled in that
+  synthetic path; it should not be attributed to the BP decoder alone.
 
-### Reducing The Radio Penalty
+### Reducing The Modeled Radio Penalty
 
-The current 6 dB gap is too large for a mature LoRa-like CSS modem. The most
-useful next fixes are:
+The synthetic radio-metric penalty is still a useful design smell. Future work
+should reduce it with controlled measurements rather than by claiming standards
+performance from the current prototype. Useful next fixes are:
 
 - Calibrate bit LLRs from measured metric noise variance. Current max-log LLRs
   use a conservative fixed scale and clipping, not full likelihoods from an
@@ -965,7 +1136,8 @@ bazel test //lab:chirp_timing_drift_test --test_output=all
 Current routine timing matrix uses payload sizes 4, 8, 16, 32, 64, 128, 256,
 and 512 bytes. It tests whole-frame linear resampling to 95%, 100%, and 105% of
 the original length. No byte-level bit flips are applied in the current chirp
-timing script.
+timing script. Interpret this as a broad sample-rate mismatch/torture matrix,
+not a realistic audio-clock ppm drift matrix.
 
 Recent generated matrix:
 
@@ -980,9 +1152,9 @@ Recent generated matrix:
 | chirp timing drift | PER regression | 296,864 PCM bytes = 148,432 samples = 18.554 s before resampling | 256 B | linear PCM resampling | whole frame | 95%, 100%, 105% length | CRC/protocol pass + exact payload match | pass at 95% and 100%; fail at 105% |
 | chirp timing drift | PER regression | 559,008 PCM bytes = 279,504 samples = 34.938 s before resampling | 512 B | linear PCM resampling | whole frame | 95%, 100%, 105% length | CRC/protocol pass + exact payload match | pass at 95% and 100%; fail at 105% |
 
-The 1024-byte chirp timing matrix is omitted from routine tests because the
-current scalar all-symbol correlator is slow at that size without FFT/SIMD
-acceleration.
+The 1024-byte chirp timing matrix is omitted from routine tests because this
+broad 95..105% torture sweep is expensive at that size and is not part of the
+normal fast development loop.
 
 ### Chirp/CSS Synthetic Channel Regression
 
@@ -1077,13 +1249,17 @@ lab/*_test.sh                   Bazel shell regression tests
 - The chirp FEC is experimental and local to this repository.
 - The P4 FEC is also local and should not be described as a standards code.
 - Current tests are mostly packet success/failure tests.
-- Raw BER and raw SER are instrumented only in the synthetic `measure` mode.
+- Raw BER and raw SER are instrumented in synthetic metric measurements and in
+  the PCM measurement path, but current curves are regression aids rather than
+  calibrated standards measurements.
 - Post-FEC BER is CRC-gated at packet output, and FEC BLER is not separately
   instrumented.
 - Statistical false alarm and missed detection rates are not estimated.
-- The current chirp correlator is scalar and becomes slow for long frames.
+- The normal chirp demodulator uses FFT circular correlation; optional
+  `--weighted-correlation` currently uses a slower time-domain path.
 - Real RF/audio-path behavior is not validated by the current synthetic tests.
-- `measure` includes sample-SNR AWGN tests, but not calibrated Eb/N0 curves.
+- Metric and PCM measurement modes include AWGN-like tests, but not calibrated
+  Eb/N0 compliance curves.
 - Multipath, fading, clipping, and impulsive noise are present only as simple
   deterministic regression models, not calibrated channel models.
 - No FM pre-emphasis/de-emphasis, VOX, or adjacent-channel interference model is
