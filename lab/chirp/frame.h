@@ -12,6 +12,8 @@
 #include <cstdint>
 #include <vector>
 
+#include "lab/chirp/fec_ldpc.h"
+
 namespace chirp {
 namespace frame {
 
@@ -28,6 +30,12 @@ bool parse_protected_header(const std::vector<uint8_t>& bytes,
 
 bool parse_protected_frame(const std::vector<uint8_t>& bytes,
                            std::vector<uint8_t>* payload);
+
+bool decode_exact_payload_from_llrs(const std::vector<double>& llrs,
+                                    size_t fec_bit_count,
+                                    std::vector<uint8_t>* payload,
+                                    fec::FecDecodeResult* header_fec_result = nullptr,
+                                    fec::FecDecodeResult* body_fec_result = nullptr);
 
 }  // namespace frame
 }  // namespace chirp

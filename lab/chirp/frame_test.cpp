@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "lab/chirp/config.h"
+#include "lab/chirp/modulator.h"
 
 int main() {
     const std::vector<uint8_t> payload = {'h', 'e', 'l', 'l', 'o'};
@@ -34,6 +35,21 @@ int main() {
     std::vector<uint8_t> bad_crc = frame;
     bad_crc[chirp::config::PROTOCOL_HEADER_BYTES] ^= 0x01;
     assert(!chirp::frame::parse_protected_frame(bad_crc, &decoded));
+
+    const std::vector<uint8_t> tx_bits = chirp::modulator::build_frame_tx_bits(frame);
+    std::vector<double> ideal_llrs;
+    ideal_llrs.reserve(tx_bits.size());
+    for (uint8_t bit : tx_bits) {
+        ideal_llrs.push_back((bit & 1U) ? -8.0 : 8.0);
+    }
+    std::vector<uint8_t> llr_decoded;
+    chirp::fec::FecDecodeResult header_fec;
+    chirp::fec::FecDecodeResult body_fec;
+    assert(chirp::frame::decode_exact_payload_from_llrs(
+        ideal_llrs, tx_bits.size(), &llr_decoded, &header_fec, &body_fec));
+    assert(llr_decoded == payload);
+    assert(header_fec.success);
+    assert(body_fec.success);
 
     bool threw = false;
     try {

@@ -2,8 +2,10 @@
 
 #include <stdexcept>
 
+#include "lab/chirp/bit_utils.h"
 #include "lab/chirp/config.h"
 #include "lab/chirp/crc16.h"
+#include "lab/chirp/interleaver.h"
 
 namespace chirp {
 namespace frame {
@@ -77,6 +79,51 @@ bool parse_protected_frame(const std::vector<uint8_t>& bytes,
     payload->assign(bytes.begin() + config::PROTOCOL_HEADER_BYTES,
                     bytes.begin() + std::ptrdiff_t(config::PROTOCOL_HEADER_BYTES + len));
     return true;
+}
+
+bool decode_exact_payload_from_llrs(const std::vector<double>& llrs,
+                                    size_t fec_bit_count,
+                                    std::vector<uint8_t>* payload,
+                                    fec::FecDecodeResult* header_fec_result,
+                                    fec::FecDecodeResult* body_fec_result) {
+    if (llrs.size() < fec_bit_count || fec_bit_count < config::FEC_CODEWORD_BITS) {
+        return false;
+    }
+
+    const std::vector<double> fec_llrs = bits::descramble_llrs(llrs);
+    std::vector<double> header_llrs(
+        fec_llrs.begin(),
+        fec_llrs.begin() + std::ptrdiff_t(config::FEC_CODEWORD_BITS));
+    const fec::FecDecodeResult header_result =
+        fec::fec_decode_bits_from_llr_result(header_llrs);
+    if (header_fec_result) *header_fec_result = header_result;
+    const std::vector<uint8_t>& header_bits = header_result.bits;
+    std::vector<uint8_t> bytes = bits::bits_to_bytes(header_bits);
+    bytes.resize(config::PROTOCOL_HEADER_BYTES);
+
+    size_t required_fec_bits = 0;
+    if (!parse_protected_header(bytes, nullptr, &required_fec_bits)) {
+        return false;
+    }
+    if (required_fec_bits != fec_bit_count) return false;
+
+    const size_t body_fec_bits = fec_bit_count - config::FEC_CODEWORD_BITS;
+    if (body_fec_bits > 0) {
+        std::vector<double> body_tx_llrs(
+            fec_llrs.begin() + std::ptrdiff_t(config::FEC_CODEWORD_BITS),
+            fec_llrs.begin() + std::ptrdiff_t(fec_bit_count));
+        const std::vector<double> body_fec_llrs =
+            interleave::deinterleave_soft(body_tx_llrs);
+        const fec::FecDecodeResult body_result =
+            fec::fec_decode_bits_from_llr_result(body_fec_llrs);
+        if (body_fec_result) *body_fec_result = body_result;
+        const std::vector<uint8_t>& body_bits = body_result.bits;
+        const std::vector<uint8_t> body_bytes = bits::bits_to_bytes(body_bits);
+        bytes.insert(bytes.end(), body_bytes.begin(), body_bytes.end());
+    } else if (body_fec_result) {
+        *body_fec_result = fec::FecDecodeResult();
+    }
+    return parse_protected_frame(bytes, payload);
 }
 
 }  // namespace frame
