@@ -62,9 +62,12 @@ using chirp::config::PhyProfile;
 using chirp::config::current_phy_profile;
 using chirp::dsp::CircularCorrelationScratch;
 using chirp::dsp::PrecomputedChirpTemplate;
-using chirp::dsp::circular_chirp_correlation_precomputed;
+using chirp::dsp::circular_chirp_correlation_diagnostics;
+using chirp::dsp::circular_chirp_correlation_precomputed_into;
 using chirp::dsp::cyclic_corr_sample;
+using chirp::dsp::FftCorrelationDiagnostics;
 using chirp::dsp::make_precomputed_chirp_template;
+using chirp::dsp::reset_circular_chirp_correlation_diagnostics;
 using chirp::demod::DemodConfig;
 using chirp::demod::MetricStats;
 using chirp::demod::SymbolMetrics;
@@ -727,6 +730,8 @@ static bool fast_symbol_metrics_from_base(const std::vector<int16_t>& pcm,
                                           const PrecomputedChirpTemplate& base_fft,
                                           const double* fractional_offsets,
                                           int fractional_offset_count,
+                                          CircularCorrelationScratch* scratch,
+                                          std::array<double, SYMBOL_SAMPLES>* corr,
                                           SymbolMetrics* m) {
     if (pos < 0.0 || pos + symbol_span >= double(pcm.size())) return false;
     const std::array<double, SYMBOL_SAMPLES> samples =
@@ -735,14 +740,14 @@ static bool fast_symbol_metrics_from_base(const std::vector<int16_t>& pcm,
     for (double v : samples) energy += v * v;
     if (energy <= 1e-9) return false;
 
-    CircularCorrelationScratch scratch;
-    const std::array<double, SYMBOL_SAMPLES> corr =
-        circular_chirp_correlation_precomputed(samples, base_fft, &scratch);
+    circular_chirp_correlation_precomputed_into(samples, base_fft, scratch, corr);
     for (int s = 0; s < ALPHABET; ++s) {
         const double shift = double(s * SYMBOL_SAMPLES / ALPHABET);
         double score = -1.0;
         for (int i = 0; i < fractional_offset_count; ++i) {
-            score = std::max(score, std::abs(cyclic_corr_sample(corr, shift + fractional_offsets[i])));
+            score = std::max(
+                score,
+                std::abs(cyclic_corr_sample(*corr, shift + fractional_offsets[i])));
         }
         m->metric[size_t(s)] = score;
     }
@@ -818,6 +823,8 @@ static SymbolMetrics decode_symbol_metrics_at(const std::vector<int16_t>& pcm,
 
     SymbolMetrics best;
     double best_rank = -1.0;
+    CircularCorrelationScratch corr_scratch;
+    std::array<double, SYMBOL_SAMPLES> corr = {};
     for (int offset_index = 0; offset_index < timing_offset_count; ++offset_index) {
         const double timing_offset = timing_offsets[offset_index];
         SymbolMetrics current;
@@ -830,14 +837,14 @@ static SymbolMetrics decode_symbol_metrics_at(const std::vector<int16_t>& pcm,
             used_fast = fast_symbol_metrics_from_base(
                 pcm, pos + timing_offset, symbol_span, adaptive->base_fft,
                 intermediate ? adaptive_offsets : centered_offset,
-                intermediate ? 3 : 1, &current);
+                intermediate ? 3 : 1, &corr_scratch, &corr, &current);
         } else if (!use_weighted) {
             const double ideal_offsets[3] = {-2.0, 0.0, 2.0};
             const double centered_offset[1] = {0.0};
             used_fast = fast_symbol_metrics_from_base(
                 pcm, pos + timing_offset, symbol_span, ideal_base_precomputed_template(),
                 intermediate ? ideal_offsets : centered_offset,
-                intermediate ? 3 : 1, &current);
+                intermediate ? 3 : 1, &corr_scratch, &corr, &current);
         }
 
         if (!used_fast) {
@@ -3344,6 +3351,60 @@ static void run_compare_demod_measurement(const std::string& profile,
                                 &snr_db, 1, false, false);
 }
 
+static void run_correlation_benchmark(int symbols) {
+    if (symbols <= 0) throw std::runtime_error("bench-correlation symbols must be positive");
+
+    std::vector<uint8_t> payload(96);
+    for (size_t i = 0; i < payload.size(); ++i) {
+        payload[i] = uint8_t((int(i) * 37 + 11) & 0xFF);
+    }
+    const std::vector<int16_t> pcm = encode_payload_to_pcm(payload);
+
+    std::vector<double> positions;
+    const double data_start = double(PREAMBLE_SYMBOLS + SYNC_SYMBOLS) * NOMINAL_SPAN;
+    const double data_end = std::max(data_start, double(pcm.size()) - 0.25 * SAMPLE_RATE);
+    for (double pos = data_start; pos + NOMINAL_SPAN < data_end; pos += NOMINAL_SPAN) {
+        positions.push_back(pos);
+    }
+    if (positions.empty()) {
+        throw std::runtime_error("bench-correlation could not find benchmark symbols");
+    }
+
+    reset_circular_chirp_correlation_diagnostics();
+    volatile int symbol_accumulator = 0;
+    const std::clock_t start = std::clock();
+    for (int i = 0; i < symbols; ++i) {
+        const double pos = positions[size_t(i % int(positions.size()))];
+        const SymbolMetrics m =
+            decode_symbol_metrics_at(pcm, pos, NOMINAL_SPAN, false, nullptr,
+                                     nullptr, -1, TimingSearchProfile::CenterOnly,
+                                     nullptr);
+        symbol_accumulator += m.best_symbol;
+    }
+    const std::clock_t end = std::clock();
+    const double elapsed_s = double(end - start) / double(CLOCKS_PER_SEC);
+    const double total_ms = elapsed_s * 1000.0;
+    const double average_us =
+        symbols > 0 ? elapsed_s * 1000000.0 / double(symbols) : 0.0;
+    const FftCorrelationDiagnostics diag =
+        circular_chirp_correlation_diagnostics();
+
+    std::cout << "symbols_decoded=" << symbols
+              << " total_decode_ms=" << total_ms
+              << " average_microseconds_per_symbol=" << average_us
+              << " correlation_calls=" << diag.correlation_calls
+              << " precomputed_correlation_calls="
+              << diag.precomputed_correlation_calls
+              << " sample_ffts_computed=" << diag.sample_ffts_computed
+              << " base_ffts_computed=" << diag.base_ffts_computed
+              << " base_fft_cache_hits=" << diag.base_fft_cache_hits
+              << " base_fft_cache_misses=" << diag.base_fft_cache_misses
+              << " base_fft_cache_entries=" << diag.base_fft_cache_entries
+              << " base_fft_cache_capacity=" << diag.base_fft_cache_capacity
+              << " symbol_accumulator=" << symbol_accumulator
+              << "\n";
+}
+
 static void require_true(bool ok, const std::string& name) {
     if (!ok) throw std::runtime_error("Selftest failed: " + name);
     std::cerr << "[PASS] " << name << "\n";
@@ -3769,6 +3830,12 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+        if (!args.empty() && args[0] == "bench-correlation") {
+            const int symbols = args.size() >= 2 ? std::atoi(args[1].c_str()) : 2000;
+            run_correlation_benchmark(symbols);
+            return 0;
+        }
+
         if (args.size() != 3) {
             std::cerr << "Usage:\n"
                       << "  " << argv[0] << " enc input.bin output.pcm\n"
@@ -3796,7 +3863,8 @@ int main(int argc, char** argv) {
                       << "  " << argv[0] << " measure-pcm [trials-per-snr]\n"
                       << "  " << argv[0] << " measure-pcm-debug --profile radio --snr 24 --trials 20\n"
                       << "  " << argv[0] << " measure-pcm-sweep --profile radio --trials 100\n"
-                      << "  " << argv[0] << " compare-demod --profile radio --snr 9 --trials 100\n";
+                      << "  " << argv[0] << " compare-demod --profile radio --snr 9 --trials 100\n"
+                      << "  " << argv[0] << " bench-correlation [symbols]\n";
             return 1;
         }
 

@@ -34,14 +34,24 @@ int main() {
 
     chirp::dsp::reset_circular_chirp_correlation_diagnostics();
     const auto uncached = chirp::dsp::circular_chirp_correlation_uncached(a, b);
+    std::array<double, chirp::config::SYMBOL_SAMPLES> uncached_into = {};
+    chirp::dsp::circular_chirp_correlation_uncached_into(a, b, &uncached_into);
     chirp::dsp::CircularCorrelationScratch scratch;
     const chirp::dsp::PrecomputedChirpTemplate precomputed =
         chirp::dsp::make_precomputed_chirp_template(b);
-    const auto explicit_precomputed =
-        chirp::dsp::circular_chirp_correlation_precomputed(a, precomputed, &scratch);
+    std::array<double, chirp::config::SYMBOL_SAMPLES> explicit_precomputed = {};
+    chirp::dsp::circular_chirp_correlation_precomputed_into(
+        a, precomputed, &scratch, &explicit_precomputed);
     for (int i = 0; i < chirp::config::SYMBOL_SAMPLES; ++i) {
         assert(std::abs(uncached[size_t(i)] - explicit_precomputed[size_t(i)]) < 1e-10);
+        assert(std::abs(uncached[size_t(i)] - uncached_into[size_t(i)]) < 1e-10);
     }
+    chirp::dsp::FftCorrelationDiagnostics diag =
+        chirp::dsp::circular_chirp_correlation_diagnostics();
+    assert(diag.correlation_calls == 3);
+    assert(diag.precomputed_correlation_calls == 1);
+    assert(diag.base_ffts_computed == 3);
+    assert(diag.sample_ffts_computed == 3);
 
     chirp::dsp::reset_circular_chirp_correlation_diagnostics();
     const auto cached1 = chirp::dsp::circular_chirp_correlation(a, b);
@@ -51,10 +61,11 @@ int main() {
         assert(std::abs(cached1[size_t(i)] - cached2[size_t(i)]) < 1e-12);
     }
 
-    chirp::dsp::FftCorrelationDiagnostics diag =
-        chirp::dsp::circular_chirp_correlation_diagnostics();
+    diag = chirp::dsp::circular_chirp_correlation_diagnostics();
+    assert(diag.correlation_calls == 2);
     assert(diag.base_fft_cache_misses == 1);
     assert(diag.base_fft_cache_hits == 1);
+    assert(diag.base_ffts_computed == 1);
     assert(diag.sample_ffts_computed == 2);
     assert(diag.base_fft_cache_entries == 1);
     assert(diag.base_fft_cache_capacity >= 4);

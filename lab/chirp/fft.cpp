@@ -78,6 +78,7 @@ void fill_base_fft(const std::array<double, config::SYMBOL_SAMPLES>& base,
         (*out)[size_t(i)] = std::complex<double>(base[size_t(i)], 0.0);
     }
     fft128(out, false);
+    ++g_base_fft_cache.diagnostics.base_ffts_computed;
 }
 
 const std::array<std::complex<double>, config::SYMBOL_SAMPLES>& cached_base_fft(
@@ -114,10 +115,11 @@ const std::array<std::complex<double>, config::SYMBOL_SAMPLES>& cached_base_fft(
     return victim->fft;
 }
 
-std::array<double, config::SYMBOL_SAMPLES> circular_chirp_correlation_with_base_fft(
+void circular_chirp_correlation_with_base_fft_into(
     const std::array<double, config::SYMBOL_SAMPLES>& samples,
     const std::array<std::complex<double>, config::SYMBOL_SAMPLES>& base_fft,
-    CircularCorrelationScratch* scratch) {
+    CircularCorrelationScratch* scratch,
+    std::array<double, config::SYMBOL_SAMPLES>* out) {
     CircularCorrelationScratch local_scratch;
     CircularCorrelationScratch* work = scratch != nullptr ? scratch : &local_scratch;
     for (int i = 0; i < config::SYMBOL_SAMPLES; ++i) {
@@ -132,11 +134,9 @@ std::array<double, config::SYMBOL_SAMPLES> circular_chirp_correlation_with_base_
     }
     fft128(&work->samples_fft, true);
 
-    std::array<double, config::SYMBOL_SAMPLES> corr = {};
     for (int i = 0; i < config::SYMBOL_SAMPLES; ++i) {
-        corr[size_t(i)] = work->samples_fft[size_t(i)].real();
+        (*out)[size_t(i)] = work->samples_fft[size_t(i)].real();
     }
-    return corr;
 }
 
 }  // namespace
@@ -191,22 +191,47 @@ PrecomputedChirpTemplate make_precomputed_chirp_template(
     return out;
 }
 
+void circular_chirp_correlation_precomputed_into(
+    const std::array<double, config::SYMBOL_SAMPLES>& samples,
+    const PrecomputedChirpTemplate& base,
+    CircularCorrelationScratch* scratch,
+    std::array<double, config::SYMBOL_SAMPLES>* out) {
+    ++g_base_fft_cache.diagnostics.correlation_calls;
+    ++g_base_fft_cache.diagnostics.precomputed_correlation_calls;
+    circular_chirp_correlation_with_base_fft_into(samples, base.fft, scratch, out);
+}
+
 std::array<double, config::SYMBOL_SAMPLES> circular_chirp_correlation_precomputed(
     const std::array<double, config::SYMBOL_SAMPLES>& samples,
     const PrecomputedChirpTemplate& base,
     CircularCorrelationScratch* scratch) {
-    return circular_chirp_correlation_with_base_fft(samples, base.fft, scratch);
+    std::array<double, config::SYMBOL_SAMPLES> out = {};
+    circular_chirp_correlation_precomputed_into(samples, base, scratch, &out);
+    return out;
+}
+
+void circular_chirp_correlation_into(
+    const std::array<double, config::SYMBOL_SAMPLES>& samples,
+    const std::array<double, config::SYMBOL_SAMPLES>& base,
+    CircularCorrelationScratch* scratch,
+    std::array<double, config::SYMBOL_SAMPLES>* out) {
+    ++g_base_fft_cache.diagnostics.correlation_calls;
+    circular_chirp_correlation_with_base_fft_into(samples, cached_base_fft(base), scratch, out);
 }
 
 std::array<double, config::SYMBOL_SAMPLES> circular_chirp_correlation(
     const std::array<double, config::SYMBOL_SAMPLES>& samples,
     const std::array<double, config::SYMBOL_SAMPLES>& base) {
-    return circular_chirp_correlation_with_base_fft(samples, cached_base_fft(base), nullptr);
+    std::array<double, config::SYMBOL_SAMPLES> out = {};
+    circular_chirp_correlation_into(samples, base, nullptr, &out);
+    return out;
 }
 
-std::array<double, config::SYMBOL_SAMPLES> circular_chirp_correlation_uncached(
+void circular_chirp_correlation_uncached_into(
     const std::array<double, config::SYMBOL_SAMPLES>& samples,
-    const std::array<double, config::SYMBOL_SAMPLES>& base) {
+    const std::array<double, config::SYMBOL_SAMPLES>& base,
+    std::array<double, config::SYMBOL_SAMPLES>* out) {
+    ++g_base_fft_cache.diagnostics.correlation_calls;
     std::array<std::complex<double>, config::SYMBOL_SAMPLES> x = {};
     std::array<std::complex<double>, config::SYMBOL_SAMPLES> y = {};
     for (int i = 0; i < config::SYMBOL_SAMPLES; ++i) {
@@ -217,16 +242,23 @@ std::array<double, config::SYMBOL_SAMPLES> circular_chirp_correlation_uncached(
     fft128(&x, false);
     ++g_base_fft_cache.diagnostics.sample_ffts_computed;
     fft128(&y, false);
+    ++g_base_fft_cache.diagnostics.base_ffts_computed;
     for (int i = 0; i < config::SYMBOL_SAMPLES; ++i) {
         x[size_t(i)] = std::conj(x[size_t(i)]) * y[size_t(i)];
     }
     fft128(&x, true);
 
-    std::array<double, config::SYMBOL_SAMPLES> corr = {};
     for (int i = 0; i < config::SYMBOL_SAMPLES; ++i) {
-        corr[size_t(i)] = x[size_t(i)].real();
+        (*out)[size_t(i)] = x[size_t(i)].real();
     }
-    return corr;
+}
+
+std::array<double, config::SYMBOL_SAMPLES> circular_chirp_correlation_uncached(
+    const std::array<double, config::SYMBOL_SAMPLES>& samples,
+    const std::array<double, config::SYMBOL_SAMPLES>& base) {
+    std::array<double, config::SYMBOL_SAMPLES> out = {};
+    circular_chirp_correlation_uncached_into(samples, base, &out);
+    return out;
 }
 
 double cyclic_corr_sample(const std::array<double, config::SYMBOL_SAMPLES>& corr,

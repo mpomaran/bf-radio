@@ -30,15 +30,21 @@ struct CircularCorrelationScratch {
 };
 
 struct FftCorrelationDiagnostics {
+    unsigned long long correlation_calls;
+    unsigned long long precomputed_correlation_calls;
     unsigned long long base_fft_cache_hits;
     unsigned long long base_fft_cache_misses;
+    unsigned long long base_ffts_computed;
     unsigned long long sample_ffts_computed;
     int base_fft_cache_entries;
     int base_fft_cache_capacity;
 
     FftCorrelationDiagnostics()
-        : base_fft_cache_hits(0),
+        : correlation_calls(0),
+          precomputed_correlation_calls(0),
+          base_fft_cache_hits(0),
           base_fft_cache_misses(0),
+          base_ffts_computed(0),
           sample_ffts_computed(0),
           base_fft_cache_entries(0),
           base_fft_cache_capacity(0) {}
@@ -50,14 +56,31 @@ FftCorrelationDiagnostics circular_chirp_correlation_diagnostics();
 PrecomputedChirpTemplate make_precomputed_chirp_template(
     const std::array<double, config::SYMBOL_SAMPLES>& base);
 
+void circular_chirp_correlation_precomputed_into(
+    const std::array<double, config::SYMBOL_SAMPLES>& samples,
+    const PrecomputedChirpTemplate& base,
+    CircularCorrelationScratch* scratch,
+    std::array<double, config::SYMBOL_SAMPLES>* out);
+
 std::array<double, config::SYMBOL_SAMPLES> circular_chirp_correlation_precomputed(
     const std::array<double, config::SYMBOL_SAMPLES>& samples,
     const PrecomputedChirpTemplate& base,
     CircularCorrelationScratch* scratch);
 
+void circular_chirp_correlation_into(
+    const std::array<double, config::SYMBOL_SAMPLES>& samples,
+    const std::array<double, config::SYMBOL_SAMPLES>& base,
+    CircularCorrelationScratch* scratch,
+    std::array<double, config::SYMBOL_SAMPLES>* out);
+
 std::array<double, config::SYMBOL_SAMPLES> circular_chirp_correlation(
     const std::array<double, config::SYMBOL_SAMPLES>& samples,
     const std::array<double, config::SYMBOL_SAMPLES>& base);
+
+void circular_chirp_correlation_uncached_into(
+    const std::array<double, config::SYMBOL_SAMPLES>& samples,
+    const std::array<double, config::SYMBOL_SAMPLES>& base,
+    std::array<double, config::SYMBOL_SAMPLES>* out);
 
 std::array<double, config::SYMBOL_SAMPLES> circular_chirp_correlation_uncached(
     const std::array<double, config::SYMBOL_SAMPLES>& samples,
