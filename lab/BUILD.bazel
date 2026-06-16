@@ -57,6 +57,16 @@ cc_binary(
 )
 
 cc_library(
+    name = "chirp_receiver_core",
+    srcs = ["chirp_modem.cpp"],
+    hdrs = ["chirp/receiver.h"],
+    copts = CPP17_COPTS,
+    defines = ["CHIRP_MODEM_NO_MAIN"],
+    deps = [":chirp_modem_lib"],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "chirp_modem_lib",
     srcs = [
         "chirp/bit_utils.cpp",
@@ -69,6 +79,8 @@ cc_library(
         "chirp/interleaver.cpp",
         "chirp/modulator.cpp",
         "chirp/pcm_io.cpp",
+        "chirp/receiver_diagnostics.cpp",
+        "chirp/receiver_options.cpp",
         "chirp/waveform.cpp",
     ],
     hdrs = [
@@ -83,6 +95,9 @@ cc_library(
         "chirp/interleaver.h",
         "chirp/modulator.h",
         "chirp/pcm_io.h",
+        "chirp/receiver_diagnostics.h",
+        "chirp/receiver_options.h",
+        "chirp/receiver.h",
         "chirp/waveform.h",
     ],
     copts = CPP17_COPTS,
@@ -136,6 +151,30 @@ cc_test(
     srcs = ["chirp/waveform_test.cpp"],
     copts = CPP17_COPTS,
     deps = [":chirp_modem_lib"],
+)
+
+cc_test(
+    name = "receiver_options_test",
+    srcs = ["chirp/receiver_options_test.cpp"],
+    copts = CPP17_COPTS,
+    deps = [":chirp_modem_lib"],
+)
+
+cc_test(
+    name = "receiver_diagnostics_test",
+    srcs = ["chirp/receiver_diagnostics_test.cpp"],
+    copts = CPP17_COPTS,
+    deps = [":chirp_modem_lib"],
+)
+
+cc_test(
+    name = "receiver_test",
+    srcs = ["chirp/receiver_test.cpp"],
+    copts = CPP17_COPTS,
+    deps = [
+        ":chirp_modem_lib",
+        ":chirp_receiver_core",
+    ],
 )
 
 cc_test(
@@ -414,6 +453,9 @@ test_suite(
         ":frame_test",
         ":interleaver_test",
         ":modulator_test",
+        ":receiver_diagnostics_test",
+        ":receiver_options_test",
+        ":receiver_test",
         ":waveform_test",
         ":p4modem_roundtrip_test",
         ":pcm_to_wav_test",

@@ -34,6 +34,9 @@
 #include "lab/chirp/interleaver.h"
 #include "lab/chirp/modulator.h"
 #include "lab/chirp/pcm_io.h"
+#include "lab/chirp/receiver.h"
+#include "lab/chirp/receiver_diagnostics.h"
+#include "lab/chirp/receiver_options.h"
 #include "lab/chirp/waveform.h"
 
 using chirp::bits::binary_to_gray4;
@@ -98,6 +101,20 @@ using chirp::modulator::build_frame_tx_bits;
 using chirp::modulator::encode_frame_bytes_to_pcm;
 using chirp::modulator::encode_payload_to_pcm;
 using chirp::modulator::pilot_count_for_data_symbols;
+using chirp::receiver::apply_receiver_profile_defaults;
+using chirp::receiver::decode_failure_cause_name;
+using chirp::receiver::DecodeAttemptDiagnostics;
+using chirp::receiver::DecodeFailureCause;
+using chirp::receiver::parse_receiver_profile;
+using chirp::receiver::parse_timing_search_profile;
+using chirp::receiver::ReceiverDiagnostics;
+using chirp::receiver::ReceiverOptions;
+using chirp::receiver::ReceiverProfile;
+using chirp::receiver::receiver_demod_config;
+using chirp::receiver::receiver_profile_name;
+using chirp::receiver::TimingDiagnostics;
+using chirp::receiver::TimingSearchProfile;
+using chirp::receiver::timing_search_profile_name;
 using chirp::waveform::append_symbol_pcm;
 using chirp::waveform::ideal_base_template_array;
 using chirp::waveform::symbol_template;
@@ -175,58 +192,7 @@ struct TimingLoopConfig {
           confidence_threshold(0.055), pilot_confidence_threshold(0.04) {}
 };
 
-enum class TimingSearchProfile {
-    Full,
-    Local,
-    CenterOnly
-};
-
-enum class ReceiverProfile {
-    Default,
-    Legacy,
-    Robust
-};
-
-static TimingSearchProfile g_timing_search_profile = TimingSearchProfile::Local;
-static ReceiverProfile g_receiver_profile = ReceiverProfile::Robust;
-static bool g_rx_diagnostics_enabled = false;
-static bool g_adaptive_llr_enabled = false;
-static bool g_adaptive_clock_tracking_enabled = false;
-static bool g_adaptive_channel_templates_enabled = false;
-static bool g_weighted_correlation_enabled = false;
-static bool g_manual_llr_scale_set = false;
-static double g_manual_llr_scale = 0.0;
-
-static const char* timing_search_profile_name(TimingSearchProfile profile) {
-    switch (profile) {
-        case TimingSearchProfile::Full: return "full";
-        case TimingSearchProfile::Local: return "local";
-        case TimingSearchProfile::CenterOnly: return "center";
-    }
-    return "unknown";
-}
-
-static const char* receiver_profile_name(ReceiverProfile profile) {
-    switch (profile) {
-        case ReceiverProfile::Default: return "default";
-        case ReceiverProfile::Legacy: return "legacy";
-        case ReceiverProfile::Robust: return "robust";
-    }
-    return "unknown";
-}
-
-static TimingSearchProfile parse_timing_search_profile(const std::string& value) {
-    if (value == "full") return TimingSearchProfile::Full;
-    if (value == "local") return TimingSearchProfile::Local;
-    if (value == "center") return TimingSearchProfile::CenterOnly;
-    throw std::runtime_error("timing search must be full, local, or center");
-}
-
-static ReceiverProfile parse_receiver_profile(const std::string& value) {
-    if (value == "legacy") return ReceiverProfile::Legacy;
-    if (value == "robust") return ReceiverProfile::Robust;
-    throw std::runtime_error("receiver profile must be legacy or robust");
-}
+static ReceiverOptions g_receiver_options;
 
 static double parse_cli_double(const std::string& value, const std::string& name) {
     size_t parsed = 0;
@@ -247,7 +213,7 @@ static std::vector<std::string> strip_global_receiver_args(int argc, char** argv
     args.reserve(size_t(std::max(0, argc - 1)));
     ReceiverProfile selected_profile = ReceiverProfile::Robust;
     bool has_timing_search_override = false;
-    TimingSearchProfile timing_search_override = g_timing_search_profile;
+    TimingSearchProfile timing_search_override = g_receiver_options.timing_search_profile;
     bool has_adaptive_llr_override = false;
     bool adaptive_llr_override = false;
     bool has_adaptive_clock_override = false;
@@ -281,7 +247,7 @@ static std::vector<std::string> strip_global_receiver_args(int argc, char** argv
         } else if (arg == "--robust-receiver") {
             selected_profile = ReceiverProfile::Robust;
         } else if (arg == "--rx-diagnostics" || arg == "--diagnostics") {
-            g_rx_diagnostics_enabled = true;
+            g_receiver_options.rx_diagnostics_enabled = true;
         } else if (arg == "--adaptive-llr") {
             adaptive_llr_override = true;
             has_adaptive_llr_override = true;
@@ -307,18 +273,19 @@ static std::vector<std::string> strip_global_receiver_args(int argc, char** argv
             adaptive_llr_override = false;
             has_adaptive_llr_override = true;
         } else if (arg.compare(0, llr_scale_prefix.size(), llr_scale_prefix) == 0) {
-            g_manual_llr_scale = parse_cli_double(arg.substr(llr_scale_prefix.size()),
-                                                  "--llr-scale");
-            if (g_manual_llr_scale <= 0.0) {
+            g_receiver_options.manual_llr_scale =
+                parse_cli_double(arg.substr(llr_scale_prefix.size()), "--llr-scale");
+            if (g_receiver_options.manual_llr_scale <= 0.0) {
                 throw std::runtime_error("--llr-scale must be positive");
             }
-            g_manual_llr_scale_set = true;
+            g_receiver_options.manual_llr_scale_set = true;
         } else if (arg == "--llr-scale" && i + 1 < argc) {
-            g_manual_llr_scale = parse_cli_double(argv[++i], "--llr-scale");
-            if (g_manual_llr_scale <= 0.0) {
+            g_receiver_options.manual_llr_scale =
+                parse_cli_double(argv[++i], "--llr-scale");
+            if (g_receiver_options.manual_llr_scale <= 0.0) {
                 throw std::runtime_error("--llr-scale must be positive");
             }
-            g_manual_llr_scale_set = true;
+            g_receiver_options.manual_llr_scale_set = true;
         } else if (arg == "--llr-scale") {
             throw std::runtime_error("--llr-scale requires a positive number");
         } else {
@@ -326,38 +293,27 @@ static std::vector<std::string> strip_global_receiver_args(int argc, char** argv
         }
     }
 
-    g_receiver_profile = selected_profile;
-    if (selected_profile == ReceiverProfile::Legacy) {
-        g_timing_search_profile = TimingSearchProfile::Local;
-        g_adaptive_llr_enabled = false;
-        g_adaptive_clock_tracking_enabled = false;
-        g_adaptive_channel_templates_enabled = false;
-        g_weighted_correlation_enabled = false;
-    } else if (selected_profile == ReceiverProfile::Robust) {
-        g_timing_search_profile = TimingSearchProfile::Local;
-        g_adaptive_llr_enabled = true;
-        g_adaptive_clock_tracking_enabled = true;
-        g_adaptive_channel_templates_enabled = true;
-        g_weighted_correlation_enabled = true;
+    apply_receiver_profile_defaults(&g_receiver_options, selected_profile);
+    if (has_timing_search_override) {
+        g_receiver_options.timing_search_profile = timing_search_override;
     }
-
-    if (has_timing_search_override) g_timing_search_profile = timing_search_override;
-    if (has_adaptive_llr_override) g_adaptive_llr_enabled = adaptive_llr_override;
-    if (has_adaptive_clock_override) g_adaptive_clock_tracking_enabled = adaptive_clock_override;
+    if (has_adaptive_llr_override) {
+        g_receiver_options.adaptive_llr_enabled = adaptive_llr_override;
+    }
+    if (has_adaptive_clock_override) {
+        g_receiver_options.adaptive_clock_tracking_enabled = adaptive_clock_override;
+    }
     if (has_adaptive_templates_override) {
-        g_adaptive_channel_templates_enabled = adaptive_templates_override;
+        g_receiver_options.adaptive_channel_templates_enabled = adaptive_templates_override;
     }
     if (has_weighted_correlation_override) {
-        g_weighted_correlation_enabled = weighted_correlation_override;
+        g_receiver_options.weighted_correlation_enabled = weighted_correlation_override;
     }
     return args;
 }
 
 static DemodConfig receiver_demod_config() {
-    DemodConfig cfg = calibrated_llr_demod_config();
-    if (g_manual_llr_scale_set) cfg.llr_scale = g_manual_llr_scale;
-    cfg.use_adaptive_llr = g_adaptive_llr_enabled;
-    return cfg;
+    return receiver_demod_config(g_receiver_options);
 }
 
 static TimingLoopConfig timing_loop_config_for_templates(bool adaptive_templates) {
@@ -380,69 +336,6 @@ static bool pilot_is_strong_for_timing(double margin,
     return margin > cfg.pilot_confidence_threshold &&
            std::abs(timing_offset) <= cfg.max_timing_update;
 }
-
-struct TimingDiagnostics {
-    int pilot_count;
-    int pilot_used_for_timing;
-    int pilot_rejected_low_confidence;
-    double pilot_mean_margin;
-    double pilot_timing_offset_rms;
-    double timing_error_rms;
-    double span_estimate_mean;
-    double span_estimate_min;
-    double span_estimate_max;
-    int timing_search_full_count;
-    int timing_search_local_count;
-    int timing_search_center_count;
-    double average_offsets_per_symbol;
-    double timing_offset_initial_samples;
-    double timing_offset_final_samples;
-    int timing_corrections_applied;
-    double estimated_clock_ppm;
-    double clock_scale;
-    double clock_offset_samples;
-    double clock_fit_error_rms_samples;
-    int clock_fit_points;
-    double timing_error_before_rms;
-    double timing_error_after_rms;
-
-    double pilot_margin_sum;
-    double pilot_offset_sq_sum;
-    double timing_error_sq_sum;
-    double span_sum;
-    double clock_fit_sum_expected;
-    double clock_fit_sum_observed;
-    double clock_fit_sum_expected_sq;
-    double clock_fit_sum_observed_sq;
-    double clock_fit_sum_expected_observed;
-    double timing_error_before_sq_sum;
-    double timing_error_after_sq_sum;
-    int timing_error_samples;
-    int timing_error_compare_samples;
-    int span_samples;
-    int timing_search_symbols;
-    int timing_search_offsets;
-
-    TimingDiagnostics()
-        : pilot_count(0), pilot_used_for_timing(0),
-          pilot_rejected_low_confidence(0), pilot_mean_margin(0.0),
-          pilot_timing_offset_rms(0.0), timing_error_rms(0.0),
-          span_estimate_mean(NOMINAL_SPAN), span_estimate_min(NOMINAL_SPAN),
-          span_estimate_max(NOMINAL_SPAN), timing_search_full_count(0),
-          timing_search_local_count(0), timing_search_center_count(0),
-          average_offsets_per_symbol(0.0), timing_offset_initial_samples(0.0),
-          timing_offset_final_samples(0.0), timing_corrections_applied(0),
-          estimated_clock_ppm(0.0), clock_scale(1.0), clock_offset_samples(0.0),
-          clock_fit_error_rms_samples(0.0), clock_fit_points(0),
-          timing_error_before_rms(0.0), timing_error_after_rms(0.0),
-          pilot_margin_sum(0.0), pilot_offset_sq_sum(0.0),
-          timing_error_sq_sum(0.0), span_sum(0.0), clock_fit_sum_expected(0.0),
-          clock_fit_sum_observed(0.0), clock_fit_sum_expected_sq(0.0),
-          clock_fit_sum_observed_sq(0.0), clock_fit_sum_expected_observed(0.0),
-          timing_error_before_sq_sum(0.0), timing_error_after_sq_sum(0.0),
-          timing_error_samples(0), timing_error_compare_samples(0), span_samples(0),
-          timing_search_symbols(0), timing_search_offsets(0) {}
-};
 
 struct AdaptiveTemplateBank {
     std::array<double, SYMBOL_SAMPLES> base;
@@ -992,7 +885,7 @@ static WeightedCorrelationModel build_weighted_correlation_model(
     const SyncLock& lock,
     const AdaptiveTemplateBank* adaptive) {
     WeightedCorrelationModel model;
-    if (!g_weighted_correlation_enabled) return model;
+    if (!g_receiver_options.weighted_correlation_enabled) return model;
 
     std::array<double, SYMBOL_SAMPLES> reference_base =
         adaptive != nullptr && adaptive->valid ? adaptive->base
@@ -1387,7 +1280,7 @@ static std::vector<double> decode_llrs_tracking(const std::vector<int16_t>& pcm,
                                                 TimingDiagnostics* timing_diag = nullptr,
                                                 const WeightedCorrelationModel* weights = nullptr,
                                                 TimingSearchProfile timing_search_profile =
-                                                    g_timing_search_profile,
+                                                    g_receiver_options.timing_search_profile,
                                                 DemodConfig* effective_demod_cfg = nullptr,
                                                 double clock_fit_base_expected_sample = 0.0) {
     std::vector<double> llrs;
@@ -1416,7 +1309,7 @@ static std::vector<double> decode_llrs_tracking(const std::vector<int16_t>& pcm,
         const double nominal_expected_sample =
             clock_fit_base_expected_sample +
             double(physical_symbols_since_data_start) * NOMINAL_SPAN;
-        if (g_adaptive_clock_tracking_enabled &&
+        if (g_receiver_options.adaptive_clock_tracking_enabled &&
             timing_diag_clock_tracking_is_safe(timing_diag)) {
             timing.pos =
                 timing_diag_predict_clock_sample(timing_diag, nominal_expected_sample);
@@ -1791,7 +1684,7 @@ static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pc
     }
 
     const AdaptiveTemplateBank adaptive =
-        g_adaptive_channel_templates_enabled
+        g_receiver_options.adaptive_channel_templates_enabled
             ? build_adaptive_template_bank(pcm, lock.preamble_pos, lock.symbol_span)
             : AdaptiveTemplateBank();
     progress_message(verbose, progress_clock,
@@ -1828,7 +1721,7 @@ static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pc
             }
 
             const int template_modes =
-                (g_adaptive_channel_templates_enabled && adaptive.valid) ? 2 : 1;
+                (g_receiver_options.adaptive_channel_templates_enabled && adaptive.valid) ? 2 : 1;
             for (int template_mode = 0; template_mode < template_modes; ++template_mode) {
                 AdaptiveTemplateBank working_adaptive = adaptive;
                 AdaptiveTemplateBank* decode_templates =
@@ -1942,6 +1835,11 @@ static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pc
     return result;
 }
 
+static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
+    const std::vector<int16_t>& pcm,
+    std::vector<uint8_t>* decoded_payload,
+    const DemodConfig& demod_cfg);
+
 static bool decode_payload_from_pcm(const std::vector<int16_t>& pcm,
                                     std::vector<uint8_t>* payload,
                                     bool verbose = false,
@@ -1982,6 +1880,29 @@ static bool decode_payload_from_pcm(const std::vector<int16_t>& pcm,
     }
     return false;
 }
+
+namespace chirp {
+namespace receiver {
+
+DecodeResult decode_payload_from_pcm(const std::vector<int16_t>& pcm,
+                                     const ReceiverOptions& options) {
+    const ReceiverOptions saved_options = g_receiver_options;
+    g_receiver_options = options;
+    try {
+        DecodeResult result;
+        result.diagnostics =
+            diagnose_pcm_decode_attempt(pcm, &result.payload, ::receiver_demod_config());
+        result.ok = result.diagnostics.ok;
+        g_receiver_options = saved_options;
+        return result;
+    } catch (...) {
+        g_receiver_options = saved_options;
+        throw;
+    }
+}
+
+}  // namespace receiver
+}  // namespace chirp
 
 static void print_receiver_diagnostics_for_pcm(const std::vector<int16_t>& pcm,
                                                bool decode_ok,
@@ -2275,31 +2196,6 @@ static RawLinkMetrics measure_oracle_raw_link_metrics(
     return measure_raw_link_metrics_core(pcm, expected_tx_bits, expected_symbols, true);
 }
 
-enum class DecodeFailureCause {
-    None,
-    Sync,
-    HeaderFec,
-    BodyFec,
-    Crc,
-    FalseLock,
-    Incomplete,
-    ConvergedButCrc
-};
-
-static const char* decode_failure_cause_name(DecodeFailureCause cause) {
-    switch (cause) {
-        case DecodeFailureCause::None: return "none";
-        case DecodeFailureCause::Sync: return "sync";
-        case DecodeFailureCause::HeaderFec: return "header_fec";
-        case DecodeFailureCause::BodyFec: return "body_fec";
-        case DecodeFailureCause::Crc: return "crc";
-        case DecodeFailureCause::FalseLock: return "false_lock";
-        case DecodeFailureCause::Incomplete: return "incomplete";
-        case DecodeFailureCause::ConvergedButCrc: return "converged_but_crc";
-    }
-    return "unknown";
-}
-
 static std::string bytes_to_hex_string(const std::vector<uint8_t>& bytes) {
     static const char hex[] = "0123456789ABCDEF";
     std::string out;
@@ -2310,67 +2206,6 @@ static std::string bytes_to_hex_string(const std::vector<uint8_t>& bytes) {
     }
     return out;
 }
-
-struct DecodeAttemptDiagnostics {
-    bool ok;
-    DecodeFailureCause cause;
-    FecDecodeResult header_fec;
-    FecDecodeResult body_fec;
-    bool sync_locked;
-    double preamble_score;
-    double sync_score;
-    size_t detected_start_sample;
-    double estimated_symbol_span;
-    double selected_candidate_span;
-    size_t number_of_symbols;
-    size_t payload_bytes;
-    size_t required_fec_bits;
-    bool crc_ok;
-    std::vector<uint8_t> header_decoded_bytes;
-    MetricStats metric_stats;
-    TimingDiagnostics timing_diag;
-    DemodConfig demod_cfg_used;
-    bool adaptive_channel_templates_enabled;
-    int channel_template_known_symbols;
-    double channel_template_energy;
-    bool channel_template_fallback_used;
-    double ideal_vs_adaptive_sync_score;
-    bool weighted_correlation_enabled;
-    double weight_min;
-    double weight_max;
-    double weight_mean;
-    bool weight_fallback_used;
-
-    DecodeAttemptDiagnostics()
-        : ok(false), cause(DecodeFailureCause::Sync), header_fec(), body_fec(),
-          sync_locked(false), preamble_score(0.0), sync_score(0.0),
-          detected_start_sample(0), estimated_symbol_span(0.0),
-          selected_candidate_span(0.0), number_of_symbols(0), payload_bytes(0),
-          required_fec_bits(0), crc_ok(false), header_decoded_bytes(),
-          metric_stats(), timing_diag(), demod_cfg_used(),
-          adaptive_channel_templates_enabled(false),
-          channel_template_known_symbols(0), channel_template_energy(0.0),
-          channel_template_fallback_used(false),
-          ideal_vs_adaptive_sync_score(0.0),
-          weighted_correlation_enabled(false), weight_min(1.0),
-          weight_max(1.0), weight_mean(1.0), weight_fallback_used(true) {}
-};
-
-struct ReceiverDiagnostics {
-    DecodeAttemptDiagnostics decode;
-    DemodConfig demod_cfg;
-    bool fec_enabled;
-    const char* fec_mode;
-
-    ReceiverDiagnostics()
-        : decode(), demod_cfg(calibrated_llr_demod_config()), fec_enabled(true),
-          fec_mode("ldpc-bp") {}
-};
-
-static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
-    const std::vector<int16_t>& pcm,
-    std::vector<uint8_t>* decoded_payload,
-    const DemodConfig& demod_cfg);
 
 static double finite_or_zero(double value) {
     return std::isfinite(value) ? value : 0.0;
@@ -2406,9 +2241,9 @@ static void print_receiver_diagnostics_json(const ReceiverDiagnostics& rx) {
         << "\"payload_bytes\":" << d.payload_bytes << ","
         << "\"fec_enabled\":" << (rx.fec_enabled ? "true" : "false") << ","
         << "\"fec_mode\":\"" << rx.fec_mode << "\","
-        << "\"rx_profile\":\"" << receiver_profile_name(g_receiver_profile) << "\","
+        << "\"rx_profile\":\"" << receiver_profile_name(g_receiver_options.receiver_profile) << "\","
         << "\"robust_defaults_enabled\":"
-        << (g_receiver_profile == ReceiverProfile::Robust ? "true" : "false") << ","
+        << (g_receiver_options.receiver_profile == ReceiverProfile::Robust ? "true" : "false") << ","
         << "\"legacy_baseline_available\":true,"
         << "\"same_bitrate_as_legacy\":"
         << (phy.same_bitrate_as_legacy ? "true" : "false") << ","
@@ -2417,7 +2252,7 @@ static void print_receiver_diagnostics_json(const ReceiverDiagnostics& rx) {
         << "\"estimated_clock_ppm\":"
         << finite_or_zero(t.estimated_clock_ppm) << ","
         << "\"adaptive_clock_tracking_enabled\":"
-        << (g_adaptive_clock_tracking_enabled ? "true" : "false") << ","
+        << (g_receiver_options.adaptive_clock_tracking_enabled ? "true" : "false") << ","
         << "\"adaptive_channel_templates_enabled\":"
         << (d.adaptive_channel_templates_enabled ? "true" : "false") << ","
         << "\"channel_template_known_symbols\":"
@@ -2509,21 +2344,22 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
         diag.detected_start_sample =
             size_t(std::max(0.0, std::floor(lock.preamble_pos + 0.5)));
         diag.estimated_symbol_span = lock.symbol_span;
-        diag.adaptive_channel_templates_enabled = g_adaptive_channel_templates_enabled;
-        diag.weighted_correlation_enabled = g_weighted_correlation_enabled;
+        diag.adaptive_channel_templates_enabled =
+            g_receiver_options.adaptive_channel_templates_enabled;
+        diag.weighted_correlation_enabled = g_receiver_options.weighted_correlation_enabled;
         if (lock.score < STREAM_DECODE_SYNC_SCORE_THRESHOLD) {
             diag.cause = DecodeFailureCause::FalseLock;
             return diag;
         }
 
         const AdaptiveTemplateBank adaptive =
-            g_adaptive_channel_templates_enabled
+            g_receiver_options.adaptive_channel_templates_enabled
                 ? build_adaptive_template_bank(pcm, lock.preamble_pos, lock.symbol_span)
                 : AdaptiveTemplateBank();
         diag.channel_template_known_symbols = adaptive.known_symbols;
         diag.channel_template_energy = adaptive.template_energy;
         diag.channel_template_fallback_used =
-            !g_adaptive_channel_templates_enabled || !adaptive.valid;
+            !g_receiver_options.adaptive_channel_templates_enabled || !adaptive.valid;
         diag.ideal_vs_adaptive_sync_score =
             ideal_vs_adaptive_template_score_delta(pcm, lock, adaptive);
         const double data_pos = lock.sync_pos + SYNC_SYMBOLS * lock.symbol_span;
@@ -2547,7 +2383,7 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
                 }
 
                 const int template_modes =
-                    (g_adaptive_channel_templates_enabled && adaptive.valid) ? 2 : 1;
+                    (g_receiver_options.adaptive_channel_templates_enabled && adaptive.valid) ? 2 : 1;
                 for (int template_mode = 0; template_mode < template_modes; ++template_mode) {
                     AdaptiveTemplateBank working_adaptive = adaptive;
                     AdaptiveTemplateBank* adaptive_ptr =
@@ -2567,7 +2403,7 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
                                              FEC_CODEWORD_BITS, adaptive_ptr, false,
                                              demod_cfg, &metric_stats, &timing_diag,
                                              weights,
-                                             g_timing_search_profile, &header_demod_cfg,
+                                             g_receiver_options.timing_search_profile, &header_demod_cfg,
                                              double(PREAMBLE_SYMBOLS + SYNC_SYMBOLS) *
                                                  NOMINAL_SPAN);
                     if (header_llrs.size() < FEC_CODEWORD_BITS) {
@@ -2591,7 +2427,7 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
                         diag.weight_max = weighted_model.weight_max;
                         diag.weight_mean = weighted_model.weight_mean;
                         diag.weight_fallback_used =
-                            g_weighted_correlation_enabled && !weighted_model.valid;
+                            g_receiver_options.weighted_correlation_enabled && !weighted_model.valid;
                         saw_header_candidate = true;
                     }
 
@@ -2612,7 +2448,7 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
                     diag.weight_max = weighted_model.weight_max;
                     diag.weight_mean = weighted_model.weight_mean;
                     diag.weight_fallback_used =
-                        g_weighted_correlation_enabled && !weighted_model.valid;
+                        g_receiver_options.weighted_correlation_enabled && !weighted_model.valid;
 
                     const size_t required_symbols =
                         (required_fec_bits + BITS_PER_SYMBOL - 1) / BITS_PER_SYMBOL;
@@ -2636,7 +2472,7 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
                                              full_adaptive_ptr != nullptr,
                                              demod_cfg, &metric_stats, &timing_diag,
                                              weights,
-                                             g_timing_search_profile, &full_demod_cfg,
+                                             g_receiver_options.timing_search_profile, &full_demod_cfg,
                                              double(PREAMBLE_SYMBOLS + SYNC_SYMBOLS) *
                                                  NOMINAL_SPAN);
                     if (frame_llrs.size() < required_fec_bits) {
@@ -2657,7 +2493,7 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
                     diag.weight_max = weighted_model.weight_max;
                     diag.weight_mean = weighted_model.weight_mean;
                     diag.weight_fallback_used =
-                        g_weighted_correlation_enabled && !weighted_model.valid;
+                        g_receiver_options.weighted_correlation_enabled && !weighted_model.valid;
                     if (ok) {
                         diag.ok = true;
                         diag.cause = DecodeFailureCause::None;
@@ -3155,7 +2991,7 @@ static void run_pcm_quality_measurement(int trials_per_point = 2,
                       << span_estimate_mean << ","
                       << span_min << ","
                       << span_max << ","
-                      << timing_search_profile_name(g_timing_search_profile) << ","
+                      << timing_search_profile_name(g_receiver_options.timing_search_profile) << ","
                       << timing_search_full_count << ","
                       << timing_search_local_count << ","
                       << timing_search_center_count << ","
@@ -3182,10 +3018,11 @@ static void run_pcm_debug_measurement(const std::string& profile,
     std::cout << "measure-pcm-debug profile=" << profile
               << " snr_db=" << snr_db
               << " trials=" << trials
-              << " timing_search=" << timing_search_profile_name(g_timing_search_profile)
+              << " timing_search="
+              << timing_search_profile_name(g_receiver_options.timing_search_profile)
               << " adaptive_llr=" << (demod_cfg.use_adaptive_llr ? 1 : 0)
               << " adaptive_clock_tracking="
-              << (g_adaptive_clock_tracking_enabled ? 1 : 0)
+              << (g_receiver_options.adaptive_clock_tracking_enabled ? 1 : 0)
               << " rng_seed=0xBEEF\n";
 
     for (int trial = 0; trial < trials; ++trial) {
@@ -3740,6 +3577,7 @@ static void run_selftest() {
     std::cerr << "All self-tests passed.\n";
 }
 
+#ifndef CHIRP_MODEM_NO_MAIN
 int main(int argc, char** argv) {
     try {
         const std::vector<std::string> args = strip_global_receiver_args(argc, argv);
@@ -3872,7 +3710,7 @@ int main(int argc, char** argv) {
         if (mode == "enc") {
             encode_file(args[1], args[2]);
         } else if (mode == "dec") {
-            decode_file(args[1], args[2], g_rx_diagnostics_enabled);
+            decode_file(args[1], args[2], g_receiver_options.rx_diagnostics_enabled);
         } else {
             throw std::runtime_error("Mode must be enc or dec");
         }
@@ -3882,3 +3720,4 @@ int main(int argc, char** argv) {
         return 2;
     }
 }
+#endif  // CHIRP_MODEM_NO_MAIN
