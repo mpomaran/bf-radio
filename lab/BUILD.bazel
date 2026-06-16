@@ -84,6 +84,7 @@ cc_library(
         "chirp/receiver_options.cpp",
         "chirp/receiver_options_cli.cpp",
         "chirp/sample_view.cpp",
+        "chirp/sync_acquisition.cpp",
         "chirp/timing_tracker.cpp",
         "chirp/waveform.cpp",
         "chirp/weighted_correlation.cpp",
@@ -106,6 +107,7 @@ cc_library(
         "chirp/receiver_options_cli.h",
         "chirp/receiver.h",
         "chirp/sample_view.h",
+        "chirp/sync_acquisition.h",
         "chirp/timing_tracker.h",
         "chirp/waveform.h",
         "chirp/weighted_correlation.h",
@@ -218,6 +220,13 @@ cc_test(
 cc_test(
     name = "timing_tracker_test",
     srcs = ["chirp/timing_tracker_test.cpp"],
+    copts = CPP17_COPTS,
+    deps = [":chirp_modem_lib"],
+)
+
+cc_test(
+    name = "sync_acquisition_test",
+    srcs = ["chirp/sync_acquisition_test.cpp"],
     copts = CPP17_COPTS,
     deps = [":chirp_modem_lib"],
 )
@@ -504,6 +513,7 @@ test_suite(
         ":receiver_options_test",
         ":receiver_test",
         ":sample_view_test",
+        ":sync_acquisition_test",
         ":timing_tracker_test",
         ":waveform_test",
         ":weighted_correlation_test",
