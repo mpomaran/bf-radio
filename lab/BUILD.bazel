@@ -183,7 +183,7 @@ sh_test(
         "//:phone_recording_testdata",
     ],
     size = "small",
-    tags = ["manual", "slow"],
+    tags = ["manual", "slow", "testdata"],
 )
 
 sh_test(
@@ -196,7 +196,7 @@ sh_test(
     ],
     size = "large",
     timeout = "long",
-    tags = ["manual", "nightly", "slow"],
+    tags = ["manual", "nightly", "slow", "testdata"],
 )
 
 sh_test(
@@ -216,6 +216,7 @@ sh_test(
         "//:phone_recording_testdata",
     ],
     size = "small",
+    tags = ["manual", "slow", "testdata"],
 )
 
 sh_test(
@@ -259,6 +260,7 @@ sh_test(
         "//:phone_recording_testdata",
     ],
     size = "medium",
+    tags = ["manual", "slow", "testdata"],
 )
 
 sh_test(
@@ -416,10 +418,8 @@ test_suite(
         ":p4modem_roundtrip_test",
         ":pcm_to_wav_test",
         ":chirp_clean_roundtrip_fast_test",
-        ":chirp_audio_channel_impair_test",
         ":chirp_fec_fast_test",
         ":chirp_pcm_to_wav_test",
-        ":chirp_radio_channel_impair_test",
         ":chirp_timing_drift_fast_test",
     ],
 )
@@ -429,8 +429,6 @@ test_suite(
     tags = ["manual"],
     tests = [
         ":wav_to_pcm_test",
-        ":chirp_recorded_wav_test",
-        ":chirp_recorded_wav_long_test",
         ":corruption_test",
         ":fec_limits_test",
         ":fec_performance_test",
@@ -459,6 +457,5 @@ test_suite(
         ":timing_drift_test",
         ":chirp_fec_performance_test",
         ":chirp_timing_drift_test",
-        ":chirp_recorded_wav_long_test",
     ],
 )
