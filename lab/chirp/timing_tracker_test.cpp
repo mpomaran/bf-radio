@@ -1,6 +1,9 @@
 #include "lab/chirp/timing_tracker.h"
 
 #include <cassert>
+#include <cmath>
+
+#include "lab/chirp/config.h"
 
 int main() {
     {
@@ -37,6 +40,41 @@ int main() {
         assert(state.pos == 12.5);
         assert(state.span == 127.0);
         assert(state.timing_error_filtered == 0.0);
+    }
+    {
+        chirp::receiver::TimingDiagnostics diag;
+        chirp::timing::timing_diag_record_span(&diag, 126.0);
+        chirp::timing::timing_diag_record_span(&diag, 130.0);
+        assert(diag.span_samples == 2);
+        assert(diag.span_estimate_min == 126.0);
+        assert(diag.span_estimate_max == 130.0);
+        assert(diag.span_estimate_mean == 128.0);
+
+        chirp::timing::timing_diag_record_error(&diag, 3.0);
+        chirp::timing::timing_diag_record_error(&diag, 4.0);
+        assert(diag.timing_corrections_applied == 2);
+        assert(std::abs(diag.timing_error_rms - std::sqrt(12.5)) < 1e-12);
+    }
+    {
+        chirp::receiver::TimingDiagnostics diag;
+        chirp::sync::SyncLock lock;
+        lock.preamble_pos = 10.0;
+        lock.sync_pos = 10.0 + double(chirp::config::PREAMBLE_SYMBOLS) *
+                                   chirp::config::NOMINAL_SPAN * 1.001;
+        lock.symbol_span = chirp::config::NOMINAL_SPAN * 1.001;
+        chirp::timing::timing_diag_record_sync_clock_points(&diag, lock);
+        assert(chirp::timing::timing_diag_has_clock_model(&diag));
+        assert(std::abs(diag.estimated_clock_ppm - 1000.0) < 1e-6);
+        assert(std::abs(chirp::timing::timing_diag_predict_clock_sample(&diag, 100.0) -
+                        (diag.clock_offset_samples + diag.clock_scale * 100.0)) <
+               1e-12);
+
+        chirp::timing::timing_diag_record_clock_point(&diag, 1000.0, 1011.0);
+        assert(chirp::timing::timing_diag_has_tracking_clock_model(&diag));
+        chirp::timing::timing_diag_record_clock_tracking_error(&diag, 2.0, 1.0);
+        assert(diag.timing_error_compare_samples == 1);
+        assert(diag.timing_error_before_rms == 2.0);
+        assert(diag.timing_error_after_rms == 1.0);
     }
     return 0;
 }

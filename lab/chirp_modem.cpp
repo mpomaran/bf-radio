@@ -130,6 +130,14 @@ using chirp::sync::SyncLock;
 using chirp::timing::pilot_is_strong_for_timing;
 using chirp::timing::TimingLoopConfig;
 using chirp::timing::TimingState;
+using chirp::timing::timing_diag_clock_tracking_is_safe;
+using chirp::timing::timing_diag_has_clock_model;
+using chirp::timing::timing_diag_predict_clock_sample;
+using chirp::timing::timing_diag_record_clock_point;
+using chirp::timing::timing_diag_record_clock_tracking_error;
+using chirp::timing::timing_diag_record_error;
+using chirp::timing::timing_diag_record_span;
+using chirp::timing::timing_diag_record_sync_clock_points;
 using chirp::timing::timing_loop_config_for_templates;
 using chirp::waveform::append_symbol_pcm;
 using chirp::waveform::symbol_template;
@@ -380,22 +388,6 @@ static double ideal_vs_adaptive_template_score_delta(
     return adaptive_score - ideal_score;
 }
 
-static void timing_diag_record_clock_point(TimingDiagnostics* diag,
-                                           double expected_sample,
-                                           double observed_sample);
-
-static void timing_diag_record_sync_clock_points(TimingDiagnostics* diag,
-                                                 const SyncLock& lock) {
-    timing_diag_record_clock_point(diag, 0.0, lock.preamble_pos);
-    timing_diag_record_clock_point(diag,
-                                   double(PREAMBLE_SYMBOLS) * NOMINAL_SPAN,
-                                   lock.sync_pos);
-    timing_diag_record_clock_point(
-        diag,
-        double(PREAMBLE_SYMBOLS + SYNC_SYMBOLS) * NOMINAL_SPAN,
-        lock.sync_pos + double(SYNC_SYMBOLS) * lock.symbol_span);
-}
-
 static MetricStats estimate_metric_stats_from_known_symbols(
     const std::vector<int16_t>& pcm,
     const SyncLock& lock,
@@ -416,109 +408,6 @@ static MetricStats estimate_metric_stats_from_known_symbols(
         metric_stats_observe_known_symbol(&stats, m, sync[i]);
     }
     return stats;
-}
-
-static void timing_diag_record_span(TimingDiagnostics* diag, double span) {
-    if (diag == nullptr) return;
-    if (diag->span_samples == 0) {
-        diag->span_estimate_min = span;
-        diag->span_estimate_max = span;
-    } else {
-        diag->span_estimate_min = std::min(diag->span_estimate_min, span);
-        diag->span_estimate_max = std::max(diag->span_estimate_max, span);
-    }
-    diag->span_sum += span;
-    ++diag->span_samples;
-    diag->span_estimate_mean = diag->span_sum / double(diag->span_samples);
-}
-
-static void timing_diag_record_error(TimingDiagnostics* diag, double error) {
-    if (diag == nullptr) return;
-    if (diag->timing_corrections_applied == 0) {
-        diag->timing_offset_initial_samples = error;
-    }
-    diag->timing_offset_final_samples = error;
-    ++diag->timing_corrections_applied;
-    diag->timing_error_sq_sum += error * error;
-    ++diag->timing_error_samples;
-    diag->timing_error_rms =
-        std::sqrt(diag->timing_error_sq_sum / double(diag->timing_error_samples));
-}
-
-static void timing_diag_record_clock_point(TimingDiagnostics* diag,
-                                           double expected_sample,
-                                           double observed_sample) {
-    if (diag == nullptr) return;
-    ++diag->clock_fit_points;
-    diag->clock_fit_sum_expected += expected_sample;
-    diag->clock_fit_sum_observed += observed_sample;
-    diag->clock_fit_sum_expected_sq += expected_sample * expected_sample;
-    diag->clock_fit_sum_observed_sq += observed_sample * observed_sample;
-    diag->clock_fit_sum_expected_observed += expected_sample * observed_sample;
-
-    const double n = double(diag->clock_fit_points);
-    const double sx = diag->clock_fit_sum_expected;
-    const double sy = diag->clock_fit_sum_observed;
-    const double sxx = diag->clock_fit_sum_expected_sq;
-    const double syy = diag->clock_fit_sum_observed_sq;
-    const double sxy = diag->clock_fit_sum_expected_observed;
-    const double denom = n * sxx - sx * sx;
-    if (diag->clock_fit_points < 2 || std::abs(denom) < 1e-9) return;
-
-    const double scale = (n * sxy - sx * sy) / denom;
-    const double offset = (sy - scale * sx) / n;
-    const double sse =
-        syy + n * offset * offset + scale * scale * sxx +
-        2.0 * offset * scale * sx - 2.0 * offset * sy - 2.0 * scale * sxy;
-    diag->clock_scale = scale;
-    diag->clock_offset_samples = offset;
-    diag->estimated_clock_ppm = (scale - 1.0) * 1000000.0;
-    diag->clock_fit_error_rms_samples =
-        std::sqrt(std::max(0.0, sse / n));
-}
-
-static bool timing_diag_has_clock_model(const TimingDiagnostics* diag) {
-    return diag != nullptr && diag->clock_fit_points >= 2 &&
-           std::isfinite(diag->clock_scale) &&
-           std::isfinite(diag->clock_offset_samples);
-}
-
-static bool timing_diag_has_tracking_clock_model(const TimingDiagnostics* diag) {
-    return timing_diag_has_clock_model(diag) && diag->clock_fit_points >= 4;
-}
-
-static bool timing_diag_clock_tracking_is_safe(const TimingDiagnostics* diag) {
-    if (!timing_diag_has_tracking_clock_model(diag)) return false;
-
-    /*
-      The fitted clock model is used only when the known-symbol observations are
-      internally consistent. In multipath or timing-wander cases a linear fit can
-      be worse than the local decision-directed timing loop, so pilot residuals
-      gate the optional adaptive clock path.
-    */
-    if (diag->clock_fit_error_rms_samples > 2.0) return false;
-    if (diag->timing_error_compare_samples >= 2 &&
-        diag->timing_error_after_rms > diag->timing_error_before_rms * 1.05) {
-        return false;
-    }
-    return true;
-}
-
-static double timing_diag_predict_clock_sample(const TimingDiagnostics* diag,
-                                               double expected_sample) {
-    return diag->clock_offset_samples + diag->clock_scale * expected_sample;
-}
-
-static void timing_diag_record_clock_tracking_error(TimingDiagnostics* diag,
-                                                    double before_error,
-                                                    double after_error) {
-    if (diag == nullptr) return;
-    diag->timing_error_before_sq_sum += before_error * before_error;
-    diag->timing_error_after_sq_sum += after_error * after_error;
-    ++diag->timing_error_compare_samples;
-    const double n = double(diag->timing_error_compare_samples);
-    diag->timing_error_before_rms = std::sqrt(diag->timing_error_before_sq_sum / n);
-    diag->timing_error_after_rms = std::sqrt(diag->timing_error_after_sq_sum / n);
 }
 
 static double percentile_from_samples(std::vector<double> samples, double percentile) {
