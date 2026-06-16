@@ -185,7 +185,7 @@ enum class ReceiverProfile {
 };
 
 static TimingSearchProfile g_timing_search_profile = TimingSearchProfile::Local;
-static ReceiverProfile g_receiver_profile = ReceiverProfile::Default;
+static ReceiverProfile g_receiver_profile = ReceiverProfile::Robust;
 static bool g_rx_diagnostics_enabled = false;
 static bool g_adaptive_llr_enabled = false;
 static bool g_adaptive_clock_tracking_enabled = false;
@@ -242,7 +242,7 @@ static double parse_cli_double(const std::string& value, const std::string& name
 static std::vector<std::string> strip_global_receiver_args(int argc, char** argv) {
     std::vector<std::string> args;
     args.reserve(size_t(std::max(0, argc - 1)));
-    ReceiverProfile selected_profile = ReceiverProfile::Default;
+    ReceiverProfile selected_profile = ReceiverProfile::Robust;
     bool has_timing_search_override = false;
     TimingSearchProfile timing_search_override = g_timing_search_profile;
     bool has_adaptive_llr_override = false;
