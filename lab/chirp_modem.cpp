@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "lab/chirp/bit_utils.h"
+#include "lab/chirp/adaptive_templates.h"
 #include "lab/chirp/config.h"
 #include "lab/chirp/demod_metrics.h"
 #include "lab/chirp/fec_ldpc.h"
@@ -41,6 +42,7 @@
 #include "lab/chirp/sample_view.h"
 #include "lab/chirp/timing_tracker.h"
 #include "lab/chirp/waveform.h"
+#include "lab/chirp/weighted_correlation.h"
 
 using chirp::bits::binary_to_gray4;
 using chirp::bits::bits_to_bytes;
@@ -48,6 +50,10 @@ using chirp::bits::bits_to_symbols;
 using chirp::bits::bytes_to_bits;
 using chirp::bits::descramble_llrs;
 using chirp::bits::gray_to_binary4;
+using chirp::adaptive::AdaptiveTemplateBank;
+using chirp::adaptive::build_adaptive_template_bank;
+using chirp::adaptive::ideal_base_precomputed_template;
+using chirp::adaptive::update_adaptive_template_bank;
 using chirp::config::ALPHABET;
 using chirp::config::BITS_PER_SYMBOL;
 using chirp::config::FEC_CODEWORD_BITS;
@@ -72,7 +78,6 @@ using chirp::dsp::circular_chirp_correlation_diagnostics;
 using chirp::dsp::circular_chirp_correlation_precomputed_into;
 using chirp::dsp::cyclic_corr_sample;
 using chirp::dsp::FftCorrelationDiagnostics;
-using chirp::dsp::make_precomputed_chirp_template;
 using chirp::dsp::reset_circular_chirp_correlation_diagnostics;
 using chirp::demod::DemodConfig;
 using chirp::demod::MetricStats;
@@ -117,8 +122,6 @@ using chirp::receiver::TimingDiagnostics;
 using chirp::receiver::TimingSearchProfile;
 using chirp::receiver::timing_search_profile_name;
 using chirp::sample::corr_score;
-using chirp::sample::cyclic_array_sample;
-using chirp::sample::normalize_template;
 using chirp::sample::normalized_symbol_samples;
 using chirp::sample::sample_at;
 using chirp::timing::pilot_is_strong_for_timing;
@@ -126,8 +129,11 @@ using chirp::timing::TimingLoopConfig;
 using chirp::timing::TimingState;
 using chirp::timing::timing_loop_config_for_templates;
 using chirp::waveform::append_symbol_pcm;
-using chirp::waveform::ideal_base_template_array;
 using chirp::waveform::symbol_template;
+using chirp::weighted::build_weighted_correlation_model;
+using chirp::weighted::corr_score_adaptive_weighted;
+using chirp::weighted::corr_score_weighted;
+using chirp::weighted::WeightedCorrelationModel;
 
 static void print_not_same_bitrate_notice() {
     const PhyProfile p = current_phy_profile();
@@ -152,229 +158,6 @@ static ReceiverOptions g_receiver_options;
 
 static DemodConfig receiver_demod_config() {
     return receiver_demod_config(g_receiver_options);
-}
-
-struct AdaptiveTemplateBank {
-    std::array<double, SYMBOL_SAMPLES> base;
-    PrecomputedChirpTemplate base_fft;
-    std::array<std::array<std::array<double, SYMBOL_SAMPLES>, 3>, ALPHABET> tpl;
-    bool valid;
-    int known_symbols;
-    double template_energy;
-
-    AdaptiveTemplateBank()
-        : base(), base_fft(), tpl(), valid(false), known_symbols(0),
-          template_energy(0.0) {}
-};
-
-struct WeightedCorrelationModel {
-    std::array<double, SYMBOL_SAMPLES> weights;
-    bool valid;
-    int known_symbols;
-    double weight_min;
-    double weight_max;
-    double weight_mean;
-
-    WeightedCorrelationModel()
-        : weights(), valid(false), known_symbols(0), weight_min(1.0),
-          weight_max(1.0), weight_mean(1.0) {
-        weights.fill(1.0);
-    }
-};
-
-static const PrecomputedChirpTemplate& ideal_base_precomputed_template() {
-    static const PrecomputedChirpTemplate tpl =
-        make_precomputed_chirp_template(ideal_base_template_array());
-    return tpl;
-}
-
-static void rebuild_adaptive_templates(AdaptiveTemplateBank* bank) {
-    bank->template_energy = 0.0;
-    for (double v : bank->base) bank->template_energy += v * v;
-    bank->base_fft = make_precomputed_chirp_template(bank->base);
-    const double fractional_offsets[3] = {-0.35, 0.0, 0.35};
-    for (int symbol = 0; symbol < ALPHABET; ++symbol) {
-        const int shift = symbol * SYMBOL_SAMPLES / ALPHABET;
-        for (int offset_index = 0; offset_index < 3; ++offset_index) {
-            const double frac = fractional_offsets[offset_index];
-            for (int n = 0; n < SYMBOL_SAMPLES; ++n) {
-                bank->tpl[size_t(symbol)][size_t(offset_index)][size_t(n)] =
-                    cyclic_array_sample(bank->base, double(n + shift) + frac);
-            }
-            normalize_template(&bank->tpl[size_t(symbol)][size_t(offset_index)]);
-        }
-    }
-}
-
-static void update_adaptive_template_bank(AdaptiveTemplateBank* bank,
-                                          const std::vector<int16_t>& pcm,
-                                          double pos,
-                                          double symbol_span,
-                                          int raw_symbol,
-                                          double learning_rate);
-
-static AdaptiveTemplateBank build_adaptive_template_bank(const std::vector<int16_t>& pcm,
-                                                         double preamble_pos,
-                                                         double symbol_span) {
-    AdaptiveTemplateBank bank;
-    std::array<double, SYMBOL_SAMPLES> base = {};
-    int used = 0;
-
-    for (int sym = 0; sym < PREAMBLE_SYMBOLS; ++sym) {
-        std::array<double, SYMBOL_SAMPLES> current =
-            normalized_symbol_samples(pcm, preamble_pos + sym * symbol_span, symbol_span);
-        double energy = 0.0;
-        for (double v : current) energy += v * v;
-        if (energy <= 1e-9) continue;
-
-        if (used > 0) {
-            double dot = 0.0;
-            for (int i = 0; i < SYMBOL_SAMPLES; ++i) {
-                dot += current[size_t(i)] * base[size_t(i)];
-            }
-            if (dot < 0.0) {
-                for (double& v : current) v = -v;
-            }
-        }
-        for (int i = 0; i < SYMBOL_SAMPLES; ++i) {
-            base[size_t(i)] += current[size_t(i)];
-        }
-        ++used;
-    }
-
-    if (used < PREAMBLE_SYMBOLS / 2) return bank;
-    normalize_template(&base);
-    bank.base = base;
-    bank.known_symbols = used;
-    rebuild_adaptive_templates(&bank);
-    bank.valid = true;
-
-    const int sync[SYNC_SYMBOLS] = {15, 1, 14, 2, 13, 3, 12, 4};
-    for (int i = 0; i < SYNC_SYMBOLS; ++i) {
-        /*
-          The sync word is known protocol content, so it can safely refine the
-          preamble-learned template before any payload decisions are made.
-        */
-        update_adaptive_template_bank(&bank, pcm,
-                                      preamble_pos + (PREAMBLE_SYMBOLS + i) * symbol_span,
-                                      symbol_span, sync[i], 0.04);
-        ++bank.known_symbols;
-    }
-    return bank;
-}
-
-static void update_adaptive_template_bank(AdaptiveTemplateBank* bank,
-                                          const std::vector<int16_t>& pcm,
-                                          double pos,
-                                          double symbol_span,
-                                          int raw_symbol,
-                                          double learning_rate) {
-    if (bank == nullptr || !bank->valid || raw_symbol < 0 || raw_symbol >= ALPHABET) return;
-    if (learning_rate <= 0.0) return;
-
-    const std::array<double, SYMBOL_SAMPLES> observed =
-        normalized_symbol_samples(pcm, pos, symbol_span);
-    double observed_energy = 0.0;
-    for (double v : observed) observed_energy += v * v;
-    if (observed_energy <= 1e-9) return;
-
-    const int shift = raw_symbol * SYMBOL_SAMPLES / ALPHABET;
-    std::array<double, SYMBOL_SAMPLES> candidate = {};
-    for (int n = 0; n < SYMBOL_SAMPLES; ++n) {
-        candidate[size_t(n)] = cyclic_array_sample(observed, double(n - shift));
-    }
-    normalize_template(&candidate);
-
-    double dot = 0.0;
-    for (int n = 0; n < SYMBOL_SAMPLES; ++n) {
-        dot += candidate[size_t(n)] * bank->base[size_t(n)];
-    }
-    if (dot < 0.0) {
-        for (double& v : candidate) v = -v;
-    }
-
-    const double keep = 1.0 - learning_rate;
-    for (int n = 0; n < SYMBOL_SAMPLES; ++n) {
-        bank->base[size_t(n)] = keep * bank->base[size_t(n)] +
-                                learning_rate * candidate[size_t(n)];
-    }
-    normalize_template(&bank->base);
-    rebuild_adaptive_templates(bank);
-}
-
-static double corr_score_adaptive(const std::vector<int16_t>& pcm,
-                                  double pos,
-                                  double symbol_span,
-                                  const std::array<double, SYMBOL_SAMPLES>& tpl) {
-    if (pos < 0.0 || pos + symbol_span >= double(pcm.size())) return 0.0;
-
-    const std::array<double, SYMBOL_SAMPLES> samples =
-        normalized_symbol_samples(pcm, pos, symbol_span);
-    double dot = 0.0;
-    double e1 = 0.0;
-    double e2 = 0.0;
-    for (int i = 0; i < SYMBOL_SAMPLES; ++i) {
-        const double a = samples[size_t(i)];
-        const double b = tpl[size_t(i)];
-        dot += a * b;
-        e1 += a * a;
-        e2 += b * b;
-    }
-    if (e1 <= 1e-9 || e2 <= 1e-9) return 0.0;
-    return std::abs(dot) / std::sqrt(e1 * e2);
-}
-
-static double corr_score_weighted(const std::vector<int16_t>& pcm,
-                                  double pos,
-                                  double symbol_span,
-                                  const std::vector<double>& tpl,
-                                  const WeightedCorrelationModel* weights) {
-    if (weights == nullptr || !weights->valid) return corr_score(pcm, pos, symbol_span, tpl);
-    if (pos < 0.0 || pos + symbol_span >= double(pcm.size())) return 0.0;
-
-    const std::array<double, SYMBOL_SAMPLES> samples =
-        normalized_symbol_samples(pcm, pos, symbol_span);
-    double dot = 0.0;
-    double e1 = 0.0;
-    double e2 = 0.0;
-    for (int i = 0; i < SYMBOL_SAMPLES; ++i) {
-        const double w = weights->weights[size_t(i)];
-        const double a = samples[size_t(i)];
-        const double b = tpl[size_t(i)];
-        dot += w * a * b;
-        e1 += w * a * a;
-        e2 += w * b * b;
-    }
-    if (e1 <= 1e-9 || e2 <= 1e-9) return 0.0;
-    return std::abs(dot) / std::sqrt(e1 * e2);
-}
-
-static double corr_score_adaptive_weighted(
-    const std::vector<int16_t>& pcm,
-    double pos,
-    double symbol_span,
-    const std::array<double, SYMBOL_SAMPLES>& tpl,
-    const WeightedCorrelationModel* weights) {
-    if (weights == nullptr || !weights->valid) {
-        return corr_score_adaptive(pcm, pos, symbol_span, tpl);
-    }
-    if (pos < 0.0 || pos + symbol_span >= double(pcm.size())) return 0.0;
-
-    const std::array<double, SYMBOL_SAMPLES> samples =
-        normalized_symbol_samples(pcm, pos, symbol_span);
-    double dot = 0.0;
-    double e1 = 0.0;
-    double e2 = 0.0;
-    for (int i = 0; i < SYMBOL_SAMPLES; ++i) {
-        const double w = weights->weights[size_t(i)];
-        const double a = samples[size_t(i)];
-        const double b = tpl[size_t(i)];
-        dot += w * a * b;
-        e1 += w * a * a;
-        e2 += w * b * b;
-    }
-    if (e1 <= 1e-9 || e2 <= 1e-9) return 0.0;
-    return std::abs(dot) / std::sqrt(e1 * e2);
 }
 
 static bool fast_symbol_metrics_from_base(const std::vector<int16_t>& pcm,
@@ -602,106 +385,6 @@ static double ideal_vs_adaptive_template_score_delta(
     const double adaptive_score = known_symbol_template_score(pcm, lock, &adaptive);
     const double ideal_score = known_symbol_template_score(pcm, lock, nullptr);
     return adaptive_score - ideal_score;
-}
-
-static void weighted_model_accumulate_known_symbol(
-    const std::vector<int16_t>& pcm,
-    double pos,
-    double symbol_span,
-    int raw_symbol,
-    const std::array<double, SYMBOL_SAMPLES>& reference_base,
-    std::array<double, SYMBOL_SAMPLES>* residual_sum,
-    int* used) {
-    const std::array<double, SYMBOL_SAMPLES> observed =
-        normalized_symbol_samples(pcm, pos, symbol_span);
-    double observed_energy = 0.0;
-    for (double v : observed) observed_energy += v * v;
-    if (observed_energy <= 1e-9) return;
-
-    const int shift = raw_symbol * SYMBOL_SAMPLES / ALPHABET;
-    std::array<double, SYMBOL_SAMPLES> candidate = {};
-    for (int n = 0; n < SYMBOL_SAMPLES; ++n) {
-        candidate[size_t(n)] = cyclic_array_sample(observed, double(n - shift));
-    }
-    normalize_template(&candidate);
-
-    double dot = 0.0;
-    for (int n = 0; n < SYMBOL_SAMPLES; ++n) {
-        dot += candidate[size_t(n)] * reference_base[size_t(n)];
-    }
-    if (dot < 0.0) {
-        for (double& v : candidate) v = -v;
-    }
-
-    for (int n = 0; n < SYMBOL_SAMPLES; ++n) {
-        const double r = candidate[size_t(n)] - reference_base[size_t(n)];
-        (*residual_sum)[size_t(n)] += r * r;
-    }
-    ++(*used);
-}
-
-static WeightedCorrelationModel build_weighted_correlation_model(
-    const std::vector<int16_t>& pcm,
-    const SyncLock& lock,
-    const AdaptiveTemplateBank* adaptive) {
-    WeightedCorrelationModel model;
-    if (!g_receiver_options.weighted_correlation_enabled) return model;
-
-    std::array<double, SYMBOL_SAMPLES> reference_base =
-        adaptive != nullptr && adaptive->valid ? adaptive->base
-                                               : ideal_base_template_array();
-    normalize_template(&reference_base);
-
-    std::array<double, SYMBOL_SAMPLES> residual_sum = {};
-    int used = 0;
-    const int sync[SYNC_SYMBOLS] = {15, 1, 14, 2, 13, 3, 12, 4};
-    for (int i = 0; i < PREAMBLE_SYMBOLS; i += 3) {
-        weighted_model_accumulate_known_symbol(
-            pcm, lock.preamble_pos + i * lock.symbol_span, lock.symbol_span,
-            0, reference_base, &residual_sum, &used);
-    }
-    for (int i = 0; i < SYNC_SYMBOLS; ++i) {
-        weighted_model_accumulate_known_symbol(
-            pcm, lock.sync_pos + i * lock.symbol_span, lock.symbol_span,
-            sync[i], reference_base, &residual_sum, &used);
-    }
-
-    if (used < 6) return model;
-
-    std::vector<double> residuals;
-    residuals.reserve(SYMBOL_SAMPLES);
-    for (int i = 0; i < SYMBOL_SAMPLES; ++i) {
-        residuals.push_back(residual_sum[size_t(i)] / double(used));
-    }
-    std::sort(residuals.begin(), residuals.end());
-    const double median_residual = residuals[SYMBOL_SAMPLES / 2];
-    const double floor_residual = std::max(1e-4, median_residual * 0.35);
-
-    double sum = 0.0;
-    for (int i = 0; i < SYMBOL_SAMPLES; ++i) {
-        const double residual = residual_sum[size_t(i)] / double(used);
-        const double raw_weight = (median_residual + floor_residual) /
-                                  (residual + floor_residual);
-        const double clamped = std::max(0.35, std::min(2.50, raw_weight));
-        model.weights[size_t(i)] = clamped;
-        sum += clamped;
-    }
-    if (sum <= 1e-9) return model;
-
-    const double mean = sum / SYMBOL_SAMPLES;
-    model.weight_min = std::numeric_limits<double>::infinity();
-    model.weight_max = 0.0;
-    model.weight_mean = 0.0;
-    for (double& w : model.weights) {
-        w /= mean;
-        model.weight_min = std::min(model.weight_min, w);
-        model.weight_max = std::max(model.weight_max, w);
-        model.weight_mean += w;
-    }
-    model.weight_mean /= SYMBOL_SAMPLES;
-    model.known_symbols = used;
-    model.valid = true;
-    return model;
 }
 
 static double sync_score_at(const std::vector<int16_t>& pcm,
@@ -1479,7 +1162,10 @@ static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pc
                 AdaptiveTemplateBank* decode_templates =
                     (template_mode == 0 && working_adaptive.valid) ? &working_adaptive : nullptr;
                 const WeightedCorrelationModel weighted_model =
-                    build_weighted_correlation_model(pcm, lock, decode_templates);
+                    build_weighted_correlation_model(
+                        pcm, lock.preamble_pos, lock.sync_pos, lock.symbol_span,
+                        g_receiver_options.weighted_correlation_enabled,
+                        decode_templates);
                 const WeightedCorrelationModel* weights =
                     weighted_model.valid ? &weighted_model : nullptr;
                 MetricStats metric_stats =
@@ -2141,7 +1827,10 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
                     AdaptiveTemplateBank* adaptive_ptr =
                         (template_mode == 0 && working_adaptive.valid) ? &working_adaptive : nullptr;
                     const WeightedCorrelationModel weighted_model =
-                        build_weighted_correlation_model(pcm, lock, adaptive_ptr);
+                        build_weighted_correlation_model(
+                            pcm, lock.preamble_pos, lock.sync_pos, lock.symbol_span,
+                            g_receiver_options.weighted_correlation_enabled,
+                            adaptive_ptr);
                     const WeightedCorrelationModel* weights =
                         weighted_model.valid ? &weighted_model : nullptr;
                     MetricStats metric_stats =

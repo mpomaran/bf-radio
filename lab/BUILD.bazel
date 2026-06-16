@@ -69,6 +69,7 @@ cc_library(
 cc_library(
     name = "chirp_modem_lib",
     srcs = [
+        "chirp/adaptive_templates.cpp",
         "chirp/bit_utils.cpp",
         "chirp/crc16.cpp",
         "chirp/demod_metrics.cpp",
@@ -85,8 +86,10 @@ cc_library(
         "chirp/sample_view.cpp",
         "chirp/timing_tracker.cpp",
         "chirp/waveform.cpp",
+        "chirp/weighted_correlation.cpp",
     ],
     hdrs = [
+        "chirp/adaptive_templates.h",
         "chirp/bit_utils.h",
         "chirp/config.h",
         "chirp/crc16.h",
@@ -105,6 +108,7 @@ cc_library(
         "chirp/sample_view.h",
         "chirp/timing_tracker.h",
         "chirp/waveform.h",
+        "chirp/weighted_correlation.h",
     ],
     copts = CPP17_COPTS,
     visibility = ["//visibility:public"],
@@ -113,6 +117,13 @@ cc_library(
 cc_test(
     name = "bit_utils_test",
     srcs = ["chirp/bit_utils_test.cpp"],
+    copts = CPP17_COPTS,
+    deps = [":chirp_modem_lib"],
+)
+
+cc_test(
+    name = "adaptive_templates_test",
+    srcs = ["chirp/adaptive_templates_test.cpp"],
     copts = CPP17_COPTS,
     deps = [":chirp_modem_lib"],
 )
@@ -155,6 +166,13 @@ cc_test(
 cc_test(
     name = "waveform_test",
     srcs = ["chirp/waveform_test.cpp"],
+    copts = CPP17_COPTS,
+    deps = [":chirp_modem_lib"],
+)
+
+cc_test(
+    name = "weighted_correlation_test",
+    srcs = ["chirp/weighted_correlation_test.cpp"],
     copts = CPP17_COPTS,
     deps = [":chirp_modem_lib"],
 )
@@ -472,6 +490,7 @@ sh_test(
 test_suite(
     name = "fast_tests",
     tests = [
+        ":adaptive_templates_test",
         ":bit_utils_test",
         ":crc16_test",
         ":demod_metrics_test",
@@ -487,6 +506,7 @@ test_suite(
         ":sample_view_test",
         ":timing_tracker_test",
         ":waveform_test",
+        ":weighted_correlation_test",
         ":p4modem_roundtrip_test",
         ":pcm_to_wav_test",
         ":chirp_clean_roundtrip_fast_test",
