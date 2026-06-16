@@ -37,6 +37,9 @@
 #include "lab/chirp/receiver.h"
 #include "lab/chirp/receiver_diagnostics.h"
 #include "lab/chirp/receiver_options.h"
+#include "lab/chirp/receiver_options_cli.h"
+#include "lab/chirp/sample_view.h"
+#include "lab/chirp/timing_tracker.h"
 #include "lab/chirp/waveform.h"
 
 using chirp::bits::binary_to_gray4;
@@ -101,12 +104,10 @@ using chirp::modulator::build_frame_tx_bits;
 using chirp::modulator::encode_frame_bytes_to_pcm;
 using chirp::modulator::encode_payload_to_pcm;
 using chirp::modulator::pilot_count_for_data_symbols;
-using chirp::receiver::apply_receiver_profile_defaults;
 using chirp::receiver::decode_failure_cause_name;
 using chirp::receiver::DecodeAttemptDiagnostics;
 using chirp::receiver::DecodeFailureCause;
-using chirp::receiver::parse_receiver_profile;
-using chirp::receiver::parse_timing_search_profile;
+using chirp::receiver::parse_receiver_options_from_cli;
 using chirp::receiver::ReceiverDiagnostics;
 using chirp::receiver::ReceiverOptions;
 using chirp::receiver::ReceiverProfile;
@@ -115,6 +116,15 @@ using chirp::receiver::receiver_profile_name;
 using chirp::receiver::TimingDiagnostics;
 using chirp::receiver::TimingSearchProfile;
 using chirp::receiver::timing_search_profile_name;
+using chirp::sample::corr_score;
+using chirp::sample::cyclic_array_sample;
+using chirp::sample::normalize_template;
+using chirp::sample::normalized_symbol_samples;
+using chirp::sample::sample_at;
+using chirp::timing::pilot_is_strong_for_timing;
+using chirp::timing::TimingLoopConfig;
+using chirp::timing::TimingState;
+using chirp::timing::timing_loop_config_for_templates;
 using chirp::waveform::append_symbol_pcm;
 using chirp::waveform::ideal_base_template_array;
 using chirp::waveform::symbol_template;
@@ -138,203 +148,10 @@ static void progress_message(bool enabled,
     std::cerr << "[progress] " << message << "\n";
 }
 
-static double sample_at(const std::vector<int16_t>& pcm, double pos) {
-    if (pcm.empty()) return 0.0;
-    if (pos <= 0.0) return pcm.front();
-    if (pos >= double(pcm.size() - 1)) return pcm.back();
-    const size_t i = size_t(pos);
-    const double frac = pos - double(i);
-    return double(pcm[i]) + (double(pcm[i + 1]) - double(pcm[i])) * frac;
-}
-
-static double corr_score(const std::vector<int16_t>& pcm,
-                         double pos,
-                         double symbol_span,
-                         const std::vector<double>& tpl) {
-    if (pos < 0.0 || pos + symbol_span >= double(pcm.size())) return 0.0;
-
-    double mean = 0.0;
-    std::array<double, SYMBOL_SAMPLES> samples = {};
-    for (int i = 0; i < SYMBOL_SAMPLES; ++i) {
-        const double p = pos + double(i) * symbol_span / SYMBOL_SAMPLES;
-        samples[size_t(i)] = sample_at(pcm, p);
-        mean += samples[size_t(i)];
-    }
-    mean /= SYMBOL_SAMPLES;
-
-    double dot = 0.0;
-    double e1 = 0.0;
-    double e2 = 0.0;
-    for (int i = 0; i < SYMBOL_SAMPLES; ++i) {
-        const double a = samples[size_t(i)] - mean;
-        const double b = tpl[size_t(i)] * 32767.0;
-        dot += a * b;
-        e1 += a * a;
-        e2 += b * b;
-    }
-    if (e1 <= 1e-9 || e2 <= 1e-9) return 0.0;
-    return std::abs(dot) / std::sqrt(e1 * e2);
-}
-
-struct TimingLoopConfig {
-    double data_kp;
-    double data_ki;
-    double pilot_kp;
-    double pilot_ki;
-    double max_timing_update;
-    double max_span_step;
-    double confidence_threshold;
-    double pilot_confidence_threshold;
-
-    TimingLoopConfig()
-        : data_kp(0.18), data_ki(0.003), pilot_kp(0.24), pilot_ki(0.006),
-          max_timing_update(4.0), max_span_step(0.08),
-          confidence_threshold(0.055), pilot_confidence_threshold(0.04) {}
-};
-
 static ReceiverOptions g_receiver_options;
-
-static double parse_cli_double(const std::string& value, const std::string& name) {
-    size_t parsed = 0;
-    double result = 0.0;
-    try {
-        result = std::stod(value, &parsed);
-    } catch (...) {
-        throw std::runtime_error("Invalid number for " + name + ": " + value);
-    }
-    if (parsed != value.size()) {
-        throw std::runtime_error("Invalid number for " + name + ": " + value);
-    }
-    return result;
-}
-
-static std::vector<std::string> strip_global_receiver_args(int argc, char** argv) {
-    std::vector<std::string> args;
-    args.reserve(size_t(std::max(0, argc - 1)));
-    ReceiverProfile selected_profile = ReceiverProfile::Robust;
-    bool has_timing_search_override = false;
-    TimingSearchProfile timing_search_override = g_receiver_options.timing_search_profile;
-    bool has_adaptive_llr_override = false;
-    bool adaptive_llr_override = false;
-    bool has_adaptive_clock_override = false;
-    bool adaptive_clock_override = false;
-    bool has_adaptive_templates_override = false;
-    bool adaptive_templates_override = false;
-    bool has_weighted_correlation_override = false;
-    bool weighted_correlation_override = false;
-
-    for (int i = 1; i < argc; ++i) {
-        const std::string arg = argv[i];
-        const std::string prefix = "--timing-search=";
-        const std::string rx_profile_prefix = "--rx-profile=";
-        const std::string llr_scale_prefix = "--llr-scale=";
-        if (arg.compare(0, prefix.size(), prefix) == 0) {
-            timing_search_override = parse_timing_search_profile(arg.substr(prefix.size()));
-            has_timing_search_override = true;
-        } else if (arg == "--timing-search" && i + 1 < argc) {
-            timing_search_override = parse_timing_search_profile(argv[++i]);
-            has_timing_search_override = true;
-        } else if (arg == "--timing-search") {
-            throw std::runtime_error("--timing-search requires full, local, or center");
-        } else if (arg.compare(0, rx_profile_prefix.size(), rx_profile_prefix) == 0) {
-            selected_profile = parse_receiver_profile(arg.substr(rx_profile_prefix.size()));
-        } else if (arg == "--rx-profile" && i + 1 < argc) {
-            selected_profile = parse_receiver_profile(argv[++i]);
-        } else if (arg == "--rx-profile") {
-            throw std::runtime_error("--rx-profile requires legacy or robust");
-        } else if (arg == "--legacy-receiver") {
-            selected_profile = ReceiverProfile::Legacy;
-        } else if (arg == "--robust-receiver") {
-            selected_profile = ReceiverProfile::Robust;
-        } else if (arg == "--rx-diagnostics" || arg == "--diagnostics") {
-            g_receiver_options.rx_diagnostics_enabled = true;
-        } else if (arg == "--adaptive-llr") {
-            adaptive_llr_override = true;
-            has_adaptive_llr_override = true;
-        } else if (arg == "--adaptive-clock-tracking") {
-            adaptive_clock_override = true;
-            has_adaptive_clock_override = true;
-        } else if (arg == "--no-adaptive-clock-tracking") {
-            adaptive_clock_override = false;
-            has_adaptive_clock_override = true;
-        } else if (arg == "--adaptive-channel-templates") {
-            adaptive_templates_override = true;
-            has_adaptive_templates_override = true;
-        } else if (arg == "--no-adaptive-channel-templates") {
-            adaptive_templates_override = false;
-            has_adaptive_templates_override = true;
-        } else if (arg == "--weighted-correlation") {
-            weighted_correlation_override = true;
-            has_weighted_correlation_override = true;
-        } else if (arg == "--no-weighted-correlation") {
-            weighted_correlation_override = false;
-            has_weighted_correlation_override = true;
-        } else if (arg == "--no-adaptive-llr") {
-            adaptive_llr_override = false;
-            has_adaptive_llr_override = true;
-        } else if (arg.compare(0, llr_scale_prefix.size(), llr_scale_prefix) == 0) {
-            g_receiver_options.manual_llr_scale =
-                parse_cli_double(arg.substr(llr_scale_prefix.size()), "--llr-scale");
-            if (g_receiver_options.manual_llr_scale <= 0.0) {
-                throw std::runtime_error("--llr-scale must be positive");
-            }
-            g_receiver_options.manual_llr_scale_set = true;
-        } else if (arg == "--llr-scale" && i + 1 < argc) {
-            g_receiver_options.manual_llr_scale =
-                parse_cli_double(argv[++i], "--llr-scale");
-            if (g_receiver_options.manual_llr_scale <= 0.0) {
-                throw std::runtime_error("--llr-scale must be positive");
-            }
-            g_receiver_options.manual_llr_scale_set = true;
-        } else if (arg == "--llr-scale") {
-            throw std::runtime_error("--llr-scale requires a positive number");
-        } else {
-            args.push_back(arg);
-        }
-    }
-
-    apply_receiver_profile_defaults(&g_receiver_options, selected_profile);
-    if (has_timing_search_override) {
-        g_receiver_options.timing_search_profile = timing_search_override;
-    }
-    if (has_adaptive_llr_override) {
-        g_receiver_options.adaptive_llr_enabled = adaptive_llr_override;
-    }
-    if (has_adaptive_clock_override) {
-        g_receiver_options.adaptive_clock_tracking_enabled = adaptive_clock_override;
-    }
-    if (has_adaptive_templates_override) {
-        g_receiver_options.adaptive_channel_templates_enabled = adaptive_templates_override;
-    }
-    if (has_weighted_correlation_override) {
-        g_receiver_options.weighted_correlation_enabled = weighted_correlation_override;
-    }
-    return args;
-}
 
 static DemodConfig receiver_demod_config() {
     return receiver_demod_config(g_receiver_options);
-}
-
-static TimingLoopConfig timing_loop_config_for_templates(bool adaptive_templates) {
-    TimingLoopConfig cfg;
-    if (!adaptive_templates) {
-        cfg.data_kp = 0.45;
-        cfg.data_ki = 0.010;
-        cfg.pilot_kp = 0.50;
-        cfg.pilot_ki = 0.016;
-        cfg.max_timing_update = 18.0;
-        cfg.confidence_threshold = 0.035;
-        cfg.pilot_confidence_threshold = 0.025;
-    }
-    return cfg;
-}
-
-static bool pilot_is_strong_for_timing(double margin,
-                                       double timing_offset,
-                                       const TimingLoopConfig& cfg) {
-    return margin > cfg.pilot_confidence_threshold &&
-           std::abs(timing_offset) <= cfg.max_timing_update;
 }
 
 struct AdaptiveTemplateBank {
@@ -369,63 +186,6 @@ static const PrecomputedChirpTemplate& ideal_base_precomputed_template() {
     static const PrecomputedChirpTemplate tpl =
         make_precomputed_chirp_template(ideal_base_template_array());
     return tpl;
-}
-
-static std::array<double, SYMBOL_SAMPLES> normalized_symbol_samples(
-    const std::vector<int16_t>& pcm,
-    double pos,
-    double symbol_span) {
-    std::array<double, SYMBOL_SAMPLES> samples = {};
-    if (pos < 0.0 || pos + symbol_span >= double(pcm.size())) return samples;
-
-    double mean = 0.0;
-    for (int i = 0; i < SYMBOL_SAMPLES; ++i) {
-        const double p = pos + double(i) * symbol_span / SYMBOL_SAMPLES;
-        samples[size_t(i)] = sample_at(pcm, p);
-        mean += samples[size_t(i)];
-    }
-    mean /= SYMBOL_SAMPLES;
-
-    double energy = 0.0;
-    for (double& v : samples) {
-        v -= mean;
-        energy += v * v;
-    }
-    const double rms = std::sqrt(energy / SYMBOL_SAMPLES);
-    if (rms <= 1e-9) {
-        samples.fill(0.0);
-        return samples;
-    }
-    for (double& v : samples) v /= rms;
-    return samples;
-}
-
-static void normalize_template(std::array<double, SYMBOL_SAMPLES>* samples) {
-    double mean = 0.0;
-    for (double v : *samples) mean += v;
-    mean /= SYMBOL_SAMPLES;
-
-    double energy = 0.0;
-    for (double& v : *samples) {
-        v -= mean;
-        energy += v * v;
-    }
-    const double rms = std::sqrt(energy / SYMBOL_SAMPLES);
-    if (rms <= 1e-9) {
-        samples->fill(0.0);
-        return;
-    }
-    for (double& v : *samples) v /= rms;
-}
-
-static double cyclic_array_sample(const std::array<double, SYMBOL_SAMPLES>& samples,
-                                  double p) {
-    while (p < 0.0) p += SYMBOL_SAMPLES;
-    while (p >= SYMBOL_SAMPLES) p -= SYMBOL_SAMPLES;
-    const int i0 = int(std::floor(p));
-    const int i1 = (i0 + 1) % SYMBOL_SAMPLES;
-    const double frac = p - double(i0);
-    return samples[size_t(i0)] * (1.0 - frac) + samples[size_t(i1)] * frac;
 }
 
 static void rebuild_adaptive_templates(AdaptiveTemplateBank* bank) {
@@ -1116,14 +876,6 @@ static MetricStats estimate_metric_stats_from_known_symbols(
     }
     return stats;
 }
-
-struct TimingState {
-    double pos;
-    double span;
-    double timing_error_filtered;
-
-    TimingState(double p, double s) : pos(p), span(s), timing_error_filtered(0.0) {}
-};
 
 static void timing_diag_record_span(TimingDiagnostics* diag, double span) {
     if (diag == nullptr) return;
@@ -3580,7 +3332,8 @@ static void run_selftest() {
 #ifndef CHIRP_MODEM_NO_MAIN
 int main(int argc, char** argv) {
     try {
-        const std::vector<std::string> args = strip_global_receiver_args(argc, argv);
+        std::vector<std::string> args;
+        g_receiver_options = parse_receiver_options_from_cli(argc, argv, &args);
 
         if (args.size() == 1 && args[0] == "selftest") {
             run_selftest();

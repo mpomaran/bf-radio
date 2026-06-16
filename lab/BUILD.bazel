@@ -81,6 +81,9 @@ cc_library(
         "chirp/pcm_io.cpp",
         "chirp/receiver_diagnostics.cpp",
         "chirp/receiver_options.cpp",
+        "chirp/receiver_options_cli.cpp",
+        "chirp/sample_view.cpp",
+        "chirp/timing_tracker.cpp",
         "chirp/waveform.cpp",
     ],
     hdrs = [
@@ -97,7 +100,10 @@ cc_library(
         "chirp/pcm_io.h",
         "chirp/receiver_diagnostics.h",
         "chirp/receiver_options.h",
+        "chirp/receiver_options_cli.h",
         "chirp/receiver.h",
+        "chirp/sample_view.h",
+        "chirp/timing_tracker.h",
         "chirp/waveform.h",
     ],
     copts = CPP17_COPTS,
@@ -161,6 +167,13 @@ cc_test(
 )
 
 cc_test(
+    name = "receiver_options_cli_test",
+    srcs = ["chirp/receiver_options_cli_test.cpp"],
+    copts = CPP17_COPTS,
+    deps = [":chirp_modem_lib"],
+)
+
+cc_test(
     name = "receiver_diagnostics_test",
     srcs = ["chirp/receiver_diagnostics_test.cpp"],
     copts = CPP17_COPTS,
@@ -175,6 +188,20 @@ cc_test(
         ":chirp_modem_lib",
         ":chirp_receiver_core",
     ],
+)
+
+cc_test(
+    name = "sample_view_test",
+    srcs = ["chirp/sample_view_test.cpp"],
+    copts = CPP17_COPTS,
+    deps = [":chirp_modem_lib"],
+)
+
+cc_test(
+    name = "timing_tracker_test",
+    srcs = ["chirp/timing_tracker_test.cpp"],
+    copts = CPP17_COPTS,
+    deps = [":chirp_modem_lib"],
 )
 
 cc_test(
@@ -454,8 +481,11 @@ test_suite(
         ":interleaver_test",
         ":modulator_test",
         ":receiver_diagnostics_test",
+        ":receiver_options_cli_test",
         ":receiver_options_test",
         ":receiver_test",
+        ":sample_view_test",
+        ":timing_tracker_test",
         ":waveform_test",
         ":p4modem_roundtrip_test",
         ":pcm_to_wav_test",
