@@ -178,7 +178,14 @@ enum class TimingSearchProfile {
     CenterOnly
 };
 
+enum class ReceiverProfile {
+    Default,
+    Legacy,
+    Robust
+};
+
 static TimingSearchProfile g_timing_search_profile = TimingSearchProfile::Local;
+static ReceiverProfile g_receiver_profile = ReceiverProfile::Default;
 static bool g_rx_diagnostics_enabled = false;
 static bool g_adaptive_llr_enabled = false;
 static bool g_adaptive_clock_tracking_enabled = false;
@@ -196,11 +203,26 @@ static const char* timing_search_profile_name(TimingSearchProfile profile) {
     return "unknown";
 }
 
+static const char* receiver_profile_name(ReceiverProfile profile) {
+    switch (profile) {
+        case ReceiverProfile::Default: return "default";
+        case ReceiverProfile::Legacy: return "legacy";
+        case ReceiverProfile::Robust: return "robust";
+    }
+    return "unknown";
+}
+
 static TimingSearchProfile parse_timing_search_profile(const std::string& value) {
     if (value == "full") return TimingSearchProfile::Full;
     if (value == "local") return TimingSearchProfile::Local;
     if (value == "center") return TimingSearchProfile::CenterOnly;
     throw std::runtime_error("timing search must be full, local, or center");
+}
+
+static ReceiverProfile parse_receiver_profile(const std::string& value) {
+    if (value == "legacy") return ReceiverProfile::Legacy;
+    if (value == "robust") return ReceiverProfile::Robust;
+    throw std::runtime_error("receiver profile must be legacy or robust");
 }
 
 static double parse_cli_double(const std::string& value, const std::string& name) {
@@ -220,34 +242,67 @@ static double parse_cli_double(const std::string& value, const std::string& name
 static std::vector<std::string> strip_global_receiver_args(int argc, char** argv) {
     std::vector<std::string> args;
     args.reserve(size_t(std::max(0, argc - 1)));
+    ReceiverProfile selected_profile = ReceiverProfile::Default;
+    bool has_timing_search_override = false;
+    TimingSearchProfile timing_search_override = g_timing_search_profile;
+    bool has_adaptive_llr_override = false;
+    bool adaptive_llr_override = false;
+    bool has_adaptive_clock_override = false;
+    bool adaptive_clock_override = false;
+    bool has_adaptive_templates_override = false;
+    bool adaptive_templates_override = false;
+    bool has_weighted_correlation_override = false;
+    bool weighted_correlation_override = false;
+
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         const std::string prefix = "--timing-search=";
+        const std::string rx_profile_prefix = "--rx-profile=";
         const std::string llr_scale_prefix = "--llr-scale=";
         if (arg.compare(0, prefix.size(), prefix) == 0) {
-            g_timing_search_profile = parse_timing_search_profile(arg.substr(prefix.size()));
+            timing_search_override = parse_timing_search_profile(arg.substr(prefix.size()));
+            has_timing_search_override = true;
         } else if (arg == "--timing-search" && i + 1 < argc) {
-            g_timing_search_profile = parse_timing_search_profile(argv[++i]);
+            timing_search_override = parse_timing_search_profile(argv[++i]);
+            has_timing_search_override = true;
         } else if (arg == "--timing-search") {
             throw std::runtime_error("--timing-search requires full, local, or center");
+        } else if (arg.compare(0, rx_profile_prefix.size(), rx_profile_prefix) == 0) {
+            selected_profile = parse_receiver_profile(arg.substr(rx_profile_prefix.size()));
+        } else if (arg == "--rx-profile" && i + 1 < argc) {
+            selected_profile = parse_receiver_profile(argv[++i]);
+        } else if (arg == "--rx-profile") {
+            throw std::runtime_error("--rx-profile requires legacy or robust");
+        } else if (arg == "--legacy-receiver") {
+            selected_profile = ReceiverProfile::Legacy;
+        } else if (arg == "--robust-receiver") {
+            selected_profile = ReceiverProfile::Robust;
         } else if (arg == "--rx-diagnostics" || arg == "--diagnostics") {
             g_rx_diagnostics_enabled = true;
         } else if (arg == "--adaptive-llr") {
-            g_adaptive_llr_enabled = true;
+            adaptive_llr_override = true;
+            has_adaptive_llr_override = true;
         } else if (arg == "--adaptive-clock-tracking") {
-            g_adaptive_clock_tracking_enabled = true;
+            adaptive_clock_override = true;
+            has_adaptive_clock_override = true;
         } else if (arg == "--no-adaptive-clock-tracking") {
-            g_adaptive_clock_tracking_enabled = false;
+            adaptive_clock_override = false;
+            has_adaptive_clock_override = true;
         } else if (arg == "--adaptive-channel-templates") {
-            g_adaptive_channel_templates_enabled = true;
+            adaptive_templates_override = true;
+            has_adaptive_templates_override = true;
         } else if (arg == "--no-adaptive-channel-templates") {
-            g_adaptive_channel_templates_enabled = false;
+            adaptive_templates_override = false;
+            has_adaptive_templates_override = true;
         } else if (arg == "--weighted-correlation") {
-            g_weighted_correlation_enabled = true;
+            weighted_correlation_override = true;
+            has_weighted_correlation_override = true;
         } else if (arg == "--no-weighted-correlation") {
-            g_weighted_correlation_enabled = false;
+            weighted_correlation_override = false;
+            has_weighted_correlation_override = true;
         } else if (arg == "--no-adaptive-llr") {
-            g_adaptive_llr_enabled = false;
+            adaptive_llr_override = false;
+            has_adaptive_llr_override = true;
         } else if (arg.compare(0, llr_scale_prefix.size(), llr_scale_prefix) == 0) {
             g_manual_llr_scale = parse_cli_double(arg.substr(llr_scale_prefix.size()),
                                                   "--llr-scale");
@@ -266,6 +321,31 @@ static std::vector<std::string> strip_global_receiver_args(int argc, char** argv
         } else {
             args.push_back(arg);
         }
+    }
+
+    g_receiver_profile = selected_profile;
+    if (selected_profile == ReceiverProfile::Legacy) {
+        g_timing_search_profile = TimingSearchProfile::Local;
+        g_adaptive_llr_enabled = false;
+        g_adaptive_clock_tracking_enabled = false;
+        g_adaptive_channel_templates_enabled = false;
+        g_weighted_correlation_enabled = false;
+    } else if (selected_profile == ReceiverProfile::Robust) {
+        g_timing_search_profile = TimingSearchProfile::Local;
+        g_adaptive_llr_enabled = true;
+        g_adaptive_clock_tracking_enabled = true;
+        g_adaptive_channel_templates_enabled = true;
+        g_weighted_correlation_enabled = true;
+    }
+
+    if (has_timing_search_override) g_timing_search_profile = timing_search_override;
+    if (has_adaptive_llr_override) g_adaptive_llr_enabled = adaptive_llr_override;
+    if (has_adaptive_clock_override) g_adaptive_clock_tracking_enabled = adaptive_clock_override;
+    if (has_adaptive_templates_override) {
+        g_adaptive_channel_templates_enabled = adaptive_templates_override;
+    }
+    if (has_weighted_correlation_override) {
+        g_weighted_correlation_enabled = weighted_correlation_override;
     }
     return args;
 }
@@ -2293,6 +2373,7 @@ static void print_receiver_diagnostics_json(const ReceiverDiagnostics& rx) {
     const DecodeAttemptDiagnostics& d = rx.decode;
     const MetricStats& m = d.metric_stats;
     const TimingDiagnostics& t = d.timing_diag;
+    const PhyProfile phy = current_phy_profile();
     const int ldpc_iterations =
         std::max(d.header_fec.max_iterations, d.body_fec.max_iterations);
     const bool ldpc_success =
@@ -2318,6 +2399,14 @@ static void print_receiver_diagnostics_json(const ReceiverDiagnostics& rx) {
         << "\"payload_bytes\":" << d.payload_bytes << ","
         << "\"fec_enabled\":" << (rx.fec_enabled ? "true" : "false") << ","
         << "\"fec_mode\":\"" << rx.fec_mode << "\","
+        << "\"rx_profile\":\"" << receiver_profile_name(g_receiver_profile) << "\","
+        << "\"robust_defaults_enabled\":"
+        << (g_receiver_profile == ReceiverProfile::Robust ? "true" : "false") << ","
+        << "\"legacy_baseline_available\":true,"
+        << "\"same_bitrate_as_legacy\":"
+        << (phy.same_bitrate_as_legacy ? "true" : "false") << ","
+        << "\"same_channel_as_legacy\":"
+        << (phy.same_channel_as_legacy ? "true" : "false") << ","
         << "\"estimated_clock_ppm\":"
         << finite_or_zero(t.estimated_clock_ppm) << ","
         << "\"adaptive_clock_tracking_enabled\":"
@@ -3687,6 +3776,10 @@ int main(int argc, char** argv) {
                       << "  " << argv[0] << " selftest\n"
                       << "  " << argv[0]
                       << " [--timing-search=full|local|center] <command> ...\n"
+                      << "  " << argv[0]
+                      << " [--rx-profile=legacy|robust] <command> ...\n"
+                      << "  " << argv[0]
+                      << " [--legacy-receiver|--robust-receiver] <command> ...\n"
                       << "  " << argv[0]
                       << " [--adaptive-llr] [--llr-scale X] <command> ...\n"
                       << "  " << argv[0]
