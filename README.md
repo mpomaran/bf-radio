@@ -65,8 +65,8 @@ Current implementation facts:
   preamble/sync symbols, then use channel-shaped templates for the frame.
 - With `--weighted-correlation`, RX can estimate conservative per-sample
   reliability weights from known-symbol residuals and use weighted time-domain
-  correlation. The default demodulator still uses the normal FFT correlation
-  path.
+  correlation. The legacy receiver keeps the normal FFT correlation path; the
+  robust receiver profile enables weighted correlation by default.
 - RX derives bit LLRs using a max-log style best-0 vs best-1 comparison.
 - Positive LLR means bit 0 is more likely; negative LLR means bit 1 is more
   likely.
@@ -308,6 +308,87 @@ intentionally simple estimator based on the configured chirp sweep from 700 Hz
 to 2300 Hz plus guard margin; it is useful for accounting, not a regulatory
 spectral mask measurement.
 
+### Robust Receiver Defaults vs Legacy Baseline
+
+The default chirp receiver profile is now `robust`. This is a receiver-only
+default. It does not change the transmitted waveform, protected frame format,
+FEC parameters, pilot spacing, symbol length, sample rate, alphabet size,
+bitrate, occupied audio channel, PHY version, or protocol version.
+
+The legacy baseline is available explicitly:
+
+```bash
+bazel-bin/lab/chirp_modem --rx-profile=legacy dec input.pcm output.bin
+bazel-bin/lab/chirp_modem --legacy-receiver dec input.pcm output.bin
+```
+
+Legacy receiver definition:
+
+```text
+adaptive_llr=false
+adaptive_clock_tracking=false
+adaptive_channel_templates=false
+weighted_correlation=false
+timing_search=local unless overridden
+```
+
+Robust receiver definition:
+
+```text
+adaptive_llr=true
+adaptive_clock_tracking=true
+adaptive_channel_templates=true
+weighted_correlation=true
+timing_search=local unless overridden
+```
+
+Fine-grained flags override the selected profile, so for example
+`--rx-profile=robust --no-weighted-correlation` uses the robust defaults except
+for weighted correlation. Both profiles report `same_bitrate_as_legacy=true`
+and `same_channel_as_legacy=true`. Robust receiver defaults must not print
+`NOT SAME BITRATE`; that warning is reserved for future profiles that actually
+change bitrate, latency, overhead, symbol count, pilot overhead, FEC rate,
+frame duration, or occupied channel.
+
+Deterministic measurements from this repository state:
+
+| Command / scenario | Receiver | Trials | Packet OK | Packet fail | PER | Key notes |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| `measure-pcm-debug --profile radio --snr 24 --trials 100` | legacy | 100 | 100 | 0 | 0.0000 | `no_failure_reproduced=1`, mean sync score 0.554280 |
+| `measure-pcm-debug --profile radio --snr 24 --trials 100` | robust | 100 | 100 | 0 | 0.0000 | `no_failure_reproduced=1`, mean sync score 0.554280 |
+| `compare-demod --profile radio --snr 9 --trials 100` | fixed max-log row | 100 | 100 | 0 | 0.0000 | `rx_raw_ser=0.941688`, `rx_raw_ber=0.337695`, `mean_peak_margin=0.640315` |
+| `compare-demod --profile radio --snr 9 --trials 100` | calibrated max-log row | 100 | 100 | 0 | 0.0000 | same receiver-selected raw error rates in this deterministic run |
+
+Exact commands used for this comparison:
+
+```bash
+bazel test -c opt //lab:slow_tests --test_output=all
+bazel test -c opt //lab:performance_torture_tests --test_output=all
+bazel-bin/lab/chirp_modem.exe --rx-profile=legacy measure-pcm-debug --profile radio --snr 24 --trials 100
+bazel-bin/lab/chirp_modem.exe --rx-profile=robust measure-pcm-debug --profile radio --snr 24 --trials 100
+bazel-bin/lab/chirp_modem.exe compare-demod --profile radio --snr 9 --trials 100
+```
+
+Validation status from the same run:
+
+- `//lab:slow_tests`: 17 of 20 targets passed. Failing targets were
+  `//lab:chirp_recorded_wav_test`, `//lab:chirp_recorded_wav_long_test`, and
+  `//lab:wav_to_pcm_test`. The recorded WAV logs ended after the WAV-to-PCM
+  timing line; `wav_to_pcm_test` timed out at 60 seconds on this Windows run.
+  These three targets are not tagged `known_failing` in `lab/BUILD.bazel`.
+- `//lab:performance_torture_tests`: 4 of 5 targets passed. The failing target
+  was `//lab:chirp_recorded_wav_long_test`, which failed to build because these
+  testdata files were absent from the workspace/runfiles:
+  `testdata/encoded_2.txt`, `testdata/original_encoded.pcm`,
+  `testdata/original_2_encoded.pcm`, `testdata/received2.wav`,
+  `testdata/transmitted.txt`, and `testdata/transmitted.wav`. This target is
+  not tagged `known_failing` in `lab/BUILD.bazel`.
+
+These measurements are regression evidence, not a production qualification.
+They are not calibrated RF SNR measurements, not standards BER curves, and not
+evidence of WiFi/DVB-S2/LoRa-grade link performance. The modem remains an
+experimental audio/CSS prototype.
+
 ### Convert PCM to WAV
 
 ```bash
@@ -397,16 +478,17 @@ template, refines it with the known sync symbols, and uses cyclic shifts of that
 learned template for data demodulation.
 
 This channel-template path is controlled by `--adaptive-channel-templates` and
-`--no-adaptive-channel-templates`. It is disabled by default for conservative
-A/B testing; enabling it uses known preamble/sync/pilot symbols to estimate
-channel-shaped templates for the current frame.
+`--no-adaptive-channel-templates`. It is enabled by the robust receiver profile
+and disabled by the legacy receiver profile. It uses known preamble/sync/pilot
+symbols to estimate channel-shaped templates for the current frame.
 
-`--weighted-correlation` adds another opt-in metric path. It estimates per-sample
-reliability weights from residuals on known preamble/sync symbols, clamps and
-normalizes those weights, then uses time-domain weighted correlation for symbol
-decisions in that frame. This is intentionally conservative: without the flag
-the receiver keeps the normal FFT correlation path, and if too few known symbols
-are usable the weighted path falls back to unweighted scoring.
+`--weighted-correlation` adds another receiver metric path. It estimates
+per-sample reliability weights from residuals on known preamble/sync symbols,
+clamps and normalizes those weights, then uses time-domain weighted correlation
+for symbol decisions in that frame. This is intentionally conservative: legacy
+mode or `--no-weighted-correlation` keeps the normal FFT correlation path, and
+if too few known symbols are usable the weighted path falls back to unweighted
+scoring.
 
 When adaptive channel templates are enabled, full-frame demodulation also uses
 conservative decision-directed template tracking. Only symbols with a high
@@ -796,34 +878,36 @@ predicted symbol center for data symbols and is mainly a clean-channel
 benchmark mode. These options do not change the waveform, frame format, FEC, or
 over-the-air compatibility.
 
-The receiver also has an opt-in frame-local LLR calibration mode:
+The receiver also has a frame-local LLR calibration mode:
 
 ```bash
 ./chirp_modem --adaptive-llr dec input.pcm output.bin
 ./chirp_modem --adaptive-llr --llr-scale 0.5 --rx-diagnostics dec input.pcm output.bin
 ```
 
-`--adaptive-llr` estimates a robust confidence multiplier from known
+`--adaptive-llr` is enabled by the robust receiver profile and disabled by the
+legacy profile. It estimates a robust confidence multiplier from known
 preamble/sync/pilot symbols in the received frame. The configured `llr_scale`
 remains the base multiplier, so `--llr-scale` can still be used as a manual
 base scale. This changes only receiver-side soft metrics; it does not change
 the waveform, bitrate, frame format, symbol alphabet, or FEC parameters.
 
-Clock tracking has a separate opt-in mode:
+Clock tracking has a separate adaptive mode:
 
 ```bash
 ./chirp_modem --adaptive-clock-tracking dec input.pcm output.bin
 ./chirp_modem --adaptive-clock-tracking --rx-diagnostics dec input.pcm output.bin
 ```
 
-`--adaptive-clock-tracking` uses the receiver-visible linear clock fit from
-preamble/sync/pilot positions to predict data-symbol sample positions as
-`offset + scale * nominal_position`. The existing pilot/timing loop remains the
-default path and is still present; this option only changes receiver-side sample
-extraction positions and does not change the over-the-air frame.
+`--adaptive-clock-tracking` is enabled by the robust receiver profile and
+disabled by the legacy profile. It uses the receiver-visible linear clock fit
+from preamble/sync/pilot positions to predict data-symbol sample positions as
+`offset + scale * nominal_position`. The existing pilot/timing loop remains
+available; this option only changes receiver-side sample extraction positions
+and does not change the over-the-air frame.
 
-Channel-shaped templates and weighted correlation are also receiver-only,
-opt-in demodulator modes:
+Channel-shaped templates and weighted correlation are also receiver-only
+demodulator modes:
 
 ```bash
 ./chirp_modem --adaptive-channel-templates dec input.pcm output.bin
