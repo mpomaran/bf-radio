@@ -85,6 +85,7 @@ cc_library(
         "chirp/receiver_options.cpp",
         "chirp/receiver_options_cli.cpp",
         "chirp/sample_view.cpp",
+        "chirp/stream_decoder.cpp",
         "chirp/sync_acquisition.cpp",
         "chirp/timing_tracker.cpp",
         "chirp/waveform.cpp",
@@ -109,6 +110,7 @@ cc_library(
         "chirp/receiver_options_cli.h",
         "chirp/receiver.h",
         "chirp/sample_view.h",
+        "chirp/stream_decoder.h",
         "chirp/sync_acquisition.h",
         "chirp/timing_tracker.h",
         "chirp/waveform.h",
@@ -236,6 +238,13 @@ cc_test(
 cc_test(
     name = "sync_acquisition_test",
     srcs = ["chirp/sync_acquisition_test.cpp"],
+    copts = CPP17_COPTS,
+    deps = [":chirp_modem_lib"],
+)
+
+cc_test(
+    name = "stream_decoder_test",
+    srcs = ["chirp/stream_decoder_test.cpp"],
     copts = CPP17_COPTS,
     deps = [":chirp_modem_lib"],
 )
@@ -523,6 +532,7 @@ test_suite(
         ":receiver_options_test",
         ":receiver_test",
         ":sample_view_test",
+        ":stream_decoder_test",
         ":sync_acquisition_test",
         ":timing_tracker_test",
         ":waveform_test",

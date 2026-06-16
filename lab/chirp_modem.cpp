@@ -41,6 +41,7 @@
 #include "lab/chirp/receiver_options.h"
 #include "lab/chirp/receiver_options_cli.h"
 #include "lab/chirp/sample_view.h"
+#include "lab/chirp/stream_decoder.h"
 #include "lab/chirp/sync_acquisition.h"
 #include "lab/chirp/timing_tracker.h"
 #include "lab/chirp/waveform.h"
@@ -124,6 +125,10 @@ using chirp::receiver::TimingDiagnostics;
 using chirp::receiver::TimingSearchProfile;
 using chirp::receiver::timing_search_profile_name;
 using chirp::sample::sample_at;
+using chirp::stream::clamp_discard;
+using chirp::stream::StreamScanResult;
+using chirp::stream::StreamScanStatus;
+using chirp::stream::stream_scan_status_name;
 using chirp::sync::find_sync;
 using chirp::sync::preamble_score_at;
 using chirp::sync::SyncLock;
@@ -431,52 +436,6 @@ static std::vector<double> decode_llrs_tracking(const std::vector<int16_t>& pcm,
         timing_diag_record_span(timing_diag, timing.span);
     }
     return llrs;
-}
-
-enum class StreamScanStatus {
-    NoFrameWindowConsumed,
-    NeedMoreSamples,
-    FrameDecoded,
-    InvalidFrameRejected
-};
-
-static const char* stream_scan_status_name(StreamScanStatus status) {
-    switch (status) {
-        case StreamScanStatus::NoFrameWindowConsumed: return "NoFrameWindowConsumed";
-        case StreamScanStatus::NeedMoreSamples: return "NeedMoreSamples";
-        case StreamScanStatus::FrameDecoded: return "FrameDecoded";
-        case StreamScanStatus::InvalidFrameRejected: return "InvalidFrameRejected";
-    }
-    return "Unknown";
-}
-
-struct StreamScanResult {
-    StreamScanStatus status;
-
-    /*
-      Number of samples from the front of this PCM window that a streaming
-      caller may erase. If this is zero, keep the whole window and append more
-      samples before scanning again.
-
-      frame_start_sample and frame_end_sample are offsets inside the supplied
-      window. frame_end_sample is exclusive and marks the end of the decoded
-      chirp data symbols, not necessarily trailing silence after the frame.
-    */
-    size_t discard_prefix_samples;
-    size_t frame_start_sample;
-    size_t frame_end_sample;
-    double acquisition_score;
-    double estimated_symbol_span;
-    std::vector<uint8_t> payload;
-
-    StreamScanResult()
-        : status(StreamScanStatus::NoFrameWindowConsumed),
-          discard_prefix_samples(0), frame_start_sample(0), frame_end_sample(0),
-          acquisition_score(0.0), estimated_symbol_span(0.0), payload() {}
-};
-
-static size_t clamp_discard(size_t value, size_t pcm_size) {
-    return std::min(value, pcm_size);
 }
 
 static bool find_first_energy_sample(const std::vector<int16_t>& pcm, size_t* sample) {
