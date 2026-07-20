@@ -1,0 +1,96 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+
+CPP17_COPTS = select({
+    "@platforms//os:windows": ["/std:c++17", "/D_CRT_SECURE_NO_WARNINGS"],
+    "//conditions:default": ["-std=c++17"],
+})
+
+WINMM_LINKOPTS = select({
+    "@platforms//os:windows": ["winmm.lib", "Advapi32.lib"],
+    "//conditions:default": [],
+})
+
+cc_library(
+    name = "radio_tools_lib",
+    srcs = [
+        "radio/audio_io.cpp",
+        "radio/config_file.cpp",
+        "radio/devices.cpp",
+        "radio/process.cpp",
+        "radio/ptt.cpp",
+        "radio/segment_writer.cpp",
+        "radio/wav.cpp",
+    ],
+    hdrs = [
+        "radio/audio_io.h",
+        "radio/config_file.h",
+        "radio/devices.h",
+        "radio/process.h",
+        "radio/ptt.h",
+        "radio/segment_writer.h",
+        "radio/wav.h",
+    ],
+    copts = CPP17_COPTS,
+    linkopts = WINMM_LINKOPTS,
+    visibility = ["//visibility:public"],
+)
+
+cc_binary(
+    name = "digirig_config",
+    srcs = ["digirig_config.cpp"],
+    copts = CPP17_COPTS,
+    deps = [":radio_tools_lib"],
+    visibility = ["//visibility:public"],
+)
+
+cc_binary(
+    name = "bf_wav_tx",
+    srcs = ["bf_wav_tx.cpp"],
+    copts = CPP17_COPTS,
+    deps = [":radio_tools_lib"],
+    visibility = ["//visibility:public"],
+)
+
+cc_binary(
+    name = "bf_recorder",
+    srcs = ["bf_recorder.cpp"],
+    copts = CPP17_COPTS,
+    deps = [":radio_tools_lib"],
+    visibility = ["//visibility:public"],
+)
+
+cc_test(
+    name = "wav_test",
+    srcs = ["radio/wav_test.cpp"],
+    copts = CPP17_COPTS,
+    deps = [":radio_tools_lib"],
+)
+
+cc_binary(
+    name = "wav_test_runner",
+    srcs = ["radio/wav_test.cpp"],
+    copts = CPP17_COPTS,
+    deps = [":radio_tools_lib"],
+)
+
+cc_test(
+    name = "segment_writer_test",
+    srcs = ["radio/segment_writer_test.cpp"],
+    copts = CPP17_COPTS,
+    deps = [":radio_tools_lib"],
+)
+
+cc_binary(
+    name = "segment_writer_test_runner",
+    srcs = ["radio/segment_writer_test.cpp"],
+    copts = CPP17_COPTS,
+    deps = [":radio_tools_lib"],
+)
+
+test_suite(
+    name = "fast_tests",
+    tests = [
+        ":segment_writer_test",
+        ":wav_test",
+    ],
+)
