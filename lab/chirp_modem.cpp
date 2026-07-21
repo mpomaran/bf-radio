@@ -149,10 +149,83 @@ using chirp::waveform::append_symbol_pcm;
 using chirp::weighted::build_weighted_correlation_model;
 using chirp::weighted::WeightedCorrelationModel;
 
+namespace {
+
+struct LineRateProfile {
+    const char* name;
+    double raw_bps;
+};
+
+constexpr double kLegacyRawBps =
+    double(chirp::config::SAMPLE_RATE) / double(chirp::config::SYMBOL_SAMPLES) *
+    double(chirp::config::BITS_PER_SYMBOL);
+
+LineRateProfile g_line_rate = {"current", kLegacyRawBps};
+
+bool line_rate_is_legacy() {
+    return std::abs(g_line_rate.raw_bps - kLegacyRawBps) < 1e-9;
+}
+
+double tx_line_rate_resample_factor() {
+    return kLegacyRawBps / g_line_rate.raw_bps;
+}
+
+double rx_line_rate_resample_factor() {
+    return g_line_rate.raw_bps / kLegacyRawBps;
+}
+
+LineRateProfile parse_line_rate_profile(const std::string& value) {
+    if (value == "current" || value == "legacy" || value == "250") {
+        return {"current", kLegacyRawBps};
+    }
+    if (value == "300") return {"300", 300.0};
+    if (value == "600") return {"600", 600.0};
+    if (value == "900") return {"900", 900.0};
+    if (value == "1200") return {"1200", 1200.0};
+    if (value == "2400") return {"2400", 2400.0};
+    throw std::runtime_error("--baud must be current, 300, 600, 900, 1200, or 2400");
+}
+
+void parse_line_rate_options(std::vector<std::string>* args) {
+    std::vector<std::string> filtered;
+    filtered.reserve(args->size());
+    for (size_t i = 0; i < args->size(); ++i) {
+        const std::string& arg = (*args)[i];
+        const std::string baud_prefix = "--baud=";
+        const std::string bitrate_prefix = "--line-rate=";
+        if (arg.compare(0, baud_prefix.size(), baud_prefix) == 0) {
+            g_line_rate = parse_line_rate_profile(arg.substr(baud_prefix.size()));
+        } else if (arg.compare(0, bitrate_prefix.size(), bitrate_prefix) == 0) {
+            g_line_rate = parse_line_rate_profile(arg.substr(bitrate_prefix.size()));
+        } else if ((arg == "--baud" || arg == "--line-rate") && i + 1 < args->size()) {
+            g_line_rate = parse_line_rate_profile((*args)[++i]);
+        } else if (arg == "--baud" || arg == "--line-rate") {
+            throw std::runtime_error(arg + " requires current, 300, 600, 900, 1200, or 2400");
+        } else {
+            filtered.push_back(arg);
+        }
+    }
+    *args = filtered;
+}
+
+std::vector<int16_t> resample_pcm(const std::vector<int16_t>& pcm, double factor);
+
+std::vector<int16_t> apply_tx_line_rate(const std::vector<int16_t>& pcm) {
+    if (line_rate_is_legacy()) return pcm;
+    return resample_pcm(pcm, tx_line_rate_resample_factor());
+}
+
+std::vector<int16_t> prepare_rx_line_rate(const std::vector<int16_t>& pcm) {
+    if (line_rate_is_legacy()) return pcm;
+    return resample_pcm(pcm, rx_line_rate_resample_factor());
+}
+
+}  // namespace
+
 static void print_not_same_bitrate_notice() {
-    const PhyProfile p = current_phy_profile();
-    if (!p.same_bitrate_as_legacy) {
-        std::cerr << "NOT SAME BITRATE: this mode trades bitrate/latency/overhead for robustness.\n";
+    if (!line_rate_is_legacy()) {
+        std::cerr << "NOT SAME BITRATE: --baud=" << g_line_rate.name
+                  << " changes frame duration and occupied audio spectrum.\n";
     }
 }
 
@@ -176,12 +249,15 @@ static DemodConfig receiver_demod_config() {
 
 static void encode_file(const std::string& in_path, const std::string& out_pcm_path) {
     const std::vector<uint8_t> payload = read_file(in_path);
-    const std::vector<int16_t> pcm = encode_payload_to_pcm(payload);
+    const std::vector<int16_t> legacy_pcm = encode_payload_to_pcm(payload);
+    const std::vector<int16_t> pcm = apply_tx_line_rate(legacy_pcm);
     write_pcm16(out_pcm_path, pcm);
     print_not_same_bitrate_notice();
     std::cerr << "Encoded " << payload.size() << " bytes into "
               << pcm.size() << " PCM samples, duration "
-              << double(pcm.size()) / SAMPLE_RATE << " s\n";
+              << double(pcm.size()) / SAMPLE_RATE << " s"
+              << ", baud_profile=" << g_line_rate.name
+              << ", raw_bps=" << g_line_rate.raw_bps << "\n";
 }
 
 static double percentile_from_samples(std::vector<double> samples, double percentile) {
@@ -786,7 +862,15 @@ static void print_receiver_diagnostics_for_pcm(const std::vector<int16_t>& pcm,
 static void decode_file(const std::string& in_pcm_path,
                         const std::string& out_path,
                         bool rx_diagnostics = false) {
-    const std::vector<int16_t> pcm = read_pcm16(in_pcm_path);
+    const std::vector<int16_t> input_pcm = read_pcm16(in_pcm_path);
+    const std::vector<int16_t> pcm = prepare_rx_line_rate(input_pcm);
+    if (!line_rate_is_legacy()) {
+        print_not_same_bitrate_notice();
+        std::cerr << "Decode line-rate profile --baud=" << g_line_rate.name
+                  << ": input " << input_pcm.size()
+                  << " samples expanded to " << pcm.size()
+                  << " legacy-domain samples before demodulation\n";
+    }
     std::vector<uint8_t> payload;
     const DemodConfig demod_cfg = receiver_demod_config();
     const bool ok = decode_payload_from_pcm(pcm, &payload, true, demod_cfg);
@@ -800,7 +884,9 @@ static void decode_file(const std::string& in_pcm_path,
     std::cerr << "Decoded " << payload.size() << " bytes OK\n";
 }
 
-static std::vector<int16_t> resample_pcm(const std::vector<int16_t>& pcm, double factor) {
+namespace {
+
+std::vector<int16_t> resample_pcm(const std::vector<int16_t>& pcm, double factor) {
     if (factor <= 0.0) throw std::runtime_error("Invalid resample factor");
     const size_t out_size = std::max<size_t>(1, size_t(std::floor(double(pcm.size()) * factor)));
     std::vector<int16_t> out;
@@ -812,6 +898,8 @@ static std::vector<int16_t> resample_pcm(const std::vector<int16_t>& pcm, double
     }
     return out;
 }
+
+}  // namespace
 
 static void append_silence(std::vector<int16_t>& pcm, int samples) {
     if (samples > 0) pcm.insert(pcm.end(), size_t(samples), 0);
@@ -1116,14 +1204,16 @@ static void print_receiver_diagnostics_json(const ReceiverDiagnostics& rx) {
         << "\"payload_bytes\":" << d.payload_bytes << ","
         << "\"fec_enabled\":" << (rx.fec_enabled ? "true" : "false") << ","
         << "\"fec_mode\":\"" << rx.fec_mode << "\","
+        << "\"baud_profile\":\"" << g_line_rate.name << "\","
+        << "\"line_raw_bps\":" << g_line_rate.raw_bps << ","
         << "\"rx_profile\":\"" << receiver_profile_name(g_receiver_options.receiver_profile) << "\","
         << "\"robust_defaults_enabled\":"
         << (g_receiver_options.receiver_profile == ReceiverProfile::Robust ? "true" : "false") << ","
         << "\"legacy_baseline_available\":true,"
         << "\"same_bitrate_as_legacy\":"
-        << (phy.same_bitrate_as_legacy ? "true" : "false") << ","
+        << (line_rate_is_legacy() ? "true" : "false") << ","
         << "\"same_channel_as_legacy\":"
-        << (phy.same_channel_as_legacy ? "true" : "false") << ","
+        << (line_rate_is_legacy() ? "true" : "false") << ","
         << "\"estimated_clock_ppm\":"
         << finite_or_zero(t.estimated_clock_ppm) << ","
         << "\"adaptive_clock_tracking_enabled\":"
@@ -1560,7 +1650,7 @@ static void run_pcm_quality_measurement(int trials_per_point = 2,
 
     if (print_header) {
         std::cout
-            << "profile,phy_version,protocol_version,snr_db,trials,"
+            << "profile,baud_profile,line_raw_bps,phy_version,protocol_version,snr_db,trials,"
             << "sample_rate,symbol_samples,alphabet,bits_per_symbol,"
             << "pilot_interval,pilot_symbol,fec_rate,legacy_compatible,"
             << "same_bitrate_as_legacy,same_channel_as_legacy,occupied_audio_bandwidth_hz,"
@@ -1644,7 +1734,8 @@ static void run_pcm_quality_measurement(int trials_per_point = 2,
                     build_protected_frame(payload, PROTOCOL_MAGIC, PROTOCOL_VERSION, 0);
                 const std::vector<uint8_t> tx_bits = build_frame_tx_bits(frame);
                 const std::vector<uint8_t> expected_symbols = bits_to_symbols(tx_bits);
-                const std::vector<int16_t> clean = encode_frame_bytes_to_pcm(frame);
+                const std::vector<int16_t> legacy_clean = encode_frame_bytes_to_pcm(frame);
+                const std::vector<int16_t> clean = apply_tx_line_rate(legacy_clean);
                 const size_t data_symbols =
                     (tx_bits.size() + BITS_PER_SYMBOL - 1) / BITS_PER_SYMBOL;
                 const size_t physical_symbols =
@@ -1659,9 +1750,10 @@ static void run_pcm_quality_measurement(int trials_per_point = 2,
                     std::string(profile) == "radio"
                         ? apply_quality_radio_channel(clean, snr_db, &rng)
                         : add_awgn_for_snr(clean, snr_db, &rng);
+                const std::vector<int16_t> decoder_pcm = prepare_rx_line_rate(impaired);
 
                 const RawLinkMetrics rx_raw =
-                    measure_receiver_selected_raw_link_metrics(impaired, tx_bits,
+                    measure_receiver_selected_raw_link_metrics(decoder_pcm, tx_bits,
                                                                expected_symbols);
                 rx_raw_symbols += rx_raw.symbols;
                 rx_raw_symbol_errors += rx_raw.symbol_errors;
@@ -1670,7 +1762,7 @@ static void run_pcm_quality_measurement(int trials_per_point = 2,
 
                 RawLinkMetrics oracle_raw;
                 if (include_oracle_metrics) {
-                    oracle_raw = measure_oracle_raw_link_metrics(impaired, tx_bits,
+                    oracle_raw = measure_oracle_raw_link_metrics(decoder_pcm, tx_bits,
                                                                  expected_symbols);
                 }
                 oracle_raw_symbols += oracle_raw.symbols;
@@ -1680,7 +1772,7 @@ static void run_pcm_quality_measurement(int trials_per_point = 2,
 
                 std::vector<uint8_t> decoded;
                 const DecodeAttemptDiagnostics diag =
-                    diagnose_pcm_decode_attempt(impaired, &decoded, demod_cfg);
+                    diagnose_pcm_decode_attempt(decoder_pcm, &decoded, demod_cfg);
                 header_fec_failed_blocks += size_t(diag.header_fec.failed_blocks);
                 body_fec_failed_blocks += size_t(diag.body_fec.failed_blocks);
                 max_fec_iterations =
@@ -1816,6 +1908,8 @@ static void run_pcm_quality_measurement(int trials_per_point = 2,
             if (!std::isfinite(span_max)) span_max = 0.0;
 
             std::cout << profile << ","
+                      << g_line_rate.name << ","
+                      << g_line_rate.raw_bps << ","
                       << phy.phy_version << ","
                       << phy.protocol_version << ","
                       << snr_db << ","
@@ -1828,8 +1922,8 @@ static void run_pcm_quality_measurement(int trials_per_point = 2,
                       << phy.pilot_symbol << ","
                       << phy.fec_rate << ","
                       << (phy.legacy_compatible ? 1 : 0) << ","
-                      << (phy.same_bitrate_as_legacy ? 1 : 0) << ","
-                      << (phy.same_channel_as_legacy ? 1 : 0) << ","
+                      << (line_rate_is_legacy() ? 1 : 0) << ","
+                      << (line_rate_is_legacy() ? 1 : 0) << ","
                       << phy.occupied_audio_bandwidth_hz << ","
                       << phy.required_audio_bandwidth_hz << ","
                       << net_payload_bitrate << ","
@@ -1894,6 +1988,8 @@ static void run_pcm_debug_measurement(const std::string& profile,
     std::mt19937 rng(0xBEEFu);
     const DemodConfig demod_cfg = receiver_demod_config();
     std::cout << "measure-pcm-debug profile=" << profile
+              << " baud_profile=" << g_line_rate.name
+              << " line_raw_bps=" << g_line_rate.raw_bps
               << " snr_db=" << snr_db
               << " trials=" << trials
               << " timing_search="
@@ -1913,14 +2009,15 @@ static void run_pcm_debug_measurement(const std::string& profile,
             build_protected_frame(payload, PROTOCOL_MAGIC, PROTOCOL_VERSION, 0);
         const std::vector<uint8_t> tx_bits = build_frame_tx_bits(frame);
         const std::vector<uint8_t> expected_symbols = bits_to_symbols(tx_bits);
-        const std::vector<int16_t> clean = encode_frame_bytes_to_pcm(frame);
+        const std::vector<int16_t> clean = apply_tx_line_rate(encode_frame_bytes_to_pcm(frame));
         const std::vector<int16_t> impaired =
             profile == "radio" ? apply_quality_radio_channel(clean, snr_db, &rng)
                                 : add_awgn_for_snr(clean, snr_db, &rng);
+        const std::vector<int16_t> decoder_pcm = prepare_rx_line_rate(impaired);
 
         std::vector<uint8_t> decoded;
         const DecodeAttemptDiagnostics diag =
-            diagnose_pcm_decode_attempt(impaired, &decoded, demod_cfg);
+            diagnose_pcm_decode_attempt(decoder_pcm, &decoded, demod_cfg);
         const bool payload_ok = diag.ok && decoded == payload;
         if (payload_ok) {
             std::cout << "trial=" << trial << " status=ok"
@@ -1965,9 +2062,9 @@ static void run_pcm_debug_measurement(const std::string& profile,
                 std::ptrdiff_t(std::min(expected_symbols.size(),
                                         size_t(FEC_CODEWORD_BITS / BITS_PER_SYMBOL))));
         const RawLinkMetrics header_raw =
-            measure_receiver_selected_raw_link_metrics(impaired, header_bits, header_symbols);
+            measure_receiver_selected_raw_link_metrics(decoder_pcm, header_bits, header_symbols);
         const RawLinkMetrics oracle_raw =
-            measure_oracle_raw_link_metrics(impaired, tx_bits, expected_symbols);
+            measure_oracle_raw_link_metrics(decoder_pcm, tx_bits, expected_symbols);
         const bool oracle_candidate_would_succeed = oracle_raw.bit_errors == 0;
 
         std::cout << "trial=" << trial << " status=fail"
@@ -2460,6 +2557,7 @@ int main(int argc, char** argv) {
     try {
         std::vector<std::string> args;
         g_receiver_options = parse_receiver_options_from_cli(argc, argv, &args);
+        parse_line_rate_options(&args);
 
         if (args.size() == 1 && args[0] == "selftest") {
             run_selftest();
@@ -2564,6 +2662,8 @@ int main(int argc, char** argv) {
                       << " [--rx-profile=legacy|robust] <command> ...\n"
                       << "  " << argv[0]
                       << " [--legacy-receiver|--robust-receiver] <command> ...\n"
+                      << "  " << argv[0]
+                      << " [--baud=current|300|600|900|1200|2400] <command> ...\n"
                       << "  " << argv[0]
                       << " [--adaptive-llr] [--llr-scale X] <command> ...\n"
                       << "  " << argv[0]

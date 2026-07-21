@@ -100,8 +100,47 @@ Current implementation facts:
   size, sample rate, bitrate, latency, overhead, symbol count, pilot overhead,
   FEC rate, occupied channel, or frame duration must be clearly marked as
   `same_bitrate_as_legacy=false` and/or `same_channel_as_legacy=false` and must
-  print:
-  `NOT SAME BITRATE: this mode trades bitrate/latency/overhead for robustness.`
+  print a `NOT SAME BITRATE` warning.
+
+### Experimental Line-Rate Profiles
+
+The CLI accepts an experimental line-rate option:
+
+```bash
+bazel-bin/lab/chirp_modem.exe --baud=current enc input.bin output.pcm
+bazel-bin/lab/chirp_modem.exe --baud=300 enc input.bin output_300.pcm
+bazel-bin/lab/chirp_modem.exe --baud=300 dec output_300.pcm decoded.bin
+```
+
+Accepted values are `current`, `300`, `600`, `900`, `1200`, and `2400`.
+`current` is the legacy raw CSS rate of about `250 bit/s`. The non-current
+profiles are implemented as a deterministic PCM line-rate resampling wrapper
+around the existing 128-sample chirp modem. The decoder must be run with the
+same `--baud` value so it can resample the received PCM back to the legacy
+demodulation domain before sync/demod/FEC.
+
+These profiles report `same_bitrate_as_legacy=false` and
+`same_channel_as_legacy=false`, and they print `NOT SAME BITRATE`. They do not
+change the protected frame format or FEC layout, but they do change frame
+duration and the occupied audio spectrum. This is not a full dynamic-symbol PHY
+yet.
+
+Local smoke results from 2026-06-16:
+
+| `--baud` | Clean encode/decode | Synthetic radio channel | Notes |
+| --- | --- | --- | --- |
+| `current` | pass | pass | legacy raw rate, about 250 bit/s |
+| `300` | pass | pass | first useful faster profile |
+| `600` | pass | fail | clean works, radio model fails at 24 dB smoke |
+| `900` | fail | fail | sync/header failure from compressed waveform/aliasing |
+| `1200` | fail | fail | sync failure |
+| `2400` | fail | fail | sync failure |
+
+Interpretation: the present waveform can be pushed to 300 bit/s in the current
+synthetic radio model. A clean channel can still decode 600 bit/s through this
+resampling wrapper, but the radio model cannot. Higher rates need a real
+dynamic-symbol PHY, lower/retuned chirp band, or a different demodulator design;
+the current wrapper exposes the limit rather than hiding it.
 
 High-level transmit path:
 
