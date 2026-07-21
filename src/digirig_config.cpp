@@ -11,10 +11,11 @@ void usage(const char* argv0) {
     std::cerr
         << "Usage:\n"
         << "  " << argv0 << " [--serial PORT] [--playback DEVICE] [--recording DEVICE]\n"
-        << "      [--tx-volume X] [--rx-gain X] [--write-config PATH] [--yes]\n"
+        << "      [--tx-output-level X] [--rx-input-level X]\n"
+        << "      [--ptt-active-low|--ptt-active-high] [--write-config PATH] [--yes]\n"
         << "\n"
         << "Lists connected serial/audio devices and chooses likely Digirig 1.11 endpoints.\n"
-        << "Default TX/RX software level is 0.4, intended as about 40% volume.\n"
+        << "Default TX volume and RX input level are 0.4, intended as about 40%.\n"
         << "Use selected values with bf_wav_tx/bf_recorder. Device IDs are platform-specific.\n";
 }
 
@@ -38,8 +39,9 @@ int main(int argc, char** argv) {
         std::string playback_req;
         std::string recording_req;
         std::string write_config;
-        double tx_volume = radio::kDefaultTxVolume;
-        double rx_gain = radio::kDefaultRxGain;
+        double tx_output_level = radio::kDefaultTxOutputLevel;
+        double rx_input_level = radio::kDefaultRxInputLevel;
+        bool ptt_active_low = false;
         bool interactive = true;
         for (int i = 1; i < argc; ++i) {
             const std::string a = argv[i];
@@ -54,10 +56,14 @@ int main(int argc, char** argv) {
                 playback_req = argv[++i];
             } else if (a == "--recording" && i + 1 < argc) {
                 recording_req = argv[++i];
-            } else if (a == "--tx-volume" && i + 1 < argc) {
-                tx_volume = std::stod(argv[++i]);
-            } else if (a == "--rx-gain" && i + 1 < argc) {
-                rx_gain = std::stod(argv[++i]);
+            } else if (a == "--tx-output-level" && i + 1 < argc) {
+                tx_output_level = std::stod(argv[++i]);
+            } else if (a == "--rx-input-level" && i + 1 < argc) {
+                rx_input_level = std::stod(argv[++i]);
+            } else if (a == "--ptt-active-low") {
+                ptt_active_low = true;
+            } else if (a == "--ptt-active-high") {
+                ptt_active_low = false;
             } else if (a == "--write-config" && i + 1 < argc) {
                 write_config = argv[++i];
             } else {
@@ -81,15 +87,17 @@ int main(int argc, char** argv) {
         if (s >= 0) std::cout << "  serial=" << serial[size_t(s)].id << "\n";
         if (p >= 0) std::cout << "  playback=" << playback[size_t(p)].id << "\n";
         if (r >= 0) std::cout << "  recording=" << recording[size_t(r)].id << "\n";
-        std::cout << "  tx_volume=" << tx_volume << "\n"
-                  << "  rx_gain=" << rx_gain << "\n";
+        std::cout << "  tx_output_level=" << tx_output_level << "\n"
+                  << "  rx_input_level=" << rx_input_level << "\n"
+                  << "  ptt_active_low=" << (ptt_active_low ? "true" : "false") << "\n";
         if (!write_config.empty()) {
             radio::ToolConfig cfg;
             if (s >= 0) cfg.serial_port = serial[size_t(s)].id;
             if (p >= 0) cfg.playback_device = playback[size_t(p)].id;
             if (r >= 0) cfg.recording_device = recording[size_t(r)].id;
-            cfg.tx_volume = tx_volume;
-            cfg.rx_gain = rx_gain;
+            cfg.tx_output_level = tx_output_level;
+            cfg.rx_input_level = rx_input_level;
+            cfg.ptt_active_low = ptt_active_low;
             radio::write_tool_config(write_config, cfg);
             std::cout << "  wrote_config=" << write_config << "\n";
         }

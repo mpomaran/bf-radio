@@ -6,7 +6,7 @@ CPP17_COPTS = select({
 })
 
 WINMM_LINKOPTS = select({
-    "@platforms//os:windows": ["winmm.lib", "Advapi32.lib"],
+    "@platforms//os:windows": ["winmm.lib", "Advapi32.lib", "Ole32.lib"],
     "//conditions:default": [],
 })
 
@@ -14,6 +14,7 @@ cc_library(
     name = "radio_tools_lib",
     srcs = [
         "radio/audio_io.cpp",
+        "radio/audio_levels.cpp",
         "radio/config_file.cpp",
         "radio/devices.cpp",
         "radio/process.cpp",
@@ -23,6 +24,7 @@ cc_library(
     ],
     hdrs = [
         "radio/audio_io.h",
+        "radio/audio_levels.h",
         "radio/config_file.h",
         "radio/devices.h",
         "radio/process.h",
@@ -48,6 +50,29 @@ cc_binary(
     srcs = ["bf_wav_tx.cpp"],
     copts = CPP17_COPTS,
     deps = [":radio_tools_lib"],
+    visibility = ["//visibility:public"],
+)
+
+cc_binary(
+    name = "bf_text_tx",
+    srcs = ["bf_text_tx.cpp"],
+    copts = CPP17_COPTS,
+    deps = [
+        ":radio_tools_lib",
+        "//lab:chirp_modem_lib",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+cc_binary(
+    name = "bf_chirp_rx",
+    srcs = ["bf_chirp_rx.cpp"],
+    copts = CPP17_COPTS,
+    deps = [
+        ":radio_tools_lib",
+        "//lab:chirp_modem_lib",
+        "//lab:chirp_receiver_core",
+    ],
     visibility = ["//visibility:public"],
 )
 

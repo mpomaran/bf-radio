@@ -4,6 +4,10 @@
 #include "src/radio/ptt.h"
 #include "src/radio/wav.h"
 
+#include "lab/chirp/config.h"
+#include "lab/chirp/file_io.h"
+#include "lab/chirp/modulator.h"
+
 #include <chrono>
 #include <iostream>
 #include <stdexcept>
@@ -29,28 +33,27 @@ BOOL WINAPI tx_ctrl_handler(DWORD type) {
 }
 #endif
 
+void usage(const char* argv0) {
+    std::cerr
+        << "Usage:\n"
+        << "  " << argv0
+        << " [--config PATH] [--ptt PORT] [--audio-device DEVICE]"
+           " [--output-level X] [--verbose]"
+           " [--ptt-active-low|--ptt-active-high]"
+           " [--pre-ptt-ms N] [--post-ptt-ms N]"
+           " [--save-wav PATH] input.txt\n"
+        << "\n"
+        << "Encodes input.txt with the lab chirp modem and transmits it with Digirig PTT.\n";
+}
+
 void release_ptt(radio::RtsPtt* ptt, bool verbose) {
     const bool accepted =
-        ptt->force_off_until(std::chrono::milliseconds(3000),
-                             std::chrono::milliseconds(50));
+        ptt->force_off_until(std::chrono::milliseconds(3000), std::chrono::milliseconds(50));
     if (verbose) {
         std::cerr << "PTT release "
                   << (accepted ? "accepted by serial driver" : "not confirmed by serial driver")
                   << "\n";
     }
-}
-
-void usage(const char* argv0) {
-    std::cerr
-        << "Usage:\n"
-        << "  " << argv0
-        << " [--config PATH] --ptt PORT [--audio-device DEVICE] [--rate Hz] [--channels N]"
-           " [--output-level X] [--verbose]"
-           " [--ptt-active-low|--ptt-active-high]"
-           " [--pre-ptt-ms N] [--post-ptt-ms N] input.wav\n"
-        << "\n"
-        << "Defaults: 48000 Hz, mono, signed 16-bit PCM, output-level 0.4.\n"
-        << "PTT is asserted with Digirig RTS while the converted WAV is played.\n";
 }
 
 }  // namespace
@@ -61,8 +64,7 @@ int main(int argc, char** argv) {
         std::string audio_device;
         std::string config_path;
         std::string input;
-        uint32_t rate = radio::kDefaultSampleRate;
-        uint16_t channels = radio::kDefaultChannels;
+        std::string save_wav;
         double output_level = radio::kDefaultTxOutputLevel;
         bool output_level_set = false;
         bool ptt_active_low = false;
@@ -82,10 +84,6 @@ int main(int argc, char** argv) {
                 config_path = argv[++i];
             } else if (a == "--audio-device" && i + 1 < argc) {
                 audio_device = argv[++i];
-            } else if (a == "--rate" && i + 1 < argc) {
-                rate = uint32_t(std::stoul(argv[++i]));
-            } else if (a == "--channels" && i + 1 < argc) {
-                channels = uint16_t(std::stoul(argv[++i]));
             } else if (a == "--output-level" && i + 1 < argc) {
                 output_level = std::stod(argv[++i]);
                 output_level_set = true;
@@ -101,6 +99,8 @@ int main(int argc, char** argv) {
                 pre_ms = std::stoi(argv[++i]);
             } else if (a == "--post-ptt-ms" && i + 1 < argc) {
                 post_ms = std::stoi(argv[++i]);
+            } else if (a == "--save-wav" && i + 1 < argc) {
+                save_wav = argv[++i];
             } else if (input.empty()) {
                 input = a;
             } else {
@@ -115,20 +115,36 @@ int main(int argc, char** argv) {
             if (!output_level_set) output_level = cfg.tx_output_level;
             if (!ptt_polarity_set) ptt_active_low = cfg.ptt_active_low;
         }
-        if (ptt_port.empty() || input.empty()) {
+        if (input.empty()) {
             usage(argv[0]);
             return 1;
         }
 
-        const auto wav = radio::read_wav_as_pcm16(input);
-        const auto tx = radio::convert_audio(wav, rate, channels, 1.0);
-        std::cerr << "Input: " << radio::describe_audio(wav) << "\n"
+        const std::vector<uint8_t> payload = chirp::io::read_file(input);
+        radio::AudioBuffer chirp_audio;
+        chirp_audio.sample_rate = chirp::config::SAMPLE_RATE;
+        chirp_audio.channels = 1;
+        chirp_audio.samples = chirp::modulator::encode_payload_to_pcm(payload);
+        const auto tx =
+            radio::convert_audio(chirp_audio, radio::kDefaultSampleRate, radio::kDefaultChannels, 1.0);
+
+        std::cerr << "Payload: " << payload.size() << " byte(s)\n"
+                  << "Chirp audio: " << radio::describe_audio(chirp_audio) << "\n"
                   << "Transmit: " << radio::describe_audio(tx)
                   << "; output level " << output_level
                   << "; PTT RTS " << (ptt_active_low ? "active-low" : "active-high")
                   << "\n";
-        radio::set_playback_level(audio_device, output_level, verbose);
 
+        if (!save_wav.empty()) {
+            radio::write_wav_pcm16(save_wav, chirp_audio);
+            std::cerr << "Saved chirp WAV: " << save_wav << "\n";
+        }
+        if (ptt_port.empty()) {
+            if (!save_wav.empty()) return 0;
+            throw std::runtime_error("PTT port is required unless --save-wav is used");
+        }
+
+        radio::set_playback_level(audio_device, output_level, verbose);
         radio::RtsPtt ptt(ptt_port, ptt_active_low);
 #ifdef _WIN32
         g_active_ptt = &ptt;

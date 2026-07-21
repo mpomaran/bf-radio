@@ -13,7 +13,8 @@ void record_audio_to_segments(const std::string& device_id,
                               uint32_t sample_rate,
                               uint16_t channels,
                               uint32_t segment_seconds,
-                              double gain,
+                              double input_level,
+                              bool auto_input_level,
                               uint32_t duration_seconds,
                               bool verbose);
 

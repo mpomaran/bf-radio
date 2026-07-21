@@ -1,5 +1,6 @@
 #include "src/radio/audio_io.h"
 
+#include "src/radio/audio_levels.h"
 #include "src/radio/process.h"
 #include "src/radio/segment_writer.h"
 
@@ -23,15 +24,168 @@
 namespace radio {
 namespace {
 
-void apply_gain(std::vector<int16_t>* samples, size_t count, double gain) {
-    if (gain == 1.0) return;
-    if (gain < 0.0) throw std::runtime_error("gain must be >= 0");
-    for (size_t i = 0; i < count; ++i) {
-        int v = int(std::lround(double((*samples)[i]) * gain));
-        v = std::max(-32768, std::min(32767, v));
-        (*samples)[i] = int16_t(v);
+class InputLevelController {
+public:
+    InputLevelController(std::string device_id,
+                         double initial_level,
+                         bool auto_level,
+                         bool verbose)
+        : device_id_(std::move(device_id)),
+          current_(checked_level(initial_level)),
+          upper_(std::max(0.6, std::min(1.0, current_ * 1.5))),
+          auto_level_(auto_level),
+          verbose_(verbose) {}
+
+    void start() {
+        set_capture_level(device_id_, current_, verbose_);
+        if (auto_level_) {
+            std::cerr << "Auto input level enabled: target peak 45-70%, hard limit 90%, "
+                      << "fast reaction after " << kInstantHotSamples << " hot sample(s).\n";
+        }
     }
-}
+
+    void observe(const int16_t* samples, size_t count) {
+        if (!auto_level_ || count == 0) return;
+        int peak_abs = 0;
+        int64_t sum_squares = 0;
+        size_t hot = 0;
+        size_t window_hot = 0;
+        int window_peak = 0;
+
+        for (size_t i = 0; i < count; ++i) {
+            const int v = std::abs(int(samples[i]));
+            peak_abs = std::max(peak_abs, v);
+            window_peak = std::max(window_peak, v);
+            sum_squares += int64_t(samples[i]) * int64_t(samples[i]);
+            if (v >= kHotThreshold) {
+                ++hot;
+                ++window_hot;
+            }
+            const bool end_of_window =
+                ((i + 1) % kFastWindowSamples == 0) || (i + 1 == count);
+            if (end_of_window) {
+                if (window_hot >= kInstantHotSamples) {
+                    reset_counters();
+                    upper_ = current_;
+                    if (verbose_) {
+                        std::cerr << "Input fast monitor: peak "
+                                  << int((double(window_peak) / 32767.0) * 100.0 + 0.5)
+                                  << "%, hot " << window_hot << "/"
+                                  << (((i + 1) % kFastWindowSamples == 0)
+                                          ? kFastWindowSamples
+                                          : ((i + 1) % kFastWindowSamples))
+                                  << "\n";
+                    }
+                    adjust(down_step(), "fast peak above safe limit");
+                    return;
+                }
+                window_hot = 0;
+                window_peak = 0;
+            }
+        }
+        const double peak = double(peak_abs) / 32767.0;
+        const double rms = std::sqrt(double(sum_squares) / double(count)) / 32767.0;
+        if (verbose_) {
+            std::cerr << "Input monitor: peak " << int(peak * 100.0 + 0.5)
+                      << "%, rms " << int(rms * 100.0 + 0.5)
+                      << "%, hot " << hot << "/" << count
+                      << ", microphone " << int(current_ * 100.0 + 0.5) << "%\n";
+        }
+
+        if (hot > 0 || peak >= kHardLimit) {
+            reset_counters();
+            upper_ = current_;
+            adjust(down_step(), "peak above safe limit");
+            return;
+        }
+
+        if (peak >= kTargetLow && peak <= kTargetHigh) {
+            reset_counters();
+            lower_ = current_;
+            active_seen_ = true;
+            return;
+        }
+
+        if (peak > kTargetHigh) {
+            low_peak_buffers_ = 0;
+            ++high_peak_buffers_;
+            if (peak >= kImmediateLowerPeak || high_peak_buffers_ >= kHighPeakBuffersBeforeLower) {
+                upper_ = current_;
+                adjust(down_step(), "signal above target");
+                high_peak_buffers_ = 0;
+            }
+            return;
+        }
+
+        if (peak >= kRaiseSignalFloor && rms >= kRaiseRmsFloor && peak < kTargetLow) {
+            high_peak_buffers_ = 0;
+            ++low_peak_buffers_;
+            const int buffers_before_raise =
+                active_seen_ ? kLowPeakBuffersBeforeRaise : kColdStartLowPeakBuffersBeforeRaise;
+            if (low_peak_buffers_ >= buffers_before_raise) {
+                lower_ = current_;
+                adjust(up_step(), "sustained signal below target");
+                low_peak_buffers_ = 0;
+            }
+            return;
+        }
+
+        reset_counters();
+    }
+
+private:
+    static double checked_level(double level) {
+        if (level < 0.0 || level > 1.0) {
+            throw std::runtime_error("input level must be between 0.0 and 1.0");
+        }
+        return level;
+    }
+
+    void adjust(double next, const char* reason) {
+        next = std::max(0.01, std::min(1.0, next));
+        if (std::abs(next - current_) < 0.005) return;
+        current_ = next;
+        std::cerr << "Auto input level: " << reason << "; setting microphone to "
+                  << int(current_ * 100.0 + 0.5) << "%\n";
+        set_capture_level(device_id_, current_, verbose_);
+    }
+
+    double down_step() const {
+        return (lower_ + upper_) / 2.0;
+    }
+
+    double up_step() const {
+        return (lower_ + upper_) / 2.0;
+    }
+
+    void reset_counters() {
+        low_peak_buffers_ = 0;
+        high_peak_buffers_ = 0;
+    }
+
+    static constexpr int kHotThreshold = 31800;
+    static constexpr size_t kFastWindowSamples = 32;
+    static constexpr size_t kInstantHotSamples = 1;
+    static constexpr double kRaiseSignalFloor = 0.18;
+    static constexpr double kRaiseRmsFloor = 0.03;
+    static constexpr double kTargetLow = 0.45;
+    static constexpr double kTargetHigh = 0.70;
+    static constexpr double kImmediateLowerPeak = 0.85;
+    static constexpr double kHardLimit = 0.90;
+    static constexpr int kLowPeakBuffersBeforeRaise = 25;
+    static constexpr int kColdStartLowPeakBuffersBeforeRaise = 50;
+    static constexpr int kHighPeakBuffersBeforeLower = 2;
+
+    std::string device_id_;
+    double current_ = 0.4;
+    double lower_ = 0.0;
+    double upper_ = 0.6;
+    int low_peak_buffers_ = 0;
+    int high_peak_buffers_ = 0;
+    bool active_seen_ = false;
+    bool auto_level_ = true;
+    bool verbose_ = false;
+};
 
 }  // namespace
 
@@ -51,7 +205,7 @@ BOOL WINAPI recording_ctrl_handler(DWORD type) {
 
 void append_completed_buffers(std::vector<std::vector<int16_t>>* buffers,
                               std::vector<WAVEHDR>* headers,
-                              double gain,
+                              InputLevelController* input_level,
                               SegmentWriter* writer,
                               bool requeue,
                               HWAVEIN in) {
@@ -60,7 +214,7 @@ void append_completed_buffers(std::vector<std::vector<int16_t>>* buffers,
         if (hdr.dwFlags & WHDR_DONE) {
             const size_t count = hdr.dwBytesRecorded / sizeof(int16_t);
             if (count > 0) {
-                apply_gain(&(*buffers)[i], count, gain);
+                input_level->observe((*buffers)[i].data(), count);
                 writer->append((*buffers)[i].data(), count);
             }
             hdr.dwFlags &= ~WHDR_DONE;
@@ -112,7 +266,8 @@ void record_audio_to_segments(const std::string& device_id,
                               uint32_t sample_rate,
                               uint16_t channels,
                               uint32_t segment_seconds,
-                              double gain,
+                              double input_level,
+                              bool auto_input_level,
                               uint32_t duration_seconds,
                               bool verbose) {
     if (channels == 0 || channels > 2) throw std::runtime_error("Windows capture supports 1 or 2 channels");
@@ -130,7 +285,7 @@ void record_audio_to_segments(const std::string& device_id,
         CloseHandle(event);
         throw std::runtime_error("waveInOpen failed");
     }
-    const size_t samples_per_buffer = size_t(sample_rate) * channels / 5;
+    const size_t samples_per_buffer = std::max<size_t>(64, size_t(sample_rate) * channels / 50);
     std::vector<std::vector<int16_t>> buffers(4, std::vector<int16_t>(samples_per_buffer));
     std::vector<WAVEHDR> headers(buffers.size());
     for (size_t i = 0; i < buffers.size(); ++i) {
@@ -139,6 +294,8 @@ void record_audio_to_segments(const std::string& device_id,
         waveInPrepareHeader(in, &headers[i], sizeof(WAVEHDR));
         waveInAddBuffer(in, &headers[i], sizeof(WAVEHDR));
     }
+    InputLevelController level_controller(device_id, input_level, auto_input_level, verbose);
+    level_controller.start();
     SegmentWriter writer(output_prefix, sample_rate, channels, segment_seconds, verbose);
     std::cerr << "Recording; press Ctrl+C to stop.\n";
     g_stop_recording.store(false);
@@ -147,7 +304,7 @@ void record_audio_to_segments(const std::string& device_id,
     const auto started = std::chrono::steady_clock::now();
     while (!g_stop_recording.load()) {
         WaitForSingleObject(event, 200);
-        append_completed_buffers(&buffers, &headers, gain, &writer, true, in);
+        append_completed_buffers(&buffers, &headers, &level_controller, &writer, true, in);
         if (duration_seconds > 0 &&
             std::chrono::steady_clock::now() - started >=
                 std::chrono::seconds(duration_seconds)) {
@@ -156,7 +313,7 @@ void record_audio_to_segments(const std::string& device_id,
     }
     waveInStop(in);
     waveInReset(in);
-    append_completed_buffers(&buffers, &headers, gain, &writer, false, in);
+    append_completed_buffers(&buffers, &headers, &level_controller, &writer, false, in);
     for (size_t i = 0; i < headers.size(); ++i) {
         waveInUnprepareHeader(in, &headers[i], sizeof(WAVEHDR));
     }
@@ -188,7 +345,8 @@ void record_audio_to_segments(const std::string& device_id,
                               uint32_t sample_rate,
                               uint16_t channels,
                               uint32_t segment_seconds,
-                              double gain,
+                              double input_level,
+                              bool auto_input_level,
                               uint32_t duration_seconds,
                               bool verbose) {
     std::vector<std::string> cmd = {
@@ -209,12 +367,14 @@ void record_audio_to_segments(const std::string& device_id,
     }
     FILE* pipe = popen(shell.c_str(), "r");
     if (!pipe) throw std::runtime_error("cannot start arecord");
+    InputLevelController level_controller(device_id, input_level, auto_input_level, verbose);
+    level_controller.start();
     SegmentWriter writer(output_prefix, sample_rate, channels, segment_seconds, verbose);
-    std::vector<int16_t> buffer(size_t(sample_rate) * channels / 5);
+    std::vector<int16_t> buffer(std::max<size_t>(64, size_t(sample_rate) * channels / 50));
     while (true) {
         const size_t got = std::fread(buffer.data(), sizeof(int16_t), buffer.size(), pipe);
         if (got > 0) {
-            apply_gain(&buffer, got, gain);
+            level_controller.observe(buffer.data(), got);
             writer.append(buffer.data(), got);
         }
         if (got < buffer.size()) {

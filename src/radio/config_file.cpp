@@ -3,6 +3,7 @@
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 
 namespace radio {
 namespace {
@@ -12,6 +13,12 @@ std::string trim(const std::string& s) {
     if (first == std::string::npos) return {};
     const size_t last = s.find_last_not_of(" \t\r\n");
     return s.substr(first, last - first + 1);
+}
+
+bool parse_bool(const std::string& value) {
+    if (value == "1" || value == "true" || value == "yes" || value == "on") return true;
+    if (value == "0" || value == "false" || value == "no" || value == "off") return false;
+    throw std::runtime_error("bad boolean value in config: " + value);
 }
 
 }  // namespace
@@ -31,8 +38,9 @@ ToolConfig read_tool_config(const std::string& path) {
         if (key == "serial") cfg.serial_port = value;
         else if (key == "playback") cfg.playback_device = value;
         else if (key == "recording") cfg.recording_device = value;
-        else if (key == "tx_volume") cfg.tx_volume = std::stod(value);
-        else if (key == "rx_gain") cfg.rx_gain = std::stod(value);
+        else if (key == "tx_output_level") cfg.tx_output_level = std::stod(value);
+        else if (key == "rx_input_level") cfg.rx_input_level = std::stod(value);
+        else if (key == "ptt_active_low") cfg.ptt_active_low = parse_bool(value);
     }
     return cfg;
 }
@@ -44,8 +52,9 @@ void write_tool_config(const std::string& path, const ToolConfig& cfg) {
       << "serial=" << cfg.serial_port << "\n"
       << "playback=" << cfg.playback_device << "\n"
       << "recording=" << cfg.recording_device << "\n"
-      << "tx_volume=" << cfg.tx_volume << "\n"
-      << "rx_gain=" << cfg.rx_gain << "\n";
+      << "tx_output_level=" << cfg.tx_output_level << "\n"
+      << "rx_input_level=" << cfg.rx_input_level << "\n"
+      << "ptt_active_low=" << (cfg.ptt_active_low ? "true" : "false") << "\n";
 }
 
 }  // namespace radio

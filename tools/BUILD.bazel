@@ -1,0 +1,22 @@
+genrule(
+    name = "bf_radio_field_kit_zip",
+    srcs = [
+        "make_portable_zip.ps1",
+        "portable_README.txt",
+        "portable_configure.cmd",
+        "portable_digirig.cfg",
+        "portable_rx_chirp.cmd",
+        "portable_tx_text.cmd",
+        "//lab:chirp_modem",
+        "//lab:pcm_to_wav",
+        "//lab:wav_to_pcm",
+        "//src:bf_chirp_rx",
+        "//src:bf_recorder",
+        "//src:bf_text_tx",
+        "//src:bf_wav_tx",
+        "//src:digirig_config",
+    ],
+    outs = ["bf-radio-field-kit.zip"],
+    cmd_bat = "powershell -NoProfile -ExecutionPolicy Bypass -File \"$(location make_portable_zip.ps1)\" -OutputZip \"$@\" -DigirigConfig \"$(location portable_digirig.cfg)\" -Readme \"$(location portable_README.txt)\" -ConfigureCmd \"$(location portable_configure.cmd)\" -TxTextCmd \"$(location portable_tx_text.cmd)\" -RxChirpCmd \"$(location portable_rx_chirp.cmd)\" -Exe \"$(location //src:digirig_config)\",\"$(location //src:bf_recorder)\",\"$(location //src:bf_wav_tx)\",\"$(location //src:bf_text_tx)\",\"$(location //src:bf_chirp_rx)\",\"$(location //lab:chirp_modem)\",\"$(location //lab:pcm_to_wav)\",\"$(location //lab:wav_to_pcm)\"",
+    visibility = ["//visibility:public"],
+)

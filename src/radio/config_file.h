@@ -5,15 +5,16 @@
 
 namespace radio {
 
-inline constexpr double kDefaultTxVolume = 0.4;
-inline constexpr double kDefaultRxGain = 0.4;
+inline constexpr double kDefaultTxOutputLevel = 0.4;
+inline constexpr double kDefaultRxInputLevel = 0.4;
 
 struct ToolConfig {
     std::string serial_port;
     std::string playback_device;
     std::string recording_device;
-    double tx_volume = kDefaultTxVolume;
-    double rx_gain = kDefaultRxGain;
+    double tx_output_level = kDefaultTxOutputLevel;
+    double rx_input_level = kDefaultRxInputLevel;
+    bool ptt_active_low = false;
 };
 
 ToolConfig read_tool_config(const std::string& path);

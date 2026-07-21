@@ -7,13 +7,13 @@
 
 namespace radio {
 
-inline constexpr uint32_t kLabSampleRate = 8000;
-inline constexpr uint16_t kLabChannels = 1;
-inline constexpr uint16_t kLabBitsPerSample = 16;
+inline constexpr uint32_t kDefaultSampleRate = 48000;
+inline constexpr uint16_t kDefaultChannels = 1;
+inline constexpr uint16_t kDefaultBitsPerSample = 16;
 
 struct AudioBuffer {
-    uint32_t sample_rate = kLabSampleRate;
-    uint16_t channels = kLabChannels;
+    uint32_t sample_rate = kDefaultSampleRate;
+    uint16_t channels = kDefaultChannels;
     std::vector<int16_t> samples;  // Interleaved PCM16 little-endian logical samples.
 };
 
