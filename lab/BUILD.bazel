@@ -320,6 +320,17 @@ sh_test(
 )
 
 sh_test(
+    name = "chirp_real_end_to_end_test",
+    srcs = ["chirp_real_end_to_end_test.sh"],
+    data = [
+        ":chirp_modem",
+        "//:chirp_real_end_to_end_testdata",
+    ],
+    size = "medium",
+    tags = ["testdata"],
+)
+
+sh_test(
     name = "chirp_audio_channel_impair_test",
     srcs = ["chirp_audio_channel_impair_test.sh"],
     data = [

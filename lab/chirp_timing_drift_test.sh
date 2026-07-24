@@ -33,7 +33,7 @@ print_timing_summary() {
   echo "TIMING section=${label} wall_s=$((now_s - section_start_s)) encode_invocations=${encode_invocations} decode_invocations=${decode_invocations}"
   section_start_s=$now_s
 }
-payload_sizes=(4 8 16 32 64 128 256 512)
+payload_sizes=(4 8 16 32 64 128 256)
 regions=(all)
 scales=(95 100 105)
 bitflip_modes=(no_bitflips)

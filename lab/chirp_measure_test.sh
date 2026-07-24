@@ -63,12 +63,12 @@ if grep -q 'NOT SAME BITRATE' "$pcm_err"; then
   cat "$pcm_err"
   exit 1
 fi
-grep -q '^profile,phy_version,protocol_version,snr_db,trials,' "$pcm_out"
+grep -q '^profile,baud_profile,line_raw_bps,phy_version,protocol_version,snr_db,trials,' "$pcm_out"
 grep -q 'same_bitrate_as_legacy,same_channel_as_legacy' "$pcm_out"
 grep -q 'rx_raw_ser,rx_raw_ber,oracle_raw_ser,oracle_raw_ber' "$pcm_out"
 grep -q 'timing_search_full_count,timing_search_local_count,timing_search_center_count,average_offsets_per_symbol' "$pcm_out"
-grep -q '^awgn,1,1,24,1,' "$pcm_out"
-grep -q '^radio,1,1,24,1,' "$pcm_out"
+grep -q '^awgn,current,250,1,1,24,1,' "$pcm_out"
+grep -q '^radio,current,250,1,1,24,1,' "$pcm_out"
 
 payload="$TEST_TMPDIR/default_payload.bin"
 encoded="$TEST_TMPDIR/default_payload.pcm"

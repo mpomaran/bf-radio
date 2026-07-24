@@ -141,9 +141,19 @@ int main(int argc, char** argv) {
             &options, chirp::receiver::ReceiverProfile::Robust);
         options.rx_diagnostics_enabled = verbose;
 
+        if (verbose) {
+            std::cerr << "Decoder: scanning stitched audio for one chirp frame\n";
+        }
         const auto result = chirp::receiver::decode_payload_from_pcm(modem_audio.samples, options);
         if (!result.ok) {
-            throw std::runtime_error("chirp decode failed");
+            throw std::runtime_error(
+                std::string("chirp decode failed; cause=") +
+                chirp::receiver::decode_failure_cause_name(result.diagnostics.cause));
+        }
+        if (verbose) {
+            std::cerr << "Decoder: good chirp frame decoded, "
+                      << result.payload.size() << " byte(s)"
+                      << (result.diagnostics.crc_ok ? ", CRC OK" : "") << "\n";
         }
         if (!output_path.empty()) {
             chirp::io::write_file(output_path, result.payload);

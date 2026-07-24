@@ -1,12 +1,25 @@
 filegroup(
     name = "phone_recording_testdata",
     srcs = [
-        "testdata/encoded_2.txt",
-        "testdata/original_encoded.pcm",
-        "testdata/original_2_encoded.pcm",
-        "testdata/received2.wav",
-        "testdata/transmitted.txt",
-        "testdata/transmitted.wav",
+        "testdata/test1.txt",
+        "testdata/test1_received.pcm",
+        "testdata/test1_received.wav",
+        "testdata/test1_sent.pcm",
+        "testdata/test1_sent.wav",
+        "testdata/test2.txt",
+        "testdata/test2_received.pcm",
+        "testdata/test2_received.wav",
+        "testdata/test2_sent.pcm",
+        "testdata/test2_sent.wav",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "chirp_real_end_to_end_testdata",
+    srcs = [
+        "testdata/chirp_real_end_to_end_8k.pcm",
+        "testdata/chirp_real_end_to_end_expected.txt",
     ],
     visibility = ["//visibility:public"],
 )

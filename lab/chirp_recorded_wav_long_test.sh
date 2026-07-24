@@ -23,8 +23,8 @@ find_runfile() {
 
 chirp_modem="$(find_runfile lab/chirp_modem)"
 wav_to_pcm="$(find_runfile lab/wav_to_pcm)"
-recording="$(rlocation testdata/received2.wav)"
-expected="$(rlocation testdata/encoded_2.txt)"
+recording="$(rlocation testdata/test1_received.wav)"
+expected="$(rlocation testdata/test1.txt)"
 
 test_start_s=$(date +%s)
 section_start_s=$test_start_s

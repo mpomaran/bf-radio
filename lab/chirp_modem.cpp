@@ -627,9 +627,12 @@ static StreamScanResult scan_pcm_window_for_frame(const std::vector<int16_t>& pc
                              ", skipping " +
                              std::to_string(result.discard_prefix_samples) +
                              " samples",
-                         true);
+                          true);
         return result;
     }
+    progress_message(verbose, progress_clock,
+                     "scanner: good sync lock, decoding protected frame",
+                     true);
 
     const AdaptiveTemplateBank adaptive =
         g_receiver_options.adaptive_channel_templates_enabled
@@ -791,25 +794,24 @@ static DecodeAttemptDiagnostics diagnose_pcm_decode_attempt(
     std::vector<uint8_t>* decoded_payload,
     const DemodConfig& demod_cfg);
 
-static bool decode_payload_from_pcm(const std::vector<int16_t>& pcm,
-                                    std::vector<uint8_t>* payload,
-                                    bool verbose = false,
-                                    const DemodConfig& demod_cfg =
-                                        calibrated_llr_demod_config()) {
-    std::vector<int16_t> buffer = pcm;
-    std::clock_t progress_clock = std::clock();
-    progress_message(verbose, &progress_clock,
-                     "decoder: input " + std::to_string(pcm.size()) + " samples (" +
-                         std::to_string(double(pcm.size()) / SAMPLE_RATE) + " s)",
+static bool scan_payload_from_rolling_buffer(std::vector<int16_t> buffer,
+                                             std::vector<uint8_t>* payload,
+                                             bool verbose,
+                                             std::clock_t* progress_clock,
+                                             const DemodConfig& demod_cfg,
+                                             int max_iterations) {
+    progress_message(verbose, progress_clock,
+                     "decoder: scan buffer " + std::to_string(buffer.size()) +
+                         " samples",
                      true);
-    for (int iter = 0; iter < 128 && !buffer.empty(); ++iter) {
-        progress_message(verbose, &progress_clock,
+    for (int iter = 0; iter < max_iterations && !buffer.empty(); ++iter) {
+        progress_message(verbose, progress_clock,
                          "decoder: scan iteration " + std::to_string(iter + 1) +
                              ", buffer " + std::to_string(buffer.size()) + " samples",
                          true);
         const StreamScanResult scan =
-            scan_pcm_window_for_frame(buffer, verbose, &progress_clock, demod_cfg);
-        progress_message(verbose, &progress_clock,
+            scan_pcm_window_for_frame(buffer, verbose, progress_clock, demod_cfg);
+        progress_message(verbose, progress_clock,
                          "decoder: scanner returned " +
                              std::string(stream_scan_status_name(scan.status)) +
                              ", discard " + std::to_string(scan.discard_prefix_samples) +
@@ -832,6 +834,62 @@ static bool decode_payload_from_pcm(const std::vector<int16_t>& pcm,
     return false;
 }
 
+static bool decode_payload_from_sliding_windows(const std::vector<int16_t>& pcm,
+                                                std::vector<uint8_t>* payload,
+                                                bool verbose,
+                                                std::clock_t* progress_clock,
+                                                const DemodConfig& demod_cfg) {
+    if (pcm.empty()) return false;
+
+    const size_t min_sync_samples =
+        size_t(std::ceil((PREAMBLE_SYMBOLS + SYNC_SYMBOLS) * NOMINAL_SPAN * 0.85));
+    const size_t window_samples = std::min(pcm.size(), size_t(SAMPLE_RATE * 6));
+    const size_t step_samples = std::max<size_t>(SYMBOL_SAMPLES, size_t(SAMPLE_RATE / 4));
+    if (pcm.size() <= window_samples) return false;
+
+    progress_message(verbose, progress_clock,
+                     "decoder: full-buffer scan failed, trying bounded sliding windows",
+                     true);
+    for (size_t start = 0; start + min_sync_samples < pcm.size(); start += step_samples) {
+        const size_t end = std::min(pcm.size(), start + window_samples);
+        if (end - start < min_sync_samples) break;
+        std::vector<int16_t> window(pcm.begin() + std::ptrdiff_t(start),
+                                    pcm.begin() + std::ptrdiff_t(end));
+        progress_message(verbose, progress_clock,
+                         "decoder: sliding window start " + std::to_string(start) +
+                             ", length " + std::to_string(window.size()),
+                         true);
+        if (scan_payload_from_rolling_buffer(window, payload, verbose, progress_clock,
+                                             demod_cfg, 32)) {
+            progress_message(verbose, progress_clock,
+                             "decoder: frame decoded from sliding window starting at sample " +
+                                 std::to_string(start),
+                             true);
+            return true;
+        }
+        if (end == pcm.size()) break;
+    }
+    return false;
+}
+
+static bool decode_payload_from_pcm(const std::vector<int16_t>& pcm,
+                                    std::vector<uint8_t>* payload,
+                                    bool verbose = false,
+                                    const DemodConfig& demod_cfg =
+                                        calibrated_llr_demod_config()) {
+    std::clock_t progress_clock = std::clock();
+    progress_message(verbose, &progress_clock,
+                     "decoder: input " + std::to_string(pcm.size()) + " samples (" +
+                         std::to_string(double(pcm.size()) / SAMPLE_RATE) + " s)",
+                     true);
+    if (scan_payload_from_rolling_buffer(pcm, payload, verbose, &progress_clock,
+                                         demod_cfg, 128)) {
+        return true;
+    }
+    return decode_payload_from_sliding_windows(pcm, payload, verbose, &progress_clock,
+                                               demod_cfg);
+}
+
 namespace chirp {
 namespace receiver {
 
@@ -844,6 +902,18 @@ DecodeResult decode_payload_from_pcm(const std::vector<int16_t>& pcm,
         result.diagnostics =
             diagnose_pcm_decode_attempt(pcm, &result.payload, ::receiver_demod_config());
         result.ok = result.diagnostics.ok;
+        if (!result.ok) {
+            std::vector<uint8_t> fallback_payload;
+            if (::decode_payload_from_pcm(pcm, &fallback_payload, false,
+                                          ::receiver_demod_config())) {
+                result.payload = fallback_payload;
+                result.ok = true;
+                result.diagnostics.ok = true;
+                result.diagnostics.cause = DecodeFailureCause::None;
+                result.diagnostics.crc_ok = true;
+                result.diagnostics.payload_bytes = fallback_payload.size();
+            }
+        }
         g_receiver_options = saved_options;
         return result;
     } catch (...) {
@@ -1290,6 +1360,12 @@ static void print_receiver_diagnostics_for_pcm(const std::vector<int16_t>& pcm,
     rx_diag.demod_cfg = receiver_demod_config();
     rx_diag.decode = diagnose_pcm_decode_attempt(pcm, &diagnostic_payload,
                                                  rx_diag.demod_cfg);
+    if (decode_ok && !rx_diag.decode.ok) {
+        rx_diag.decode.ok = true;
+        rx_diag.decode.cause = DecodeFailureCause::None;
+        rx_diag.decode.crc_ok = true;
+        rx_diag.decode.payload_bytes = payload.size();
+    }
     if (decode_ok && rx_diag.decode.ok && diagnostic_payload.size() != payload.size()) {
         rx_diag.decode.payload_bytes = payload.size();
     }

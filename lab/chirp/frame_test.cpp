@@ -48,8 +48,8 @@ int main() {
     assert(chirp::frame::decode_exact_payload_from_llrs(
         ideal_llrs, tx_bits.size(), &llr_decoded, &header_fec, &body_fec));
     assert(llr_decoded == payload);
-    assert(header_fec.success);
-    assert(body_fec.success);
+    assert(header_fec.all_blocks_ok);
+    assert(body_fec.all_blocks_ok);
 
     bool threw = false;
     try {
